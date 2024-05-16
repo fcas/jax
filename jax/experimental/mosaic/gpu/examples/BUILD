@@ -18,7 +18,10 @@ licenses(["notice"])
 
 package(
     default_applicable_licenses = [],
-    default_visibility = ["//third_party/py/jax:internal"],
+    default_visibility = [
+        "//gdm/jax/tokamax:__subpackages__",
+        "//third_party/py/jax:internal",
+    ],
 )
 
 exports_files(

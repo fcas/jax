@@ -134,6 +134,7 @@ package_group(
     name = "mosaic_gpu_users",
     packages = [
         "//...",
+        "//gdm/jax/tokamax/...",
         "//learning/brain/research/jax",
     ],
 )
