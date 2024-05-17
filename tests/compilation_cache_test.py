@@ -448,6 +448,23 @@ class CompilationCacheTest(jtu.JaxTestCase):
       elif process_id == 1:
         self.assertEqual(files_in_directory, 0)
 
+  def test_backend_serialization_deserialization(self):
+    computation = (
+        jax.jit(lambda x, y: x + y)
+        .lower(np.int32(1), np.int32(1))
+        .compiler_ir()
+    )
+    compile_options = compiler.get_compile_options(
+        num_replicas=1, num_partitions=1
+    )
+    backend = xla_bridge.get_backend()
+    executable = backend.compile(str(computation), compile_options)
+    serialized_executable = backend.serialize_executable(executable)
+    deserialized_executable = backend.deserialize_executable(
+        serialized_executable, compile_options)
+    self.assertEqual(
+        executable.fingerprint, deserialized_executable.fingerprint)
+
 
 @jtu.with_config(
     jax_enable_compilation_cache=False,
