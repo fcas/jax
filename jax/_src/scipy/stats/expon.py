@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from jax import lax
-import jax.numpy as jnp
+import numpy as np
+
+from jax._src import lax
+from jax._src import numpy as jnp
 from jax._src.numpy.util import promote_args_inexact
 from jax._src.typing import Array, ArrayLike
 
@@ -41,13 +43,19 @@ def logpdf(x: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
     array of logpdf values.
 
   See Also:
+    :func:`jax.scipy.stats.expon.cdf`
     :func:`jax.scipy.stats.expon.pdf`
+    :func:`jax.scipy.stats.expon.ppf`
+    :func:`jax.scipy.stats.expon.sf`
+    :func:`jax.scipy.stats.expon.logcdf`
+    :func:`jax.scipy.stats.expon.logpdf`
+    :func:`jax.scipy.stats.expon.logsf`
   """
   x, loc, scale = promote_args_inexact("expon.logpdf", x, loc, scale)
   log_scale = lax.log(scale)
   linear_term = lax.div(lax.sub(x, loc), scale)
   log_probs = lax.neg(lax.add(linear_term, log_scale))
-  return jnp.where(lax.lt(x, loc), -jnp.inf, log_probs)
+  return jnp.where(lax.lt(x, loc), -np.inf, log_probs)
 
 
 def pdf(x: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
@@ -73,6 +81,189 @@ def pdf(x: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
     array of pdf values.
 
   See Also:
+    :func:`jax.scipy.stats.expon.cdf`
+    :func:`jax.scipy.stats.expon.pdf`
+    :func:`jax.scipy.stats.expon.ppf`
+    :func:`jax.scipy.stats.expon.sf`
+    :func:`jax.scipy.stats.expon.logcdf`
     :func:`jax.scipy.stats.expon.logpdf`
+    :func:`jax.scipy.stats.expon.logsf`
   """
   return lax.exp(logpdf(x, loc, scale))
+
+
+def cdf(x: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
+  r"""Exponential cumulative density function.
+
+  JAX implementation of :obj:`scipy.stats.expon` ``cdf``.
+
+  The cdf is defined as
+
+  .. math::
+
+     f_{cdf}(x) = \int_{-\infty}^x f_{pdf}(y)\mathrm{d}y
+
+  where :math:`f_{pdf}` is the exponential distribution probability density function,
+  :func:`jax.scipy.stats.expon.pdf`.
+
+  Args:
+    x: arraylike, value at which to evaluate the PDF
+    loc: arraylike, distribution offset parameter
+    scale: arraylike, distribution scale parameter
+
+  Returns:
+    array of pdf values.
+
+  See Also:
+    :func:`jax.scipy.stats.expon.cdf`
+    :func:`jax.scipy.stats.expon.pdf`
+    :func:`jax.scipy.stats.expon.ppf`
+    :func:`jax.scipy.stats.expon.sf`
+    :func:`jax.scipy.stats.expon.logcdf`
+    :func:`jax.scipy.stats.expon.logpdf`
+    :func:`jax.scipy.stats.expon.logsf`
+  """
+  x, loc, scale = promote_args_inexact("expon.cdf", x, loc, scale)
+  neg_scaled_x = lax.div(lax.sub(loc, x), scale)
+  return jnp.where(
+    lax.lt(x, loc),
+    jnp.zeros_like(neg_scaled_x),
+    lax.neg(lax.expm1(neg_scaled_x)),
+  )
+
+
+def logcdf(x: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
+  r"""Exponential log cumulative density function.
+
+  JAX implementation of :obj:`scipy.stats.expon` ``logcdf``.
+
+  The cdf is defined as
+
+  .. math::
+
+     f_{cdf}(x) = \int_{-\infty}^x f_{pdf}(y)\mathrm{d}y
+
+  where :math:`f_{pdf}` is the exponential distribution probability density function,
+  :func:`jax.scipy.stats.expon.pdf`.
+
+  Args:
+    x: arraylike, value at which to evaluate the PDF
+    loc: arraylike, distribution offset parameter
+    scale: arraylike, distribution scale parameter
+
+  Returns:
+    array of pdf values.
+
+  See Also:
+    :func:`jax.scipy.stats.expon.cdf`
+    :func:`jax.scipy.stats.expon.pdf`
+    :func:`jax.scipy.stats.expon.ppf`
+    :func:`jax.scipy.stats.expon.sf`
+    :func:`jax.scipy.stats.expon.logcdf`
+    :func:`jax.scipy.stats.expon.logpdf`
+    :func:`jax.scipy.stats.expon.logsf`
+  """
+  return lax.log1p(lax.neg(sf(x, loc, scale)))
+
+
+def logsf(x: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
+  r"""Exponential log survival function.
+
+  JAX implementation of :obj:`scipy.stats.expon` ``logsf``.
+
+  The survival function is defined as
+
+  .. math::
+
+     f_{sf}(x) = 1 - f_{cdf}(x)
+
+  where :math:`f_{cdf}(x)` is the exponential cumulative distribution function,
+  :func:`jax.scipy.stats.expon.cdf`.
+
+  Args:
+    x: arraylike, value at which to evaluate the PDF
+    loc: arraylike, distribution offset parameter
+    scale: arraylike, distribution scale parameter
+
+  Returns:
+    array of pdf values.
+
+  See Also:
+    :func:`jax.scipy.stats.expon.cdf`
+    :func:`jax.scipy.stats.expon.pdf`
+    :func:`jax.scipy.stats.expon.ppf`
+    :func:`jax.scipy.stats.expon.sf`
+    :func:`jax.scipy.stats.expon.logcdf`
+    :func:`jax.scipy.stats.expon.logpdf`
+    :func:`jax.scipy.stats.expon.logsf`
+  """
+  x, loc, scale = promote_args_inexact("expon.sf", x, loc, scale)
+  neg_scaled_x = lax.div(lax.sub(loc, x), scale)
+  return jnp.where(lax.lt(x, loc), jnp.zeros_like(neg_scaled_x), neg_scaled_x)
+
+
+def sf(x: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
+  r"""Exponential survival function.
+
+  JAX implementation of :obj:`scipy.stats.expon` ``sf``.
+
+  The survival function is defined as
+
+  .. math::
+
+     f_{sf}(x) = 1 - f_{cdf}(x)
+
+  where :math:`f_{cdf}(x)` is the exponential cumulative distribution function,
+  :func:`jax.scipy.stats.expon.cdf`.
+
+  Args:
+    x: arraylike, value at which to evaluate the PDF
+    loc: arraylike, distribution offset parameter
+    scale: arraylike, distribution scale parameter
+
+  Returns:
+    array of pdf values.
+
+  See Also:
+    :func:`jax.scipy.stats.expon.cdf`
+    :func:`jax.scipy.stats.expon.pdf`
+    :func:`jax.scipy.stats.expon.ppf`
+    :func:`jax.scipy.stats.expon.sf`
+    :func:`jax.scipy.stats.expon.logcdf`
+    :func:`jax.scipy.stats.expon.logpdf`
+    :func:`jax.scipy.stats.expon.logsf`
+  """
+  return lax.exp(logsf(x, loc, scale))
+
+
+def ppf(q: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
+  r"""Exponential percent point function.
+
+  JAX implementation of :obj:`scipy.stats.expon` ``ppf``.
+
+  The percent point function is defined as the inverse of the
+  cumulative distribution function, :func:`jax.scipy.stats.expon.cdf`.
+
+  Args:
+    q: arraylike, value at which to evaluate the PPF
+    loc: arraylike, distribution offset parameter
+    scale: arraylike, distribution scale parameter
+
+  Returns:
+    array of ppf values.
+
+  See Also:
+    :func:`jax.scipy.stats.expon.cdf`
+    :func:`jax.scipy.stats.expon.pdf`
+    :func:`jax.scipy.stats.expon.ppf`
+    :func:`jax.scipy.stats.expon.sf`
+    :func:`jax.scipy.stats.expon.logcdf`
+    :func:`jax.scipy.stats.expon.logpdf`
+    :func:`jax.scipy.stats.expon.logsf`
+  """
+  q, loc, scale = promote_args_inexact("expon.ppf", q, loc, scale)
+  return jnp.where(
+    jnp.isnan(q) | (q < 0) | (q > 1),
+    np.nan,
+    lax.sub(loc, lax.mul(scale, lax.log1p(lax.neg(q)))),
+  )

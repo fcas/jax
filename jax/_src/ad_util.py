@@ -13,24 +13,28 @@
 # limitations under the License.
 from __future__ import annotations
 
+from collections.abc import Callable
 import types
-from typing import Any, Callable, TypeVar
+from typing import Any
 
 from jax._src import core
+from jax._src.core import typeof
 from jax._src import traceback_util
-from jax._src.core import Primitive, valid_jaxtype, raise_to_shaped, get_aval
-from jax._src.tree_util import register_pytree_node
+from jax._src.core import Primitive
+from jax._src.tree_util import register_pytree_node, tree_map
 from jax._src.typing import Array, ArrayLike
 from jax._src.util import safe_map
 
 traceback_util.register_exclusion(__file__)
 
-T = TypeVar('T')
-
 map = safe_map
 
 def add_jaxvals(x: ArrayLike, y: ArrayLike) -> Array:
-  dtype = core.get_aval(x).dtype
+  from jax._src.hijax import HiType  # pyrefly: ignore[missing-import]
+  ty = typeof(x)
+  if isinstance(ty, HiType):
+    return ty.vspace_add(x, y)
+  x, y = core.auto_insert_reshard(x, y)
   return add_jaxvals_p.bind(x, y)
 
 add_jaxvals_p = Primitive('add_any')
@@ -39,18 +43,29 @@ add_any_p = add_jaxvals_p
 @add_jaxvals_p.def_impl
 def add_impl(x, y):
   return raw_jaxval_adders[type(x)](x, y)
-raw_jaxval_adders = {}  # type: ignore
+raw_jaxval_adders = {}
 
 @add_jaxvals_p.def_abstract_eval
 def add_abstract(x, y):
-  return core.lattice_join(x, y)
+  assert core.typematch(x, y), (x, y)
+  return x
 
 def zeros_like_aval(aval: core.AbstractValue) -> Array:
+  from jax._src.hijax import HiType  # pyrefly: ignore[missing-import]
+  if isinstance(aval, HiType):
+    return aval.vspace_zero()
   return aval_zeros_likers[type(aval)](aval)
 aval_zeros_likers: dict[type, Callable[[Any], Array]] = {}
 
 def zeros_like_jaxval(val):
-  return zeros_like_aval(core.raise_to_shaped(core.get_aval(val)))
+  return zeros_like_aval(core.typeof(val))
+
+def empty_like_aval(aval):
+  from jax._src.hijax import HiType  # pyrefly: ignore[missing-import]
+  if isinstance(aval, HiType):
+    return aval.raise_val(*map(empty_like_aval, aval.lo_ty()))
+  return aval_empty_likers[type(aval)](aval)
+aval_empty_likers: dict[type, Callable[[Any], Array]] = {}
 
 def instantiate(z: Zero | Array) -> Array:
   if isinstance(z, Zero):
@@ -64,15 +79,23 @@ class Zero:
     self.aval = aval
   def __repr__(self) -> str:
     return f'Zero({self.aval})'
-  @staticmethod
-  def from_value(val: Any) -> Zero:
-    return Zero(raise_to_shaped(get_aval(val)))
+  def instantiate(self):
+    return zeros_like_aval(self.aval)
 
 register_pytree_node(Zero, lambda z: ((), z.aval), lambda aval, _: Zero(aval))
 
+def p2tz(primal_value):
+  return Zero(typeof(primal_value).to_tangent_aval())
 
-def _stop_gradient_impl(x: T) -> T:
-  if not valid_jaxtype(x):
+def p2cz(primal_value):
+  return Zero(typeof(primal_value).to_ct_aval())
+
+def a2tz(primal_aval):
+  return Zero(primal_aval.to_tangent_aval())
+
+
+def _stop_gradient_impl[T](x: T) -> T:
+  if not core.valid_jaxtype(x):
     raise TypeError("stop_gradient only works on valid JAX arrays, but "
                     f"input argument is: {x}")
   return x
@@ -82,6 +105,7 @@ stop_gradient_p.def_impl(_stop_gradient_impl)
 stop_gradient_p.def_abstract_eval(lambda x: x)
 
 
+# User-facing version of `Zero`
 class SymbolicZero:
   def __init__(self, aval: core.AbstractValue) -> None:
     self.aval = aval
@@ -107,6 +131,17 @@ class SymbolicZero:
         return types.MethodType(attr.fun, self)
       else:
         return attr
+
+  @staticmethod
+  def from_primal_value(val: Any) -> SymbolicZero:
+    return SymbolicZero(typeof(val).to_tangent_aval())
+
+def zero_from_primal(val, symbolic_zeros=False):
+  def f(x):
+    t_aval = typeof(x).to_tangent_aval()
+    return SymbolicZero(t_aval) if symbolic_zeros else zeros_like_aval(t_aval)
+  return tree_map(f, val)
+
 
 JaxTypeOrTracer = Any
 

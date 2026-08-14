@@ -15,12 +15,17 @@
 
 from __future__ import annotations
 
-from typing import Callable, NamedTuple
+from collections.abc import Callable
 from functools import partial
+from typing import NamedTuple
 
-import jax
-import jax.numpy as jnp
-from jax import lax
+import numpy as np
+
+from jax._src import api
+from jax._src import dtypes
+from jax._src import lax
+from jax._src import numpy as jnp
+from jax._src.numpy import linalg as jnp_linalg
 from jax._src.scipy.optimize.line_search import line_search
 from jax._src.typing import Array
 
@@ -53,8 +58,8 @@ class LBFGSResults(NamedTuple):
       5 = line search failed
     ls_status: integer describing the end status of the last line search
   """
-  converged: bool | Array
-  failed: bool | Array
+  converged: Array
+  failed: Array
   k: int | Array
   nfev: int | Array
   ngev: int | Array
@@ -73,7 +78,7 @@ def _minimize_lbfgs(
     fun: Callable,
     x0: Array,
     maxiter: float | None = None,
-    norm=jnp.inf,
+    norm=np.inf,
     maxcor: int = 10,
     ftol: float = 2.220446049250313e-09,
     gtol: float = 1e-05,
@@ -108,7 +113,7 @@ def _minimize_lbfgs(
     Optimization results.
   """
   d = len(x0)
-  dtype = jnp.dtype(x0)
+  dtype = dtypes.dtype(x0)
 
   # ensure there is at least one termination condition
   if (maxiter is None) and (maxfun is None) and (maxgrad is None):
@@ -116,17 +121,17 @@ def _minimize_lbfgs(
 
   # set others to inf, such that >= is supported
   if maxiter is None:
-    maxiter = jnp.inf
+    maxiter = np.inf
   if maxfun is None:
-    maxfun = jnp.inf
+    maxfun = np.inf
   if maxgrad is None:
-    maxgrad = jnp.inf
+    maxgrad = np.inf
 
   # initial evaluation
-  f_0, g_0 = jax.value_and_grad(fun)(x0)
+  f_0, g_0 = api.value_and_grad(fun)(x0)
   state_initial = LBFGSResults(
-    converged=False,
-    failed=False,
+    converged=jnp.array(False, dtype=bool),
+    failed=jnp.array(False, dtype=bool),
     k=0,
     nfev=1,
     ngev=1,
@@ -159,7 +164,7 @@ def _minimize_lbfgs(
     )
 
     # evaluate at next iterate
-    s_k = ls_results.a_k.astype(p_k.dtype) * p_k
+    s_k = jnp.asarray(ls_results.a_k).astype(p_k.dtype) * p_k
     x_kp1 = state.x_k + s_k
     f_kp1 = ls_results.f_k
     g_kp1 = ls_results.g_k
@@ -171,12 +176,12 @@ def _minimize_lbfgs(
     # replacements for next iteration
     status = jnp.array(0)
     status = jnp.where(state.f_k - f_kp1 < ftol, 4, status)
-    status = jnp.where(state.ngev >= maxgrad, 3, status)  # type: ignore
-    status = jnp.where(state.nfev >= maxfun, 2, status)  # type: ignore
-    status = jnp.where(state.k >= maxiter, 1, status)  # type: ignore
+    status = jnp.where(state.ngev >= maxgrad, 3, status)
+    status = jnp.where(state.nfev >= maxfun, 2, status)
+    status = jnp.where(state.k >= maxiter, 1, status)
     status = jnp.where(ls_results.failed, 5, status)
 
-    converged = jnp.linalg.norm(g_kp1, ord=norm) < gtol
+    converged = jnp_linalg.norm(g_kp1, ord=norm) < gtol
 
     # TODO(jakevdp): use a fixed-point procedure rather than type-casting?
     state = state._replace(

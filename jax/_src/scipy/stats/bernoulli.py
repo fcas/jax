@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from jax import lax
-import jax.numpy as jnp
+import numpy as np
+
+from jax._src import lax
+from jax._src import numpy as jnp
 from jax._src.lax.lax import _const as _lax_const
 from jax._src.numpy.util import promote_args_inexact
+from jax._src.scipy.special import xlogy, xlog1py
 from jax._src.typing import Array, ArrayLike
-from jax.scipy.special import xlogy, xlog1py
 
 
 def logpmf(k: ArrayLike, p: ArrayLike, loc: ArrayLike = 0) -> Array:
@@ -25,7 +27,7 @@ def logpmf(k: ArrayLike, p: ArrayLike, loc: ArrayLike = 0) -> Array:
 
   JAX implementation of :obj:`scipy.stats.bernoulli` ``logpmf``
 
-  The Bernoulli probablility mass function is defined as
+  The Bernoulli probability mass function is defined as
 
   .. math::
 
@@ -54,7 +56,7 @@ def logpmf(k: ArrayLike, p: ArrayLike, loc: ArrayLike = 0) -> Array:
   x = lax.sub(k, loc)
   log_probs = xlogy(x, p) + xlog1py(lax.sub(one, x), -p)
   return jnp.where(jnp.logical_or(lax.lt(x, zero), lax.gt(x, one)),
-                  -jnp.inf, log_probs)
+                  -np.inf, log_probs)
 
 
 def pmf(k: ArrayLike, p: ArrayLike, loc: ArrayLike = 0) -> Array:
@@ -62,7 +64,7 @@ def pmf(k: ArrayLike, p: ArrayLike, loc: ArrayLike = 0) -> Array:
 
   JAX implementation of :obj:`scipy.stats.bernoulli` ``pmf``
 
-  The Bernoulli probablility mass function is defined as
+  The Bernoulli probability mass function is defined as
 
   .. math::
 
@@ -105,7 +107,6 @@ def cdf(k: ArrayLike, p: ArrayLike) -> Array:
   Args:
     k: arraylike, value at which to evaluate the CDF
     p: arraylike, distribution shape parameter
-    loc: arraylike, distribution offset
 
   Returns:
     array of cdf values
@@ -136,9 +137,8 @@ def ppf(q: ArrayLike, p: ArrayLike) -> Array:
   distribution function, :func:`jax.scipy.stats.bernoulli.cdf`.
 
   Args:
-    k: arraylike, value at which to evaluate the PPF
+    q: arraylike, value at which to evaluate the PPF
     p: arraylike, distribution shape parameter
-    loc: arraylike, distribution offset
 
   Returns:
     array of ppf values

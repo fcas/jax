@@ -20,17 +20,17 @@ these tests.
 from __future__ import annotations
 
 import base64
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import io
 import os
 import tarfile
-from typing import Callable, Optional
 
 from absl.testing import absltest
 import jax
 from jax._src import test_util as jtu
 from jax._src.internal_test_util import export_back_compat_test_util as bctu
-from jax._src.lib import xla_extension
+from jax._src.lib import _jax
+from jax._src.interpreters import mlir
 from jax.experimental import jax2tf
 from jax.experimental.jax2tf.tests.back_compat_testdata import tf_call_tf_function
 import jax.numpy as jnp
@@ -58,7 +58,7 @@ def deserialize_directory(serialized_string, output_directory):
 
   # Extract the tar archive to the output directory
   with tarfile.open(fileobj=io.BytesIO(tar_data), mode="r") as tar:
-    tar.extractall(output_directory)
+    tar.extractall(output_directory, filter='data')
 
 
 class CompatTensoflowTest(bctu.CompatTestBase):
@@ -69,16 +69,18 @@ class CompatTensoflowTest(bctu.CompatTestBase):
   `tf.Graph` containing a XlaCallModule with the actual MLIR module.
   """
 
-  def run_current(self, func: Callable, data: bctu.CompatTestData):
+  def run_current(self, func: Callable, data: bctu.CompatTestData,
+                  prepare_inputs = None):
     # Here we use tf.saved_model and provide  string serialize/deserialize methods
     # for the whole directory.
     @tf.function(autograph=False, jit_compile=True)
     def tf_func(the_input):  # Use recognizable names for input and result
-      res = jax2tf.convert(func, native_serialization=True)(the_input)
+      res = jax2tf.convert(func)(the_input)
       return tf.identity(res, name="the_result")
 
     self.tf_func = tf_func
-    return tf_func(*data.inputs)  # type: ignore
+    inputs = prepare_inputs(data.inputs) if prepare_inputs else data.inputs
+    return tf_func(*inputs)
 
   def serialize(
       self,
@@ -93,9 +95,10 @@ class CompatTensoflowTest(bctu.CompatTestBase):
     for op in tf_graph.get_operations():
       if op.type == "XlaCallModule":
         serialized_module = op.get_attr("module")
-        module_str = xla_extension.mlir.deserialize_portable_artifact(
-            serialized_module
-        )
+        with mlir.make_ir_context():
+          module_str = mlir.module_to_string(
+              _jax.mlir.deserialize_portable_artifact(serialized_module)
+          )
         module_version = op.get_attr("version")
         break
     else:

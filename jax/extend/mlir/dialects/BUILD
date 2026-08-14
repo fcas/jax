@@ -24,67 +24,105 @@ package(
 )
 
 pytype_strict_library(
+    name = "dialects",
+    srcs = ["__init__.py"],
+    type_checking = "pyrefly",
+    deps = [
+        ":arithmetic_dialect",
+        ":builtin_dialect",
+        ":chlo_dialect",
+        ":func_dialect",
+        ":math_dialect",
+        ":memref_dialect",
+        ":mpmd_dialect",
+        ":scf_dialect",
+        ":sdy_dialect",
+        ":sparse_tensor_dialect",
+        ":stablehlo_dialect",
+        ":vector_dialect",
+    ],
+)
+
+pytype_strict_library(
     name = "arithmetic_dialect",
     srcs = ["arith.py"],
+    type_checking = "pyrefly",
     deps = if_building_jaxlib(["//jaxlib/mlir:arithmetic_dialect"]),
 )
 
 pytype_strict_library(
     name = "builtin_dialect",
     srcs = ["builtin.py"],
+    type_checking = "pyrefly",
     deps = if_building_jaxlib(["//jaxlib/mlir:builtin_dialect"]),
 )
 
 pytype_strict_library(
     name = "chlo_dialect",
     srcs = ["chlo.py"],
+    type_checking = "pyrefly",
     deps = if_building_jaxlib(["//jaxlib/mlir:chlo_dialect"]),
 )
 
 pytype_strict_library(
     name = "func_dialect",
     srcs = ["func.py"],
+    type_checking = "pyrefly",
     deps = if_building_jaxlib(["//jaxlib/mlir:func_dialect"]),
 )
 
 pytype_strict_library(
     name = "math_dialect",
     srcs = ["math.py"],
+    type_checking = "pyrefly",
     deps = if_building_jaxlib(["//jaxlib/mlir:math_dialect"]),
 )
 
 pytype_strict_library(
     name = "memref_dialect",
     srcs = ["memref.py"],
+    type_checking = "pyrefly",
     deps = if_building_jaxlib(["//jaxlib/mlir:memref_dialect"]),
 )
 
 pytype_strict_library(
-    name = "mhlo_dialect",
-    srcs = ["mhlo.py"],
-    deps = if_building_jaxlib(["//jaxlib/mlir:mhlo_dialect"]),
+    name = "mpmd_dialect",
+    srcs = ["mpmd.py"],
+    type_checking = "pyrefly",
+    deps = if_building_jaxlib(["//jaxlib/mlir:mpmd_dialect"]),
 )
 
 pytype_strict_library(
     name = "scf_dialect",
     srcs = ["scf.py"],
+    type_checking = "pyrefly",
     deps = if_building_jaxlib(["//jaxlib/mlir:scf_dialect"]),
 )
 
 pytype_strict_library(
     name = "sparse_tensor_dialect",
     srcs = ["sparse_tensor.py"],
+    type_checking = "pyrefly",
     deps = if_building_jaxlib(["//jaxlib/mlir:sparse_tensor_dialect"]),
+)
+
+pytype_strict_library(
+    name = "sdy_dialect",
+    srcs = ["sdy.py"],
+    type_checking = "pyrefly",
+    deps = if_building_jaxlib(["//jaxlib/mlir:sdy_dialect"]),
 )
 
 pytype_strict_library(
     name = "stablehlo_dialect",
     srcs = ["stablehlo.py"],
+    type_checking = "pyrefly",
     deps = if_building_jaxlib(["//jaxlib/mlir:stablehlo_dialect"]),
 )
 
 pytype_strict_library(
     name = "vector_dialect",
     srcs = ["vector.py"],
+    type_checking = "pyrefly",
     deps = if_building_jaxlib(["//jaxlib/mlir:vector_dialect"]),
 )

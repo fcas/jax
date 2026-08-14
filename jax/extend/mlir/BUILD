@@ -24,13 +24,27 @@ package(
 )
 
 pytype_strict_library(
+    name = "mlir",
+    srcs = ["__init__.py"],
+    type_checking = "pyrefly",
+    deps = [
+        ":ir",
+        ":pass_manager",
+        "//jax/_src:mlir",
+        "//jax/_src/lib",
+    ],
+)
+
+pytype_strict_library(
     name = "ir",
     srcs = ["ir.py"],
+    type_checking = "pyrefly",
     deps = if_building_jaxlib(["//jaxlib/mlir:ir"]),
 )
 
 pytype_strict_library(
     name = "pass_manager",
     srcs = ["passmanager.py"],
+    type_checking = "pyrefly",
     deps = if_building_jaxlib(["//jaxlib/mlir:pass_manager"]),
 )

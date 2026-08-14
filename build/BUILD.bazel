@@ -1,4 +1,4 @@
-# Copyright 2024 The Jax Authors. All Rights Reserved.
+# Copyright 2024 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,55 +13,85 @@
 # limitations under the License.
 # ==============================================================================
 
+load(
+    "@python_version_repo//:py_version.bzl",
+    "HERMETIC_PYTHON_VERSION",
+    "REQUIREMENTS",
+)
+load("@rules_python//python:pip.bzl", "compile_pip_requirements")
+load("@rules_python//python:py_library.bzl", "py_library")
+load("//jaxlib:jax.bzl", "all_py_deps")
+
 licenses(["notice"])
 
-load("@python//:defs.bzl", "compile_pip_requirements")
-load("@python_version_repo//:py_version.bzl", "REQUIREMENTS")
-load("//jaxlib:jax.bzl", "all_py_deps")
+REQUIREMENTS_TXT = (
+    "requirements_lock_{}.txt".format(
+        HERMETIC_PYTHON_VERSION.replace(".", "_").replace("-", "_")
+    )
+    if REQUIREMENTS == "//:requirements.txt"
+    else REQUIREMENTS
+)
+
+REQUIREMENTS_SRCS = [
+    "requirements.in",
+    "test-requirements.txt",
+    "nvidia-requirements.txt",
+]
+
+exports_files(["numpy.json"])
+
+filegroup(
+    name = "numpy_json",
+    srcs = ["numpy.json"],
+    visibility = ["//visibility:public"],
+)
 
 compile_pip_requirements(
     name = "requirements",
+    srcs = REQUIREMENTS_SRCS,
     extra_args = [
         "--allow-unsafe",
         "--build-isolation",
         "--rebuild",
+        "--index-url=https://us-python.pkg.dev/ml-oss-artifacts-published/pypi-mirror/simple",
     ],
-    requirements_in = "requirements.in",
-    requirements_txt = REQUIREMENTS,
     generate_hashes = True,
-    data = ["test-requirements.txt"]
+    requirements_txt = REQUIREMENTS_TXT,
 )
 
 compile_pip_requirements(
     name = "requirements_nightly",
+    srcs = REQUIREMENTS_SRCS,
     extra_args = [
         "--allow-unsafe",
         "--build-isolation",
+        "--index-url=https://us-python.pkg.dev/ml-oss-artifacts-published/pypi-mirror/simple",
         "--extra-index-url=https://pypi.anaconda.org/scientific-python-nightly-wheels/simple",
         "--pre",
-        "--upgrade"
+        "--upgrade",
     ],
-    requirements_in = "requirements.in",
-    requirements_txt = REQUIREMENTS,
     generate_hashes = False,
-    data = ["test-requirements.txt"]
+    requirements_txt = REQUIREMENTS_TXT,
 )
 
 compile_pip_requirements(
     name = "requirements_dev",
+    srcs = REQUIREMENTS_SRCS,
     extra_args = [
         "--allow-unsafe",
         "--build-isolation",
         "--upgrade",
         "--rebuild",
+        "--index-url=https://us-python.pkg.dev/ml-oss-artifacts-published/pypi-mirror/simple",
     ],
-    requirements_in = "requirements.in",
-    requirements_txt = REQUIREMENTS,
     generate_hashes = False,
-    data = ["test-requirements.txt"]
+    requirements_txt = REQUIREMENTS_TXT,
 )
 
 py_library(
     name = "all_py_deps",
-    deps = all_py_deps(["zstandard"]),
+    deps = all_py_deps([
+        "zstandard",
+        "tensorstore",
+    ]),
 )

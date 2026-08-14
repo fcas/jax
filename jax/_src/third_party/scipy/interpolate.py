@@ -1,7 +1,10 @@
 from itertools import product
 
-from jax.numpy import (asarray, broadcast_arrays, can_cast,
-                       empty, nan, searchsorted, where, zeros)
+import numpy as np
+
+from jax._src import dtypes
+from jax._src.numpy import (asarray, broadcast_arrays,
+                            empty, searchsorted, where, zeros)
 from jax._src.tree_util import register_pytree_node
 from jax._src.numpy.util import check_arraylike, promote_dtypes_inexact
 
@@ -45,7 +48,7 @@ class RegularGridInterpolator:
   Returns:
     interpolator: callable interpolation object.
 
-  Example:
+  Examples:
     >>> points = (jnp.array([1, 2, 3]), jnp.array([4, 5, 6]))
     >>> values = jnp.array([[10, 20, 30], [40, 50, 60], [70, 80, 90]])
     >>> interpolate = RegularGridInterpolator(points, values, method='linear')
@@ -53,6 +56,14 @@ class RegularGridInterpolator:
     >>> query_points = jnp.array([[1.5, 4.5], [2.2, 5.8]])
     >>> interpolate(query_points)
     Array([30., 64.], dtype=float32)
+
+  Note:
+    Unlike :class:`scipy.interpolate.RegularGridInterpolator`, JAX requires each
+    axis in ``points`` to be strictly increasing. SciPy accepts any monotonic
+    axis (increasing or decreasing), but a decreasing axis is not supported
+    here and will silently produce incorrect results. Reorder the grid (and the
+    corresponding axis of ``values``) so each axis is strictly increasing
+    before constructing the interpolator.
   """
   # Based on SciPy's implementation which in turn is originally based on an
   # implementation by Johannes Buchner
@@ -62,7 +73,7 @@ class RegularGridInterpolator:
                values,
                method="linear",
                bounds_error=False,
-               fill_value=nan):
+               fill_value=np.nan):
     if method not in ("linear", "nearest"):
       raise ValueError(f"method {method!r} is not defined")
     self.method = method
@@ -80,7 +91,7 @@ class RegularGridInterpolator:
     if fill_value is not None:
       check_arraylike("RegularGridInterpolator", fill_value)
       fill_value = asarray(fill_value)
-      if not can_cast(fill_value.dtype, values.dtype, casting='same_kind'):
+      if not dtypes.can_cast(fill_value.dtype, values.dtype, casting='same_kind'):
         ve = "fill_value must be either 'None' or of a type compatible with values"
         raise ValueError(ve)
     self.fill_value = fill_value
@@ -164,7 +175,7 @@ register_pytree_node(
     lambda obj: ((obj.grid, obj.values, obj.fill_value),
                  (obj.method, obj.bounds_error)),
     lambda aux, children: RegularGridInterpolator(
-        *children[:2],  # type: ignore[index]
+        *children[:2],
         *aux,
-        *children[2:]),  # type: ignore[index]
+        *children[2:]),
 )

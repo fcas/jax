@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@rules_python//python:defs.bzl", "py_library")
+load("//jaxlib:jax.bzl", "jax_multiplatform_test", "py_deps", "py_library")
 
 licenses(["notice"])
 
 package(
     default_applicable_licenses = [],
-    default_visibility = ["//third_party/py/jax:internal"],
+    default_visibility = ["//jax/experimental:mosaic_gpu_users"],
 )
 
 exports_files(
@@ -26,23 +26,58 @@ exports_files(
         "flash_attention.py",
         "matmul.py",
     ],
-    visibility = ["//third_party/py/jax:internal"],
+    visibility = ["//jax:internal"],
+)
+
+py_library(
+    name = "gpu_examples",
+    srcs = [
+        "__init__.py",
+    ],
+    visibility = ["//jax:internal"],
 )
 
 py_library(
     name = "matmul",
     srcs = ["matmul.py"],
+    strict_deps = False,
     deps = [
-        "//third_party/py/jax",
-        "//third_party/py/jax:mosaic_gpu",
+        "//jax",
+        "//jax/experimental:mosaic_gpu",
+    ],
+)
+
+py_library(
+    name = "matmul_blackwell",
+    srcs = ["matmul_blackwell.py"],
+    strict_deps = False,
+    deps = [
+        "//jax",
+        "//jax/experimental:mosaic_gpu",
     ],
 )
 
 py_library(
     name = "flash_attention",
     srcs = ["flash_attention.py"],
+    strict_deps = False,
     deps = [
-        "//third_party/py/jax",
-        "//third_party/py/jax:mosaic_gpu",
+        "//jax",
+        "//jax/experimental:mosaic_gpu",
     ],
+)
+
+jax_multiplatform_test(
+    name = "run_matmul",
+    srcs = ["matmul.py"],
+    enable_backends = [],
+    enable_configs = ["gpu_h100"],
+    main = "matmul.py",
+    tags = [
+        "manual",
+        "notap",
+    ],
+    deps = [
+        "//jax/experimental:mosaic_gpu",
+    ] + py_deps("numpy"),
 )

@@ -7,27 +7,25 @@ JAX tutorials draft
 
 .. note::
 
-   This is a 
    The tutorials below are a work in progress; for the time being, please refer
    to the older tutorial content, including :ref:`beginner-guide`,
-   :ref:`user-guides`, and the now-deleted *JAX 101* tutorials.
+   :ref:`jax-101`, and the now-deleted *JAX 101* tutorials.
 
 JAX 101
 -------
-Mostly finalized at :ref:`jax-tutorials`!
+Mostly finalized at :ref:`jax-101`!
 
 .. toctree::
    :maxdepth: 1
 
-   ../quickstart
    ../key-concepts
    ../jit-compilation
    ../automatic-vectorization
    ../automatic-differentiation
    ../debugging
    ../random-numbers
-   ../working-with-pytrees
-   ../sharded-computation
+   ../pytrees
+   ../parallel
    ../stateful-computations
    simple-neural-network
 
@@ -39,12 +37,8 @@ JAX 201
    :maxdepth: 1
 
    parallelism
-   advanced-autodiff
-   gradient-checkpointing
    advanced-debugging
-   external-callbacks
    profiling-and-performance
-
 
 JAX 301
 -------
@@ -52,6 +46,4 @@ JAX 301
 .. toctree::
    :maxdepth: 1
 
-   jax-primitives
-   jaxpr
    advanced-compilation

@@ -1,4 +1,4 @@
-# Copyright 2021 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2021 The JAX Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for mesh utils."""
 
 import collections
 from collections.abc import Sequence
@@ -21,12 +20,22 @@ import dataclasses
 from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
-from jax._src import test_util
-from jax.experimental import mesh_utils
-from jax.sharding import Mesh  # pylint: disable=g-importing-member
+from jax._src import mesh as mesh_lib
+from jax._src import mesh_utils
+from jax._src import test_util as jtu
+from jax._src.sharding_impls import NamedSharding, PartitionSpec, local_to_global_shape
+from jax.sharding import Mesh
 import numpy as np
 
 # pyformat: disable
+
+
+@dataclasses.dataclass(frozen=True)
+class MockClient:
+  """Mock client for testing, everything is done as process index 0."""
+  def process_index(self) -> int:
+    return 0
+
 
 @dataclasses.dataclass(frozen=True)
 class MockTpuDevice:
@@ -38,14 +47,24 @@ class MockTpuDevice:
   coords: Sequence[int]
   core_on_chip: int
   slice_index: int = 0
+  client: MockClient = dataclasses.field(default_factory=MockClient)
 
 
 def mock_tpu_devices(x, y, z, dev_kind, one_device_per_chip, num_slices=1,
                      reorder=False):
   """Produce fake jax.devices() output for a TPU slice."""
+  assert x > 0 and y > 0 and z > 0
+
   cores_per_chip = 1 if one_device_per_chip else 2
-  nxd, nyd, nzd = (2, 2, 1)
+
+  # 3D shape of the mesh of devices on each host (= process).
+  nxd, nyd, nzd = (min(x, 2), min(y, 2), 1)
+  # 3D shape of the mesh of hosts (= processes):
   nxp, nyp, nzp = x // nxd, y // nyd, z // nzd
+  assert nxp * nxd == x
+  assert nyp * nyd == y
+  assert nzp * nzd == z
+
   def mock_tpu_device(core_on_chip, xd, yd, zd, xp, yp, zp, slice_index):
     process_index = xp + nxp * (yp + nyp * (zp + nzp * slice_index))
     coords =  (xd + nxd * xp, yd + nyd * yp, zd + nzd * zp)
@@ -60,23 +79,46 @@ def mock_tpu_devices(x, y, z, dev_kind, one_device_per_chip, num_slices=1,
              for core_on_chip in range(cores_per_chip)]
   if reorder:
     devices = devices[::-1]
-  _validate_mocked_process_indices(devices, one_device_per_chip)
+
+  # Validate the generated mock devices:
+  num_local_chips = nxd * nyd  # Number of mock devices / process.
+  if num_local_chips < 4:
+    # Sub-host slice = fewer than the 4 chips available on a host:
+    # e.g., 1x1 TPU v2.  All devices should be on one host.
+    num_all_chips = x * y * z
+    assert num_all_chips == num_local_chips, f'Bad shape: {x=}, {y=}, {z=}'
+    # Implied by the previous assertion, but let's be explicit:
+    assert z == 1
+    _validate_mocked_devices_for_subhost_slice(devices, x, y, cores_per_chip)
+  else:
+    _validate_mocked_devices(devices, num_local_chips * cores_per_chip)
+
   return devices
 
 
 # If this function raises, it's a bug in the test code!
-def _validate_mocked_process_indices(devices, one_device_per_chip):
+def _validate_mocked_devices_for_subhost_slice(devices, x, y, cores_per_chip):
+  first_device = devices[0]
+  distinct_coords = set()
+  for d in devices:
+    assert d.process_index == first_device.process_index
+    assert d.coords[0] >= 0 and d.coords[0] < x
+    assert d.coords[1] >= 0 and d.coords[1] < y
+    assert d.coords[2] == 0
+    assert d.core_on_chip >= 0 and d.core_on_chip < cores_per_chip
+    distinct_coords.add((d.coords[0], d.coords[1], 0, d.core_on_chip))
+  assert len(distinct_coords) == x * y * cores_per_chip
+
+
+# If this function raises, it's a bug in the test code!
+def _validate_mocked_devices(devices, num_local_devices):
+  # NOTE: this function is not called for sub-host slices.
   process_to_devices = collections.defaultdict(list)
   for d in devices:
     process_to_devices[d.process_index].append(d)
 
   for local_devices in process_to_devices.values():
-    if one_device_per_chip:
-      # 4 devices per process
-      assert len(local_devices) == 4, local_devices
-    else:
-      # 8 devices per process
-      assert len(local_devices) == 8, local_devices
+    assert len(local_devices) == num_local_devices, local_devices
     # All devices have same z coord
     assert len({d.coords[2] for d in local_devices}) == 1, local_devices
     # All devices in a 2x2 subgrid
@@ -132,31 +174,57 @@ def mock_4x8x8_devices(one_device_per_chip):
   return mock_tpu_devices(4, 8, 8, 'TPU v4', one_device_per_chip)
 
 
-def mock_4x8x16_devices(one_device_per_chip):
-  """Hard-coded reproduction of jax.devices() output on 4x8x16."""
-  return mock_tpu_devices(4, 8, 16, 'TPU v4', one_device_per_chip)
-
-
 def mock_8x8x16_devices(one_device_per_chip):
   """Hard-coded reproduction of jax.devices() output on 8x8x16."""
   return mock_tpu_devices(8, 8, 16, 'TPU v4', one_device_per_chip)
 
+def mock_4x2_v5e_devices(one_device_per_chip=True):
+  """Hard-coded reproduction of jax.devices() output on 4x2 v5e."""
+  return mock_tpu_devices(4, 2, 1, 'TPU v5 lite', one_device_per_chip)
 
-class MeshUtilsTest(test_util.JaxTestCase):
+def mock_2x2x2_v5e_devices(one_device_per_chip=True):
+  """Hard-coded reproduction of jax.devices() output on 2x2x2 v5e."""
+  return mock_tpu_devices(2, 2, 2, 'TPU v5 lite', one_device_per_chip)
+
+
+_V7_MESH_TEST_CASES = (
+  #        <-logical-> <-physical->
+  ('1x1x2', [1, 1, 2], [1, 1, 1], [[[0, 1]]]),
+  ('2x1x4', [2, 1, 4], [2, 2, 1], [[[0, 1, 2, 3]], [[6, 7, 4, 5]]]),
+  ('4x1x2', [4, 1, 2], [2, 2, 1], [[[0, 1]], [[2, 3]], [[6, 7]], [[4, 5]]]),
+  ('4x2x2', [4, 2, 2], [2, 2, 2], [[[0, 1], [2, 3]],
+                                    [[6, 7], [4, 5]],
+                                    [[8, 9], [10, 11]],
+                                    [[14, 15], [12, 13]]]),
+  ('8x2',   [2, 8],    [2, 2, 2], [[0, 1, 2, 3, 6, 7, 4, 5],
+                                    [8, 9, 10, 11, 14, 15, 12, 13]]),
+  ('4x4x2', [4, 4, 2], [2, 2, 4], [[[0, 1], [2, 3],
+                                    [6, 7], [4, 5]],
+                                    [[8, 9], [10, 11],
+                                    [14, 15], [12, 13]],
+                                    [[16, 17], [18, 19],
+                                    [22, 23], [20, 21]],
+                                    [[24, 25], [26, 27],
+                                    [30, 31], [28, 29]]]),
+  ('4x2x4', [4, 2, 4], [2, 2, 4], [[[0, 1, 2, 3], [6, 7, 4, 5]],
+                                    [[8, 9, 10, 11], [14, 15, 12, 13]],
+                                    [[16, 17, 18, 19], [22, 23, 20, 21]],
+                                    [[24, 25, 26, 27], [30, 31, 28, 29]]]),
+  ('8x4',   [8, 4],    [2, 2, 4], [[0, 1, 2, 3], [6, 7, 4, 5],
+                                    [8, 9, 10, 11], [14, 15, 12, 13],
+                                    [16, 17, 18, 19], [22, 23, 20, 21],
+                                    [24, 25, 26, 27], [30, 31, 28, 29]]),
+  ('4x8',   [4, 8],    [2, 2, 4], [[0, 1, 2, 3, 6, 7, 4, 5],
+                                    [8, 9, 10, 11, 14, 15, 12, 13],
+                                    [16, 17, 18, 19, 22, 23, 20, 21],
+                                    [24, 25, 26, 27, 30, 31, 28, 29]]),
+)
+
+
+class MeshUtilsTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
-      ('2x2x1_t', mock_2x2x1_devices, True, (2, 2, 1, 1)),
-      ('2x2x1_f', mock_2x2x1_devices, False, (2, 2, 1, 2)),
-      ('8x8x16_t', mock_8x8x16_devices, True, (8, 8, 16, 1)),
-      ('8x8x16_f', mock_8x8x16_devices, False, (8, 8, 16, 2)),
-  )
-  def test_bounds_from_last_device(self, devices, one_device_per_chip,
-                                   expected_bounds):
-    self.assertEqual(
-        mesh_utils._bounds_from_last_device(devices(one_device_per_chip)[-1]),
-        expected_bounds)
-
-  @parameterized.named_parameters(
+      ('1x2x1_t', (1, 2, 1), True),
       ('4x4x4_t', (4, 4, 4), True),
       ('4x4x4_f', (4, 4, 4), False),
       ('8x8x16_t', (8, 8, 16), True),
@@ -172,6 +240,102 @@ class MeshUtilsTest(test_util.JaxTestCase):
       for j in range(y):
         for k in range(z):
           self.assertEqual(normalized[i, j, k].coords, (i, j, k))
+
+  def test_get_physical_tpu_mesh_with_subslice_TPU_v2_1x1(self):
+    one_device_per_chip = False  # Each TPU v2 chip has 2 devices.
+    device_list = mock_tpu_devices(1, 1, 1, 'TPU v2', one_device_per_chip)
+    device_array = mesh_utils._get_physical_tpu_mesh(device_list)
+    self.assertEqual(device_array.shape, (1, 1, 2))
+
+    # A subslice that includes the device at (0, 0, 0): core #0 of the
+    # device at (x, y, z) == (0, 0, 0).
+    subslice0 = mesh_utils._get_physical_tpu_mesh([device_array[0, 0, 0]])
+    self.assertEqual(subslice0.shape, (1, 1, 1))
+    self.assertEqual(subslice0[0, 0, 0], device_array[0, 0, 0])
+    self.assertEqual(subslice0[0, 0, 0].coords, (0, 0, 0))
+    self.assertEqual(subslice0[0, 0, 0].core_on_chip, 0)
+
+    # Another subsublice, without the device at (0, 0, 0): core #1 of
+    # the device at (x, y, z) == (0, 0, 0).
+    subslice1 = mesh_utils._get_physical_tpu_mesh([device_array[0, 0, 1]])
+    self.assertEqual(subslice1.shape, (1, 1, 1))
+    self.assertEqual(subslice1[0, 0, 0], device_array[0, 0, 1])
+    self.assertEqual(subslice1[0, 0, 0].coords, (0, 0, 0))
+    self.assertEqual(subslice1[0, 0, 0].core_on_chip, 1)
+
+  def test_get_physical_tpu_mesh_with_subslice_TPU_v4_1x2x1(self):
+    one_device_per_chip = True  # For TPU v4, chip == device.
+    device_list = mock_tpu_devices(1, 2, 1, 'TPU v4', one_device_per_chip)
+    device_array = mesh_utils._get_physical_tpu_mesh(device_list)
+    self.assertEqual(device_array.shape, (1, 2, 1))
+
+    # A subslice that includes the device at (0, 0, 0).
+    subslice0 = mesh_utils._get_physical_tpu_mesh([device_array[0, 0, 0]])
+    self.assertEqual(subslice0.shape, (1, 1, 1))
+    self.assertEqual(subslice0[0, 0, 0], device_array[0, 0, 0])
+
+    # Another subsublice, without the device at (0, 0, 0).
+    subslice1 = mesh_utils._get_physical_tpu_mesh([device_array[0, 1, 0]])
+    self.assertEqual(subslice1.shape, (1, 1, 1))
+    self.assertEqual(subslice1[0, 0, 0], device_array[0, 1, 0])
+
+  def test_get_physical_tpu_mesh_with_subslice_TPU_v5e_4x4(self):
+    one_device_per_chip = True  # For TPU v5e, chip == device.
+    device_list = mock_tpu_devices(4, 4, 1, 'TPU v5e', one_device_per_chip)
+    device_array = mesh_utils._get_physical_tpu_mesh(device_list)
+
+    # `device_array` is isomorphic with a 4x4 grid (z coord == 0).
+    self.assertEqual(device_array.shape, (4, 4, 1))
+
+    # Two subslices: each subslice has shape (4, 2); first one starts
+    # at (x=0, y=0), the other at (x=0, y=2); visually, the left
+    # and right halves of the (4, 4) grid.
+    for start_y in (0, 2):
+      subslice_devices = []
+      for x in range(4):
+        for delta_y in range(2):
+          subslice_devices.append(device_array[x, start_y + delta_y, 0])
+      logging.info(
+          'start_y=%s subslice_devices=%s', start_y, subslice_devices
+      )
+      subslice = mesh_utils._get_physical_tpu_mesh(subslice_devices)
+      self.assertEqual(subslice.shape, (4, 2, 1))
+      for x in range(4):
+        for delta_y in range(2):
+          self.assertEqual(
+              subslice[x, delta_y],
+              device_array[x, start_y + delta_y, 0],
+          )
+
+  def test_get_physical_tpu_mesh_with_bad_subslice(self):
+    one_device_per_chip = True  # For TPU v5e, chip == device.
+    device_list = mock_tpu_devices(4, 4, 1, 'TPU v5e', one_device_per_chip)
+    device_array = mesh_utils._get_physical_tpu_mesh(device_list)
+
+    self.assertEqual(device_array.shape, (4, 4, 1))
+
+    # Second subslice from
+    # test_get_physical_tpu_mesh_with_subslice_TPU_v5e_4x4, without
+    # the device from its top-left corner (device from (0, 2, 0)).
+    start_y = 2
+    subslice_devices = []
+    for x in range(4):
+      for delta_y in range(2):
+        if (x == 0) and (delta_y == 0):
+          # Skip device from (0, 2, 0).
+          continue
+        subslice_devices.append(device_array[x, start_y + delta_y, 0])
+
+    # subslice_devices are obviously not a cuboid: only 7 devices.
+    with self.assertRaises(AssertionError):
+      mesh_utils._get_physical_tpu_mesh(subslice_devices)
+
+    # Make it a bit harder, such that just a simple test on
+    # len(subslice_devices) is not enough: 8 devices, but two of them
+    # are identical (device from (2, 2, 0) is duplicated.
+    subslice_devices.append(device_array[2, 2, 0])
+    with self.assertRaisesRegex(AssertionError, 'not a contiguous cuboid'):
+      mesh_utils._get_physical_tpu_mesh(subslice_devices)
 
   @parameterized.named_parameters(
       ('2x2x1', mock_2x2x1_devices, [1, 1, 4], [(), (), (0, 1, 2)]),
@@ -206,6 +370,47 @@ class MeshUtilsTest(test_util.JaxTestCase):
             physical_mesh.shape[physical_axis]
         )
     self.assertArraysEqual(assignment, expected_assignment_matrix)
+
+  def test_create_device_mesh_non_int_error(self):
+    with self.assertRaisesRegex(
+        ValueError,
+        "`mesh_shape` passed to `create_device_mesh` should be a sequence of ints"):
+      mesh_utils.create_device_mesh(((4,), 4))
+
+  @parameterized.named_parameters(
+      ('2x2x1', mock_2x2x1_devices,),
+      ('2x2x4', mock_2x2x4_devices, ),
+      ('4x4x4', mock_4x4x4_devices,),
+      ('4x4x8', mock_4x4x8_devices,),
+      ('4x8x8', mock_4x8x8_devices, ),
+      ('8x8', mock_8x8_devices),
+  )
+  def test_create_device_mesh_has_computable_global_shape(self, devices):
+    def factorize(n, max_factors=3):
+      if max_factors == 1 or n == 1:
+        yield (n, ) * max_factors
+        return
+      for i in range(2, n+1):
+        if n % i == 0:
+          for remaining in factorize(n // i, max_factors=max_factors - 1):
+            yield (i, *remaining)
+    jax_devices = devices(True)
+    for mesh_shape in factorize(len(jax_devices), max_factors=3):
+      mesh = mesh_utils.create_device_mesh(mesh_shape, devices=jax_devices,
+                                           allow_split_physical_axes=True)
+      mesh = mesh_lib.Mesh(mesh, ('a', 'b', 'c'))
+      sharding = NamedSharding(mesh, PartitionSpec('a', 'b', 'c'))
+      computed_global_shape = local_to_global_shape(sharding, (1, 1, 1))
+      self.assertFalse(
+          np.any([x is None for x in computed_global_shape]),
+          f'{mesh_shape=}, {computed_global_shape=} is not uniform')
+
+      sharding = NamedSharding(mesh, PartitionSpec(('a', 'c',), 'b'))
+      computed_global_shape = local_to_global_shape(sharding, (1, 1, 1))
+      self.assertFalse(
+          np.any([x is None for x in computed_global_shape]),
+          f'{mesh_shape=}, {computed_global_shape=} is not uniform')
+
 
   @parameterized.named_parameters(
       ('2x2x1', mock_2x2x1_devices, [1, 1, 4], [(), (), (0, 1, 2)]),
@@ -389,6 +594,20 @@ class MeshUtilsTest(test_util.JaxTestCase):
     device_id_mesh = np.vectorize(lambda d: d.id)(mesh)
     self.assertAllClose(np.array(expected_device_id_mesh), device_id_mesh)
 
+  @parameterized.named_parameters(
+      # Ring order over tray
+      ('4x2_1d', mock_4x2_v5e_devices, [8], [0, 1, 2, 3, 7, 6, 5, 4]),
+      # Iota order
+      ('2x2x2_1d', mock_2x2x2_v5e_devices, [8], [0, 4, 2, 6, 1, 5, 3, 7]),
+  )
+  def test_v5e_create_device_mesh(self, devices, mesh_shape,
+                                 expected_device_id_mesh):
+    global_devices = devices()
+    mesh = mesh_utils.create_device_mesh(
+        mesh_shape, devices=global_devices, contiguous_submeshes=False)
+    device_id_mesh = np.vectorize(lambda d: d.id)(mesh)
+    self.assertAllClose(np.array(expected_device_id_mesh), device_id_mesh)
+
   def _assert_contiguous_submeshes(self, global_device_mesh):
     global_mesh = Mesh(global_device_mesh, list(range(global_device_mesh.ndim)))
     max_process_index = max(d.process_index
@@ -450,6 +669,116 @@ class MeshUtilsTest(test_util.JaxTestCase):
           mesh_shape, devices=devices, contiguous_submeshes=True
       )
 
+  @parameterized.named_parameters(
+      *[(f'{name}_{suffix}', logical, physical, expected, kind)
+        for name, logical, physical, expected in _V7_MESH_TEST_CASES
+        for suffix, kind in [('v7x', mesh_utils._TPU_7X),
+                             ('v7', mesh_utils._TPU_7)]]
+  )
+  def test_v7x_create_device_mesh(
+      self, logical_mesh_shape, physical_mesh_shape, expected_device_id_mesh,
+      device_kind
+  ):
+    global_devices = mock_tpu_devices(
+        physical_mesh_shape[0],
+        physical_mesh_shape[1],
+        physical_mesh_shape[2],
+        device_kind,
+        one_device_per_chip=False,
+    )
+    mesh = mesh_utils.create_device_mesh(
+        logical_mesh_shape, devices=global_devices, contiguous_submeshes=False
+    )
+    device_id_mesh = np.vectorize(lambda d: d.id)(mesh)
+    self.assertAllClose(device_id_mesh, np.array(expected_device_id_mesh))
+
+  @parameterized.named_parameters(
+      ('v7x', mesh_utils._TPU_7X),
+      ('v7', mesh_utils._TPU_7),
+  )
+  def test_v7x_create_device_mesh_fallback(self, device_kind):
+    devices = mock_tpu_devices(2, 4, 4, device_kind,
+                               one_device_per_chip=False)
+    mesh = mesh_utils.create_device_mesh(
+        (1, 32), devices=devices[:32], contiguous_submeshes=False)
+    self.assertEqual(mesh.shape, (1, 32))
+
+    mesh = mesh_utils.create_device_mesh(
+        (1, 32), devices=devices[32:], contiguous_submeshes=False)
+    self.assertEqual(mesh.shape, (1, 32))
+
+  @parameterized.named_parameters(
+      ('v7x', mesh_utils._TPU_7X),
+      ('v7', mesh_utils._TPU_7),
+  )
+  def test_v7_core_axis_priority(self, device_kind):
+    """Test that high network-intensity axes are assigned to core axis (highest bandwidth).
+
+    For TPU v7, the physical mesh shape is 4D: (x, y, z, core). The core axis
+    has the highest bandwidth. This test verifies that when we have a logical
+    mesh like [DP=2, FSDP=32] where FSDP has higher network intensity, the FSDP
+    axis is preferentially mapped to the core axis.
+
+    Physical mesh: (2, 4, 4, 2) = (x, y, z, core), total 64 devices
+    Logical mesh: (2, 32) = (DP, FSDP)
+
+    Without priority: FSDP=32 might be assigned to x*y*z = 2*4*4 = 32,
+    leaving DP=2 on core axis.
+
+    With priority: FSDP=32 should be assigned to y*z*core = 4*4*2 = 32 or
+    similar combination that includes the core axis.
+    """
+    devices = mock_tpu_devices(2, 4, 4, device_kind,
+                               one_device_per_chip=False)
+    # Use all 64 devices: DP=2, FSDP=32
+    mesh = mesh_utils.create_device_mesh(
+        (2, 32), devices=devices, contiguous_submeshes=False)
+    self.assertEqual(mesh.shape, (2, 32))
+
+    # Verify physical mesh is 4D for v7
+    physical_mesh = mesh_utils._get_physical_tpu_mesh(devices)
+    self.assertEqual(physical_mesh.shape, (2, 4, 4, 2))  # (x, y, z, core)
+
+    # _create_device_mesh_for_nd_torus detects the v7 device kind and
+    # preferentially maps high network intensity logical axes to the core axis.
+    # mesh_shape (2, 32): FSDP=32 (axis 1) should include core (axis 3)
+    device_mesh, assignment = mesh_utils._create_device_mesh_for_nd_torus(
+        physical_mesh,
+        (2, 32),
+    )
+    self.assertEqual(device_mesh.shape, (2, 32))
+
+    # assignment[physical_axis, logical_axis]
+    # assignment[:, 1] shows how FSDP (logical axis 1) is mapped
+    fsdp_assignment = assignment[:, 1]
+    # FSDP should use core axis (axis 3), so assignment[3, 1] should be 2 (core size)
+    self.assertEqual(fsdp_assignment[3], 2,  # core axis is used
+                     f"FSDP should be assigned to core axis, got assignment: {assignment}")
+
+  @parameterized.named_parameters(
+      ('v7x', mesh_utils._TPU_7X),
+      ('v7', mesh_utils._TPU_7),
+  )
+  def test_v7_core_axis_priority_direct(self, device_kind):
+    """Direct test of v7 core-axis priority behavior inside nd_torus."""
+    devices = mock_tpu_devices(2, 2, 2, device_kind,
+                               one_device_per_chip=False)
+    physical_mesh = mesh_utils._get_physical_tpu_mesh(devices)
+    # (2, 2, 2, 2) = 16 devices
+    self.assertEqual(physical_mesh.shape, (2, 2, 2, 2))
+
+    # logical mesh (2, 8): FSDP=8 could be assigned to x*y*z = 2*2*2 = 8 (no
+    # core) or y*z*core = 2*2*2 = 8 (with core). For v7, nd_torus applies the
+    # core-axis priority automatically, so the combination including core
+    # should be preferred.
+    _, assignment = mesh_utils._create_device_mesh_for_nd_torus(
+        physical_mesh, (2, 8)
+    )
+
+    # Verify FSDP (axis 1) uses core (axis 3)
+    self.assertEqual(assignment[3, 1], 2,
+                     f"For v7, FSDP should use core axis: {assignment}")
+
 
 def int64_array(x) -> np.ndarray:
   return np.array(x, dtype=np.int64)
@@ -459,7 +788,7 @@ def get_int_mesh(shape: Sequence[int]) -> np.ndarray:
   return np.arange(np.prod(shape), dtype=np.int64).reshape(shape)
 
 
-class SplitAxesDeviceMeshCreationTest(test_util.JaxTestCase):
+class SplitAxesDeviceMeshCreationTest(jtu.JaxTestCase):
 
   def test_get_prime_factors(self):
     self.assertEqual(mesh_utils._get_prime_factors(1), [])  # 1 has no factor.
@@ -471,6 +800,10 @@ class SplitAxesDeviceMeshCreationTest(test_util.JaxTestCase):
     self.assertEqual(mesh_utils._get_prime_factors(12), [2, 2, 3])
     self.assertEqual(mesh_utils._get_prime_factors(121), [11, 11])  # square
     self.assertEqual(mesh_utils._get_prime_factors(43), [43])  # prime
+    self.assertEqual(mesh_utils._get_prime_factors(10), [2, 5])
+    self.assertEqual(mesh_utils._get_prime_factors(14), [2, 7])
+    self.assertEqual(mesh_utils._get_prime_factors(22), [2, 11])
+    self.assertEqual(mesh_utils._get_prime_factors(26), [2, 13])
 
   @parameterized.named_parameters(
       (
@@ -604,4 +937,4 @@ class SplitAxesDeviceMeshCreationTest(test_util.JaxTestCase):
 
 
 if __name__ == '__main__':
-  absltest.main()
+  absltest.main(testLoader=jtu.JaxTestLoader())

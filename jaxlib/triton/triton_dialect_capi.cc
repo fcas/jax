@@ -15,12 +15,16 @@ limitations under the License.
 
 #include "jaxlib/triton/triton_dialect_capi.h"
 
-#include "llvm/include/llvm/Support/Casting.h"
-#include "mlir/include/mlir-c/IR.h"
-#include "mlir/include/mlir/CAPI/IR.h"
-#include "mlir/include/mlir/CAPI/Registration.h"
-#include "mlir/include/mlir/IR/Attributes.h"
-#include "mlir/include/mlir/IR/Dialect.h"
+#include <optional>
+
+#include "llvm/Support/Casting.h"
+#include "mlir-c/IR.h"
+#include "mlir-c/Support.h"
+#include "mlir/CAPI/IR.h"
+#include "mlir/CAPI/Registration.h"
+#include "mlir/CAPI/Support.h"
+#include "mlir/IR/Attributes.h"
+#include "mlir/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 
@@ -51,13 +55,17 @@ int mlirTritonPointerTypeGetAddressSpace(MlirType pointerType) {
 MlirAttribute mlirTritonInferReduceOpEncoding(MlirAttribute operandEncoding,
                                               int axis) {
   auto opEncoding = unwrap(operandEncoding);
-  mlir::Dialect &dialect = opEncoding.getDialect();
+  mlir::Dialect& dialect = opEncoding.getDialect();
   auto inferLayoutInterface =
       llvm::dyn_cast<mlir::triton::DialectInferLayoutInterface>(&dialect);
   mlir::Attribute retEncoding;
   (void)inferLayoutInterface->inferReduceOpEncoding(opEncoding, axis,
-                                                    retEncoding);
+                                                    retEncoding, std::nullopt);
   return wrap(retEncoding);
+}
+
+MlirTypeID mlirTritonPointerTypeGetTypeID(void) {
+  return wrap(mlir::triton::PointerType::getTypeID());
 }
 
 }  // extern "C"

@@ -18,7 +18,7 @@ limitations under the License.
 //
 // To build a HloModule,
 //
-// $ python3 jax/tools/jax_to_hlo.py \
+// $ python3 jax/tools/jax_to_ir.py \
 // --fn examples.jax_cpp.prog.fn \
 // --input_shapes '[("x", "f32[2,2]"), ("y", "f32[2,2]")]' \
 // --constants '{"z": 2.0}' \
@@ -36,19 +36,25 @@ limitations under the License.
 // }
 // )
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "absl/log/log.h"
+#include "absl/status/statusor.h"
+#include "xla/hlo/builder/xla_computation.h"
+#include "xla/hlo/ir/hlo_module.h"
 #include "xla/literal.h"
 #include "xla/literal_util.h"
-#include "xla/pjrt/cpu/cpu_client.h"
 #include "xla/pjrt/pjrt_client.h"
-#include "xla/status.h"
-#include "xla/statusor.h"
+#include "xla/pjrt/pjrt_executable.h"
+#include "xla/pjrt/plugin/xla_cpu/cpu_client_options.h"
+#include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
+#include "xla/service/hlo.pb.h"
+#include "xla/service/hlo_module_config.h"
 #include "xla/tools/hlo_module_loader.h"
 #include "tsl/platform/init_main.h"
-#include "tsl/platform/logging.h"
 
 int main(int argc, char** argv) {
   tsl::port::InitMain("", &argc, &argv);
@@ -67,26 +73,28 @@ int main(int argc, char** argv) {
   // Run it using JAX C++ Runtime (PJRT).
 
   // Get a CPU client.
+  xla::CpuClientOptions options;
+  options.asynchronous = true;
   std::unique_ptr<xla::PjRtClient> client =
-      xla::GetTfrtCpuClient(/*asynchronous=*/true).value();
+      xla::GetXlaPjrtCpuClient(options).value();
 
   // Compile XlaComputation to PjRtExecutable.
   xla::XlaComputation xla_computation(test_module_proto);
   xla::CompileOptions compile_options;
   std::unique_ptr<xla::PjRtLoadedExecutable> executable =
-      client->Compile(xla_computation, compile_options).value();
+      client->CompileAndLoad(xla_computation, compile_options).value();
 
   // Prepare inputs.
   xla::Literal literal_x =
       xla::LiteralUtil::CreateR2<float>({{1.0f, 2.0f}, {3.0f, 4.0f}});
   xla::Literal literal_y =
       xla::LiteralUtil::CreateR2<float>({{1.0f, 1.0f}, {1.0f, 1.0f}});
+  xla::PjRtDevice* device = client->addressable_devices()[0];
+  xla::PjRtMemorySpace* memory_space = *device->default_memory_space();
   std::unique_ptr<xla::PjRtBuffer> param_x =
-      client->BufferFromHostLiteral(literal_x, client->addressable_devices()[0])
-          .value();
+      client->BufferFromHostLiteral(literal_x, memory_space).value();
   std::unique_ptr<xla::PjRtBuffer> param_y =
-      client->BufferFromHostLiteral(literal_y, client->addressable_devices()[0])
-          .value();
+      client->BufferFromHostLiteral(literal_y, memory_space).value();
 
   // Execute on CPU.
   xla::ExecuteOptions execute_options;
@@ -97,7 +105,7 @@ int main(int argc, char** argv) {
 
   // Get result.
   std::shared_ptr<xla::Literal> result_literal =
-      results[0][0]->ToLiteralSync().value();
+      results[0][0]->ToLiteral().Await().value();
   LOG(INFO) << "result = " << *result_literal;
   return 0;
 }

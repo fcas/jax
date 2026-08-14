@@ -1,0 +1,108 @@
+# Composite action to download the jax, jaxlib, and the CUDA plugin wheels
+name: Download JAX CUDA wheels
+description: "Downloads JAX, jaxlib, and CUDA plugin wheels from Google Cloud Storage based on the runner, Python, and CUDA version."
+
+inputs:
+  python:
+    description: "Which python version should the artifact be downloaded for?"
+    required: true
+  cuda-version:
+    description: "Which cuda version should the artifact be downloaded for?"
+    default: "12"
+  use-nvidia-pip-wheels:
+    description: "Whether to download Nvidia CUDA packages from PyPI?"
+  jaxlib-version:
+    description: "Which jaxlib version to download? (head/pypi_latest)"
+    default: "head"
+  download-jax-from-gcs:
+    description: "Whether to download the jax wheel from GCS"
+    default: '1'
+  skip-download-jaxlib-and-plugins-from-gcs:
+    description: "Whether to skip downloading the jaxlib and plugins from GCS (e.g for testing a jax only release)"
+    default: '0'
+  gcs_download_uri:
+    description: "GCS location prefix from where the artifacts should be downloaded"
+    default: 'gs://general-ml-ci-transient/jax-github-actions/jax/${{ github.workflow }}/${{ github.run_number }}/${{ github.run_attempt }}'
+
+permissions: {}
+runs:
+  using: "composite"
+
+  steps:
+    # Note that certain envs such as JAXCI_HERMETIC_PYTHON_VERSION are set by the calling workflow.
+    - name: Set env vars for use in artifact download URL
+      id: set-vars
+      shell: bash
+      run: |
+        os=$(uname -s | awk '{print tolower($0)}')
+        arch=$(uname -m)
+
+        # Get the major and minor version of Python.
+        # E.g if JAXCI_HERMETIC_PYTHON_VERSION=3.12, then python_major_minor=312
+        # E.g if JAXCI_HERMETIC_PYTHON_VERSION=3.13t, then python_major_minor=313t
+        python_major_minor=$(echo "${JAXCI_HERMETIC_PYTHON_VERSION}" | tr -d '.')
+
+        echo "os=${os}" >> $GITHUB_OUTPUT
+        echo "arch=${arch}" >> $GITHUB_OUTPUT
+        # Python wheels follow a naming convention: standard wheels use the pattern
+        # `*-cp<py_version>-cp<py_version>-*`, while free-threaded wheels use
+        # `*-cp<py_version>-cp<py_version>t-*`.
+        echo "python_major_minor=cp${python_major_minor%t}-cp${python_major_minor}-" >> $GITHUB_OUTPUT
+
+        # Get the CUDA major version only
+        full_cuda_version="${INPUTS_CUDA_VERSION}"
+        echo "jaxci_cuda_version=${full_cuda_version%%.*}" >> $GITHUB_OUTPUT
+      env:
+        INPUTS_CUDA_VERSION: ${{ inputs.cuda-version }}
+    - name: Download wheels
+      shell: bash
+      id: download-wheel-artifacts
+      # Set continue-on-error to true to prevent actions from failing the workflow if this step
+      # fails. Instead, we verify the outcome in the next step so that we can print a more
+      # informative error message.
+      continue-on-error: true
+      run: |
+        mkdir -p $(pwd)/dist
+        if [[ "${INPUTS_DOWNLOAD_JAX_FROM_GCS}" == "1" ]]; then
+          gcloud storage cp -r "${INPUTS_GCS_DOWNLOAD_URI}"/jax*py3*none*any.whl $(pwd)/dist/
+        else
+          echo "JAX wheel won't be downloaded, only jaxlib pre-built wheel is tested."
+        fi
+
+        # Do not download the jaxlib and CUDA plugin artifacts if we are testing a jax only
+        # release.
+        if [[ "${INPUTS_SKIP_DOWNLOAD_JAXLIB_AND_PLUGINS_FROM_GCS}" == "1" ]]; then
+          echo "JAX only release. Only downloading the jax wheel from the release bucket."
+        else
+          if [[ ${INPUTS_JAXLIB_VERSION} == "head" ]]; then
+            gcloud storage cp -r "${INPUTS_GCS_DOWNLOAD_URI}/jaxlib*${PYTHON_MAJOR_MINOR}*${OS}*${ARCH}*.whl" $(pwd)/dist/
+            gcloud storage cp -r "${INPUTS_GCS_DOWNLOAD_URI}/jax*cuda${JAXCI_CUDA_VERSION}*plugin*${PYTHON_MAJOR_MINOR}*${OS}*${ARCH}*.whl" $(pwd)/dist/
+            gcloud storage cp -r "${INPUTS_GCS_DOWNLOAD_URI}/jax*cuda${JAXCI_CUDA_VERSION}*pjrt*${OS}*${ARCH}*.whl" $(pwd)/dist/
+          elif [[ ${INPUTS_JAXLIB_VERSION} == "pypi_latest" ]]; then
+            PYTHON=python${INPUTS_PYTHON}
+            $PYTHON -m pip download jaxlib jax-cuda${JAXCI_CUDA_VERSION}-pjrt jax-cuda${JAXCI_CUDA_VERSION}-plugin --dest $(pwd)/dist/ --no-deps
+          else
+            echo "Invalid jaxlib version: ${INPUTS_JAXLIB_VERSION}"
+            exit 1
+          fi
+        fi
+      env:
+        CLOUDSDK_AUTH_DISABLE_CREDENTIALS: 1
+        OS: ${{ steps.set-vars.outputs.os }}
+        ARCH: ${{ steps.set-vars.outputs.arch }}
+        PYTHON_MAJOR_MINOR: ${{ steps.set-vars.outputs.python_major_minor }}
+        JAXCI_CUDA_VERSION: ${{ steps.set-vars.outputs.jaxci_cuda_version }}
+        INPUTS_DOWNLOAD_JAX_FROM_GCS: ${{ inputs.download-jax-from-gcs }}
+        INPUTS_GCS_DOWNLOAD_URI: ${{ inputs.gcs_download_uri }}
+        INPUTS_SKIP_DOWNLOAD_JAXLIB_AND_PLUGINS_FROM_GCS: ${{ inputs.skip-download-jaxlib-and-plugins-from-gcs }}
+        INPUTS_JAXLIB_VERSION: ${{ inputs.jaxlib-version }}
+        INPUTS_PYTHON: ${{ inputs.python }}
+    - name: Skip the test run if the wheel artifacts were not downloaded successfully
+      shell: bash
+      if: steps.download-wheel-artifacts.outcome == 'failure'
+      run: |
+        echo "Failed to download wheel artifacts. Please check if the wheels were"
+        echo "built successfully by the artifact build jobs and are available in the GCS bucket if
+        echo "downloading from GCS."
+        echo "Skipping the test run."
+        exit 1

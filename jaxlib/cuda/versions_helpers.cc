@@ -16,8 +16,11 @@ limitations under the License.
 #include "jaxlib/cuda/versions_helpers.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 
+#include "absl/base/dynamic_annotations.h"
+#include "absl/synchronization/mutex.h"
 #include "jaxlib/gpu/gpu_kernel_helpers.h"
 #include "jaxlib/gpu/vendor.h"
 
@@ -27,42 +30,51 @@ namespace jax::cuda {
 #error "JAX requires CUDA 11.8 or newer."
 #endif  // CUDA_VERSION < 11080
 
+static bool driver_initialized = false;
+static absl::Mutex driver_initialization_mutex;
+
 int CudaRuntimeGetVersion() {
   int version;
   JAX_THROW_IF_ERROR(JAX_AS_STATUS(cudaRuntimeGetVersion(&version)));
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&version, sizeof version);
   return version;
 }
 
 int CudaDriverGetVersion() {
   int version;
   JAX_THROW_IF_ERROR(JAX_AS_STATUS(cudaDriverGetVersion(&version)));
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&version, sizeof version);
   return version;
 }
 
 uint32_t CuptiGetVersion() {
   uint32_t version;
   JAX_THROW_IF_ERROR(JAX_AS_STATUS(cuptiGetVersion(&version)));
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&version, sizeof version);
   return version;
 }
 
 int CufftGetVersion() {
   int version;
   JAX_THROW_IF_ERROR(JAX_AS_STATUS(cufftGetVersion(&version)));
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&version, sizeof version);
   return version;
 }
 
 int CusolverGetVersion() {
   int version;
   JAX_THROW_IF_ERROR(JAX_AS_STATUS(cusolverGetVersion(&version)));
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&version, sizeof version);
   return version;
 }
 
 int CublasGetVersion() {
   int version;
-  // NVIDIA promise that it's safe to parse nullptr as the handle to this
+  // NVIDIA promise that it's safe to pass a null pointer as the handle to this
   // function.
   JAX_THROW_IF_ERROR(
       JAX_AS_STATUS(cublasGetVersion(/*handle=*/nullptr, &version)));
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&version, sizeof version);
   return version;
 }
 
@@ -73,6 +85,9 @@ int CusparseGetVersion() {
   JAX_THROW_IF_ERROR(JAX_AS_STATUS(cusparseGetProperty(MAJOR_VERSION, &major)));
   JAX_THROW_IF_ERROR(JAX_AS_STATUS(cusparseGetProperty(MINOR_VERSION, &minor)));
   JAX_THROW_IF_ERROR(JAX_AS_STATUS(cusparseGetProperty(PATCH_LEVEL, &patch)));
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&major, sizeof major);
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&minor, sizeof minor);
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&patch, sizeof patch);
   return major * 1000 + minor * 100 + patch;
 }
 size_t CudnnGetVersion() {
@@ -82,25 +97,49 @@ size_t CudnnGetVersion() {
   if (version == 0) {
     throw std::runtime_error("cuDNN not found.");
   }
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&version, sizeof version);
   return version;
 }
 int CudaComputeCapability(int device) {
   int major, minor;
-  JAX_THROW_IF_ERROR(JAX_AS_STATUS(gpuInit(0)));
+  {
+    absl::MutexLock lock(driver_initialization_mutex);
+    if (!driver_initialized) {
+      JAX_THROW_IF_ERROR(JAX_AS_STATUS(cuInit(0)));
+      driver_initialized = true;
+    }
+  }
   JAX_THROW_IF_ERROR(JAX_AS_STATUS(gpuDeviceGetAttribute(
       &major, GPU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device)));
   JAX_THROW_IF_ERROR(JAX_AS_STATUS(gpuDeviceGetAttribute(
       &minor, GPU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device)));
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&major, sizeof major);
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&minor, sizeof minor);
   return major * 10 + minor;
+}
+
+bool CudaSupportsMulticast(int device) {
+  int supports_multicast;
+  JAX_THROW_IF_ERROR(JAX_AS_STATUS(gpuDeviceGetAttribute(
+      &supports_multicast, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, device)));
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&supports_multicast,
+                                      sizeof supports_multicast);
+  return supports_multicast;
 }
 
 int CudaDeviceCount() {
   int device_count = 0;
-  JAX_THROW_IF_ERROR(JAX_AS_STATUS(cuInit(0)));
+  {
+    absl::MutexLock lock(driver_initialization_mutex);
+    if (!driver_initialized) {
+      JAX_THROW_IF_ERROR(JAX_AS_STATUS(cuInit(0)));
+      driver_initialized = true;
+    }
+  }
   JAX_THROW_IF_ERROR(JAX_AS_STATUS(cuDeviceGetCount(&device_count)));
 
+  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&device_count, sizeof device_count);
   return device_count;
 }
-
 
 }  // namespace jax::cuda

@@ -13,9 +13,12 @@
 # limitations under the License.
 import itertools
 
+import numpy as np
+
 from absl.testing import absltest
 
 import jax
+from jax._src import config
 from jax._src import test_util as jtu
 import jax.scipy.fft as jsp_fft
 import scipy.fft as osp_fft
@@ -24,6 +27,7 @@ jax.config.parse_flags_with_absl()
 
 float_dtypes = jtu.dtypes.floating
 real_dtypes = float_dtypes + jtu.dtypes.integer + jtu.dtypes.boolean
+all_dtypes = real_dtypes + jtu.dtypes.complex
 
 def _get_dctn_test_axes(shape):
   axes = [[]]
@@ -46,11 +50,11 @@ class LaxBackedScipyFftTests(jtu.JaxTestCase):
   """Tests for LAX-backed scipy.fft implementations"""
 
   @jtu.sample_product(
-    dtype=real_dtypes,
+    dtype=all_dtypes,
     shape=[(10,), (2, 5)],
     n=[None, 1, 7, 13, 20],
     axis=[-1, 0],
-    norm=[None, 'ortho'],
+    norm=[None, 'ortho', 'backward'],
   )
   def testDct(self, shape, dtype, n, axis, norm):
     rng = jtu.rand_default(self.rng())
@@ -66,8 +70,8 @@ class LaxBackedScipyFftTests(jtu.JaxTestCase):
      for shape in [(10,), (10, 10), (9,), (2, 3, 4), (2, 3, 4, 5)]
      for axes in _get_dctn_test_axes(shape)
      for s in _get_dctn_test_s(shape, axes)],
-    dtype=real_dtypes,
-    norm=[None, 'ortho'],
+    dtype=all_dtypes,
+    norm=[None, 'ortho', 'backward'],
   )
   def testDctn(self, shape, dtype, s, axes, norm):
     rng = jtu.rand_default(self.rng())
@@ -79,15 +83,12 @@ class LaxBackedScipyFftTests(jtu.JaxTestCase):
     self._CompileAndCheck(jnp_fn, args_maker, atol=1e-4)
 
   @jtu.sample_product(
-    dtype=real_dtypes,
+    dtype=all_dtypes,
     shape=[(10,), (2, 5)],
     n=[None, 1, 7, 13, 20],
     axis=[-1, 0],
-    norm=[None, 'ortho'],
+    norm=[None, 'ortho', 'backward'],
   )
-  # TODO(phawkins): these tests are failing on T4 GPUs in CI with a
-  # CUDA_ERROR_ILLEGAL_ADDRESS.
-  @jtu.skip_on_devices("cuda")
   def testiDct(self, shape, dtype, n, axis, norm):
     rng = jtu.rand_default(self.rng())
     args_maker = lambda: (rng(shape, dtype),)
@@ -102,12 +103,9 @@ class LaxBackedScipyFftTests(jtu.JaxTestCase):
      for shape in [(10,), (10, 10), (9,), (2, 3, 4), (2, 3, 4, 5)]
      for axes in _get_dctn_test_axes(shape)
      for s in _get_dctn_test_s(shape, axes)],
-    dtype=real_dtypes,
-    norm=[None, 'ortho'],
+    dtype=all_dtypes,
+    norm=[None, 'ortho', 'backward'],
   )
-  # TODO(phawkins): these tests are failing on T4 GPUs in CI with a
-  # CUDA_ERROR_ILLEGAL_ADDRESS.
-  @jtu.skip_on_devices("cuda")
   def testiDctn(self, shape, dtype, s, axes, norm):
     rng = jtu.rand_default(self.rng())
     args_maker = lambda: (rng(shape, dtype),)
@@ -116,6 +114,53 @@ class LaxBackedScipyFftTests(jtu.JaxTestCase):
     self._CheckAgainstNumpy(np_fn, jnp_fn, args_maker, check_dtypes=False,
                             tol=1e-4)
     self._CompileAndCheck(jnp_fn, args_maker, atol=1e-4)
+
+  def testIdctNormalizationPrecision(self):
+    # reported in https://github.com/jax-ml/jax/issues/23895
+    if not config.enable_x64.value:
+      raise self.skipTest("requires jax_enable_x64=true")
+    x = np.ones(3, dtype="float64")
+    n = 10
+    expected = osp_fft.idct(x, n=n, type=2)
+    actual = jsp_fft.idct(x, n=n, type=2)
+    self.assertArraysAllClose(actual, expected, atol=1e-14)
+
+  @jtu.sample_product(func=['idctn', 'dctn'])
+  def testDctnShape(self, func):
+    # Regression test for https://github.com/jax-ml/jax/issues/31836
+    x = np.arange(10.0).reshape(5, 2)
+    kwds = dict(type=2, s=(12, 7), axes=(-2, -1))
+
+    osp_func = getattr(osp_fft, func)
+    jsp_func = getattr(jsp_fft, func)
+
+    expected = osp_func(x, **kwds)
+    actual = jsp_func(x, **kwds)
+    rtol = {np.float64: 1E-12, np.float32: 1E-4}
+    self.assertArraysAllClose(actual, expected, rtol=rtol)
+
+  @jtu.sample_product(func=['idctn', 'dctn'])
+  def testDctnAxesNoneSSpecified(self, func):
+    # Regression test for https://github.com/jax-ml/jax/issues/29426
+    x = np.arange(3.0).reshape(1, 3)
+    kwds = dict(type=2, s=(5,), axes=None)
+
+    osp_func = getattr(osp_fft, func)
+    jsp_func = getattr(jsp_fft, func)
+
+    expected = osp_func(x, **kwds)
+    actual = jsp_func(x, **kwds)
+    self.assertArraysAllClose(actual, expected, atol=1e-4)
+
+
+  @jtu.sample_product(func=['idctn', 'dctn'])
+  def testDctnSShapeTooLargeError(self, func):
+    x = np.arange(3.0).reshape(1, 3)
+    jsp_func = getattr(jsp_fft, func)
+    with self.assertRaisesRegex(
+        ValueError, r"s must have at most x.ndim \(2\) elements, got 3"):
+      jsp_func(x, s=(2, 3, 4))
+
 
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())

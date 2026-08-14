@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Note: import <name> as <name> is required for names to be exported.
-# See PEP 484 & https://github.com/google/jax/issues/7570
+# See PEP 484 & https://github.com/jax-ml/jax/issues/7570
 
 from jax._src.numpy.linalg import (
   cholesky as cholesky,
@@ -44,6 +44,7 @@ from jax._src.numpy.linalg import (
   tensordot as tensordot,
   tensorinv as tensorinv,
   tensorsolve as tensorsolve,
+  trace as trace,
   vector_norm as vector_norm,
   vecdot as vecdot,
 )

@@ -36,32 +36,38 @@ for examples.
 """
 
 # Note: import <name> as <name> is required for names to be exported.
-# See PEP 484 & https://github.com/google/jax/issues/7570
+# See PEP 484 & https://github.com/jax-ml/jax/issues/7570
 
 from jax._src.tree_util import (
     DictKey as DictKey,
     FlattenedIndexKey as FlattenedIndexKey,
     GetAttrKey as GetAttrKey,
+    KeyEntry as KeyEntry,
+    KeyPath as KeyPath,
     Partial as Partial,
     PyTreeDef as PyTreeDef,
     SequenceKey as SequenceKey,
     all_leaves as all_leaves,
-    build_tree as build_tree,
     default_registry as default_registry,
+    flatten_one_level as flatten_one_level,
+    flatten_one_level_with_keys as flatten_one_level_with_keys,
+    is_tree_node as is_tree_node,
     keystr as keystr,
+    register_dataclass as register_dataclass,
     register_pytree_node_class as register_pytree_node_class,
     register_pytree_node as register_pytree_node,
     register_pytree_with_keys_class as register_pytree_with_keys_class,
-    register_dataclass as register_dataclass,
     register_pytree_with_keys as register_pytree_with_keys,
     register_static as register_static,
     tree_all as tree_all,
+    tree_broadcast as tree_broadcast,
     tree_flatten_with_path as tree_flatten_with_path,
     tree_flatten as tree_flatten,
     tree_leaves_with_path as tree_leaves_with_path,
     tree_leaves as tree_leaves,
     tree_map_with_path as tree_map_with_path,
     tree_map as tree_map,
+    tree_reduce_associative as tree_reduce_associative,
     tree_reduce as tree_reduce,
     tree_structure as tree_structure,
     tree_transpose as tree_transpose,

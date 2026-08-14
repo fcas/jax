@@ -31,14 +31,11 @@ from jax.experimental.sparse import bcsr as sparse_bcsr
 from jax.experimental.sparse import util as sparse_util
 from jax.experimental.sparse import test_util as sptu
 from jax.experimental.sparse import _lowerings
-from jax._src import xla_bridge
-from jax._src.lib import gpu_sparse
 from jax import jit
 from jax import vmap
 from jax._src import test_util as jtu
-from jax.interpreters import mlir
 import jax.numpy as jnp
-from jax.util import split_list
+from jax._src.util import split_list
 import numpy as np
 import scipy.sparse
 
@@ -130,6 +127,10 @@ class cuSparseTest(sptu.SparseTestCase):
   )
   @jax.default_matmul_precision("float32")
   def test_csr_matmul_ad(self, shape, dtype, bshape):
+    if jtu.is_device_rocm():
+      # hipSPARSE segfault observed as of ROCm 7.2.
+      # TODO(ROCm): Re-enable once hipSPARSE issue is fixed.
+      self.skipTest("test_csr_matmul_ad not supported on ROCm due to hipSPARSE issue")
     csr_matmul = sparse_csr._csr_matvec if len(bshape) == 1 else sparse_csr._csr_matmat
     tol = {np.float32: 2E-5, np.float64: 1E-12, np.complex64: 1E-5,
            np.complex128: 1E-12}
@@ -208,6 +209,11 @@ class cuSparseTest(sptu.SparseTestCase):
     transpose=[True, False],
   )
   def test_csr_matvec(self, shape, dtype, transpose):
+    if jtu.is_device_rocm():
+      # hipSPARSE segfault observed as of ROCm 7.2.
+      # TODO(ROCm): Re-enable once hipSPARSE issue is fixed.
+      self.skipTest("test_csr_matvec not supported on ROCm due to hipSPARSE issue")
+
     op = lambda M: M.T if transpose else M
 
     v_rng = jtu.rand_default(self.rng())
@@ -323,7 +329,7 @@ class cuSparseTest(sptu.SparseTestCase):
       self.assertAllClose(op(M) @ B, jit(matmat)(*args), rtol=sptu.MATMUL_TOL)
 
   def test_coo_matmat_layout(self):
-    # Regression test for https://github.com/google/jax/issues/7533
+    # Regression test for https://github.com/jax-ml/jax/issues/7533
     d = jnp.array([1.0, 2.0, 3.0, 4.0])
     i = jnp.array([0, 0, 1, 2])
     j = jnp.array([0, 2, 0, 0])
@@ -410,25 +416,6 @@ class cuSparseTest(sptu.SparseTestCase):
     self.assertArraysEqual(matmat_expected, matmat_cols_sorted)
     self.assertArraysEqual(matmat_expected, matmat_unsorted)
     self.assertArraysEqual(matmat_expected, matmat_unsorted_fallback)
-
-  @jtu.run_on_devices("gpu")
-  def test_gpu_translation_rule(self):
-    version = xla_bridge.get_backend().platform_version
-    if version.split()[0] != "rocm":
-      cuda_version = None if version == "<unknown>" else int(
-          version.split()[-1])
-      if cuda_version is None or cuda_version < 11000:
-        self.assertFalse(gpu_sparse and gpu_sparse.cuda_is_supported)
-        self.assertNotIn(sparse.csr_todense_p,
-                         mlir._platform_specific_lowerings["cuda"])
-      else:
-        self.assertTrue(gpu_sparse and gpu_sparse.cuda_is_supported)
-        self.assertIn(sparse.csr_todense_p,
-                      mlir._platform_specific_lowerings["cuda"])
-    else:
-      self.assertTrue(gpu_sparse and gpu_sparse.rocm_is_supported)
-      self.assertIn(sparse.csr_todense_p,
-                    mlir._platform_specific_lowerings["rocm"])
 
   @jtu.sample_product(
     shape=[(5, 8), (8, 5), (5, 5), (8, 8)],
@@ -587,6 +574,12 @@ class cuSparseTest(sptu.SparseTestCase):
   )
   @jtu.run_on_devices("gpu")
   def test_csr_spmv(self, shape, dtype, transpose):
+    if jtu.is_device_rocm():
+      # hipSPARSE segfault observed as of ROCm 7.2.
+      # TODO(ROCm): Re-enable once hipSPARSE issue is fixed.
+      self.skipTest("test_csr_spmv not supported on ROCm due to hipSPARSE issue")
+    tol = {np.float32: 2E-5, np.float64: 2E-14}
+
     rng_sparse = sptu.rand_sparse(self.rng())
     rng_dense = jtu.rand_default(self.rng())
 
@@ -599,7 +592,7 @@ class cuSparseTest(sptu.SparseTestCase):
         data, indices.astype('int32'), indptr.astype('int32'), vec,
         transpose=transpose,
         shape=mat.shape)
-    self.assertArraysAllClose(actual, expected)
+    self.assertArraysAllClose(actual, expected, atol=tol, rtol=tol)
 
   @jtu.sample_product(
       shape=[(4, 5), (3, 4), (5, 4)],
@@ -608,6 +601,9 @@ class cuSparseTest(sptu.SparseTestCase):
   )
   @jtu.run_on_devices("gpu")
   def test_csr_spmm(self, shape, dtype, transpose):
+    # TODO: Add these tests back once hipSparse issue is fixed.
+    if jtu.is_device_rocm():
+      self.skipTest("Skipped on ROCm due to hipSparse internal error.")
     rng_sparse = sptu.rand_sparse(self.rng())
     rng_dense = jtu.rand_default(self.rng())
 
@@ -624,6 +620,7 @@ class cuSparseTest(sptu.SparseTestCase):
 
 class SparseGradTest(sptu.SparseTestCase):
   @jtu.sample_product(has_aux=[True, False])
+  @jax.default_matmul_precision("highest")
   def test_sparse_value_and_grad(self, has_aux):
     rng_sparse = sptu.rand_sparse(self.rng())
     rng = jtu.rand_default(self.rng())
@@ -649,6 +646,7 @@ class SparseGradTest(sptu.SparseTestCase):
                           sparse.value_and_grad(f, argnums=1, has_aux=has_aux)(Xsp, y))
 
   @jtu.sample_product(has_aux=[True, False])
+  @jax.default_matmul_precision("highest")
   def test_sparse_grad(self, has_aux):
     rng_sparse = sptu.rand_sparse(self.rng())
     rng = jtu.rand_default(self.rng())
@@ -675,6 +673,42 @@ class SparseGradTest(sptu.SparseTestCase):
     with self.subTest("wrt dense"):
       self.assertAllClose(jax.grad(f, argnums=1, has_aux=has_aux)(X, y),
                           sparse.grad(f, argnums=1, has_aux=has_aux)(Xsp, y))
+
+  @jax.default_matmul_precision("highest")
+  def test_bcoo_dot_general_vmap_matvec_grad(self):
+    A_dense = jnp.array(
+        [[4.0, -1.0, 0.0, 0.0],
+         [-1.0, 4.0, -1.0, 0.0],
+         [0.0, -1.0, 4.0, -1.0],
+         [0.0, 0.0, -1.0, 4.0]],
+        dtype=jnp.float32)
+    A_bcoo = sparse.BCOO.fromdense(A_dense)
+    B = jnp.array(
+        [[1.0, 0.0, 2.0],
+         [0.0, 1.0, 1.0],
+         [1.0, 1.0, 0.0],
+         [0.0, 2.0, 1.0]],
+        dtype=jnp.float32)
+
+    def sparse_objective(data):
+      A = sparse.BCOO(
+          (data, A_bcoo.indices),
+          shape=A_bcoo.shape,
+          indices_sorted=A_bcoo.indices_sorted,
+          unique_indices=A_bcoo.unique_indices)
+      X = jax.vmap(lambda b: A @ b, in_axes=1, out_axes=1)(B)
+      return jnp.sum(X ** 2)
+
+    def dense_objective(A):
+      X = jax.vmap(lambda b: A @ b, in_axes=1, out_axes=1)(B)
+      return jnp.sum(X ** 2)
+
+    grad_bcoo_data = jax.grad(sparse_objective)(A_bcoo.data)
+    grad_dense = jax.grad(dense_objective)(A_dense)
+
+    self.assertEqual(grad_bcoo_data.shape, A_bcoo.data.shape)
+    self.assertAllClose(
+        grad_bcoo_data, sparse_bcoo._bcoo_extract(A_bcoo.indices, grad_dense))
 
   @jtu.sample_product(
     has_aux=[True, False],
@@ -712,6 +746,98 @@ class SparseGradTest(sptu.SparseTestCase):
       self.assertAllClose(jac_dense(f, argnums=1, has_aux=has_aux)(X, y),
                           jac_sparse(f, argnums=1, has_aux=has_aux)(Xsp, y), rtol=rtol)
 
+  @jtu.sample_product(has_aux=[True, False],
+                      deep=[True,False],
+                      arg0=[True,False],
+                      bias=[True,False])
+  @jax.default_matmul_precision("highest")
+  def test_sparse_pytree_grad(self, has_aux, deep, arg0, bias):
+    rng_sparse = sptu.rand_sparse(self.rng())
+    rng = jtu.rand_default(self.rng())
+
+    y = rng(5, "float32")
+    X = rng_sparse((10, 5), "float32")
+    b = rng(10, "float32")
+    Xsp = sparse.BCOO.fromdense(X)
+    Xtree_sp = {'deep':{'X':Xsp},
+                'X':Xsp,
+                'list':[None,(b,None)]}
+    Xtree_de = {'deep':{'X':X},
+                'X':X,
+                'list':[None,(b,None)]}
+
+    def f(Xtree, y):
+      if deep:
+        out = Xtree['deep']['X'] @ y
+      else:
+        out = Xtree['X'] @ y
+      # Other grad variables
+      if bias:
+        out += Xtree['list'][1][0]
+      out = jnp.sum(out)
+      if has_aux:
+        return out, {'y': y.shape}
+      else:
+        return out
+
+    def g(y, Xtree):
+      if deep:
+        out = Xtree['deep']['X'] @ y
+      else:
+        out = Xtree['X'] @ y
+      # Other grad variables
+      if bias:
+        out += Xtree['list'][1][0]
+      out = jnp.sum(out)
+      if has_aux:
+        return out, {'y': y.shape}
+      return out
+
+    with self.subTest("wrt sparse"):
+      # Argument ordering
+      if arg0:
+        grad_de = jax.grad(f, argnums=0, has_aux=has_aux)(Xtree_de, y)
+        grad_sp = sparse.grad(f, argnums=0, has_aux=has_aux)(Xtree_sp, y)
+      else:
+        grad_de = jax.grad(g, argnums=1, has_aux=has_aux)(y, Xtree_de)
+        grad_sp = sparse.grad(g, argnums=1, has_aux=has_aux)(y, Xtree_sp)
+
+      if has_aux:
+        grad_de, aux_de = grad_de
+        grad_sp, aux_sp = grad_sp
+        self.assertAllClose(aux_de, aux_sp)
+
+      # Pytree structure
+      is_bcoo = lambda x: isinstance(x, sparse.bcoo.BCOO)
+      grad_densified = jax.tree_util.tree_map(sparse.todense, grad_sp,
+                                              is_leaf=is_bcoo)
+      self.assertEqual(jax.tree_util.tree_structure(grad_de),
+                       jax.tree_util.tree_structure(grad_densified))
+
+      # Depth in tree
+      if deep:
+        grad_sp_arr = grad_sp['deep']['X']
+        grad_de_arr = grad_de['deep']['X']
+      else:
+        grad_sp_arr = grad_sp['X']
+        grad_de_arr = grad_de['X']
+      self.assertIsInstance(grad_sp_arr, sparse.BCOO)
+      self.assertAllClose(grad_sp_arr.data,
+                          sparse_bcoo._bcoo_extract(grad_sp_arr.indices,
+                                                    grad_de_arr))
+      # Other grad variables
+      if bias:
+        self.assertAllClose(grad_sp['list'][1][0],
+                            grad_de['list'][1][0])
+
+    with self.subTest("wrt dense"):
+      # Argument ordering
+      if arg0:
+        self.assertAllClose(jax.grad(f, argnums=1, has_aux=has_aux)(Xtree_de, y),
+                            sparse.grad(f, argnums=1, has_aux=has_aux)(Xtree_sp, y))
+      else:
+        self.assertAllClose(jax.grad(g, argnums=0, has_aux=has_aux)(y, Xtree_de),
+                            sparse.grad(g, argnums=0, has_aux=has_aux)(y, Xtree_sp))
 
 class SparseObjectTest(sptu.SparseTestCase):
   @parameterized.named_parameters(
@@ -749,7 +875,7 @@ class SparseObjectTest(sptu.SparseTestCase):
     def to_elt(x):
       assert x.ndim == 2
       assert x.n_sparse == 2
-      return jnp.empty(x.shape, x.dtype)
+      return jnp.zeros(x.shape, x.dtype)
 
     with self.subTest('to_elt'):
       M_out = vmap(to_elt)(Msp)
@@ -786,7 +912,9 @@ class SparseObjectTest(sptu.SparseTestCase):
     M = sparse.empty(shape, sparse_format=sparse_format)
     self.assertIsInstance(M, cls)
     self.assertEqual(M.nse, 0)
-    self.assertArraysEqual(M.todense(), jnp.empty(shape))
+    MD = M.todense()
+    self.assertEqual(MD.shape, tuple(shape))
+    self.assertEqual(MD.dtype, jnp.empty(()).dtype)
 
   @parameterized.named_parameters(
     {"testcase_name": f"_{cls.__name__}{(N, M, k)}",
@@ -818,7 +946,9 @@ class SparseObjectTest(sptu.SparseTestCase):
   def test_empty_nse(self, shape, nse=2):
     M = sparse.empty(shape, nse=nse)
     self.assertEqual(M.nse, nse)
-    self.assertArraysEqual(M.todense(), jnp.empty(shape))
+    MD = M.todense()
+    self.assertEqual(MD.shape, tuple(shape))
+    self.assertEqual(MD.dtype, jnp.empty(()).dtype)
 
   @parameterized.named_parameters(
     {"testcase_name": f"_{Obj.__name__}", "Obj": Obj}
@@ -945,6 +1075,10 @@ class SparseObjectTest(sptu.SparseTestCase):
     for Obj in [sparse.CSR, sparse.CSC, sparse.COO, sparse.BCOO]))
   @jax.default_matmul_precision("float32")
   def test_matmul(self, shape, dtype, Obj, bshape):
+    if jtu.is_device_rocm():
+      # hipSPARSE segfault observed as of ROCm 7.2.
+      # TODO(ROCm): Re-enable once hipSPARSE issue is fixed.
+      self.skipTest("test_matmul not supported on ROCm due to hipSPARSE issue")
     rng = sptu.rand_sparse(self.rng(), post=jnp.array)
     rng_b = jtu.rand_default(self.rng())
     M = rng(shape, dtype)
@@ -1011,7 +1145,9 @@ class SparseObjectTest(sptu.SparseTestCase):
     _, bcoo_indices = sparse_bcoo._bcoo_fromdense(M, nse=nse, n_batch=n_batch,
                                                   n_dense=n_dense)
 
-    bcoo_to_bcsr = partial(sparse_bcsr._bcoo_to_bcsr, shape=shape)
+    bcoo_to_bcsr = partial(
+        sparse_bcsr._bcoo_to_bcsr, shape=shape, index_dtype=bcoo_indices.dtype
+    )
 
     args_maker_bcoo_to_bcsr = lambda: [bcoo_indices]
     self._CompileAndCheck(bcoo_to_bcsr, args_maker_bcoo_to_bcsr)
@@ -1086,7 +1222,12 @@ class SparseSolverTest(sptu.SparseTestCase):
       return sparse.linalg.spsolve(data, indices, indptr, b, tol, reorder)
     x = sparse_solve(data, indices, indptr, b)
 
-    self.assertAllClose(a @ x, b, rtol=1e-2, atol=1e-3)
+    self.assertAllClose(
+        jnp.matmul(a, x, precision=jax.lax.Precision.HIGHEST),
+        b,
+        rtol=1e-2,
+        atol=1e-3,
+    )
     self._CompileAndCheck(sparse_solve, args_maker)
 
   @jtu.sample_product(

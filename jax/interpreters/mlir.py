@@ -27,26 +27,22 @@ from jax._src.interpreters.mlir import (
   Token as Token,
   TokenSet as TokenSet,
   Value as Value,
-  call_lowering as _call_lowering,
+  call_lowering as _call_lowering,  # noqa: F401
   _lowerings as _lowerings,
   _platform_specific_lowerings as _platform_specific_lowerings,
   aval_to_ir_type as aval_to_ir_type,
   aval_to_ir_types as aval_to_ir_types,
   core_call_lowering as core_call_lowering,
-  custom_call as custom_call,
-  dense_bool_elements as dense_bool_elements,
-  dense_bool_array as dense_bool_array,
   dense_int_array as dense_int_array,
-  dense_int_array_v6 as dense_int_array_v6,
   dense_int_elements as dense_int_elements,
   dtype_to_ir_type as dtype_to_ir_type,
-  emit_python_callback as emit_python_callback,
-  flatten_lowering_ir_args as flatten_lowering_ir_args,
-  func_dialect as func_dialect,
-  hlo as hlo,
+  flatten_ir_types as flatten_ir_types,
+  flatten_ir_values as flatten_ir_values,
+  ir_tree_registry as ir_tree_registry,
   i32_attr as i32_attr,
   i64_attr as i64_attr,
   ir as ir,
+  ir_attribute as ir_attribute,
   ir_constant as ir_constant,
   ir_constants as ir_constants,
   ir_type_handlers as ir_type_handlers,
@@ -54,7 +50,6 @@ from jax._src.interpreters.mlir import (
   lower_fun as lower_fun,
   lower_jaxpr_to_fun as lower_jaxpr_to_fun,
   lower_jaxpr_to_module as lower_jaxpr_to_module,
-  lowerable_effects as lowerable_effects,
   make_ir_context as make_ir_context,
   merge_mlir_modules as merge_mlir_modules,
   module_to_bytecode as module_to_bytecode,
@@ -63,13 +58,20 @@ from jax._src.interpreters.mlir import (
   register_lowering as register_lowering,
   shape_tensor as shape_tensor,
   token_type as token_type,
-  xla_computation_to_mlir_module as xla_computation_to_mlir_module,
+  unflatten_ir_values_like_types as unflatten_ir_values_like_types,
 )
 
 from jax._src.mesh import Mesh as Mesh
 from jax._src.sharding_impls import (
   MeshAxisName as MeshAxisName,
-  ReplicaAxisContext as ReplicaAxisContext,
   SPMDAxisContext as SPMDAxisContext,
   ShardingContext as ShardingContext,
+)
+from jax._src.effects import lowerable_effects as lowerable_effects
+
+
+# TODO(dsuo): Temporarily maintain symbols related to callback lowering for sake
+# of public APIs.
+from jax._src.callback import (
+  emit_python_callback as emit_python_callback,
 )

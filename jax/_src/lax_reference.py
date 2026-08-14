@@ -102,7 +102,36 @@ bitwise_xor = np.bitwise_xor
 
 add = np.add
 sub = np.subtract
-mul = np.multiply
+
+def mul(x, y, /, *, out_dtype=None):
+  if out_dtype is not None:
+    x = np.astype(x, out_dtype)
+    y = np.astype(y, out_dtype)
+  return np.multiply(x, y)
+
+
+def mulhi(x, y):
+  x = np.asarray(x)
+  y = np.asarray(y)
+  dtype = x.dtype
+  if not np.issubdtype(dtype, np.integer):
+    raise TypeError(f'mulhi requires integer inputs, got {dtype}')
+  if dtype != y.dtype:
+    raise TypeError(
+        f'mulhi operands must have the same dtype, got {dtype} and {y.dtype}'
+    )
+  info = np.iinfo(dtype)
+  bits = info.bits
+  is_signed = np.issubdtype(dtype, np.signedinteger)
+  # For 64-bit inputs, use Python object dtype for arbitrary precision.
+  if bits == 64:
+    widen_dtype = np.dtype(object)
+  else:
+    widen_bits = bits * 2
+    widen_dtype = np.dtype(f'{"i" if is_signed else "u"}{widen_bits // 8}')
+  prod = x.astype(widen_dtype) * y.astype(widen_dtype)
+  return (prod >> bits).astype(dtype)
+
 
 def div(lhs, rhs):
   if dtypes.issubdtype(dtypes.result_type(lhs), np.integer):
@@ -173,8 +202,40 @@ lt = np.less
 def convert_element_type(operand, dtype):
   return np.asarray(operand, dtype=dtype)
 
+def _bitcast_uint4_to_uint8(operand):
+  # Note: assumes little-endian byte order.
+  assert operand.dtype == 'uint4'
+  operand = operand.astype('uint8')
+  return operand[..., ::2] + (operand[..., 1::2] << 4)
+
+def _bitcast_uint8_to_uint4(operand):
+  # Note: assumes little-endian byte order.
+  assert operand.dtype == 'uint8'
+  result = np.zeros((*operand.shape[:-1], operand.shape[-1] * 2), dtype='uint4')
+  result[..., ::2] = (operand & 0b00001111).astype('uint4')
+  result[..., 1::2] = ((operand & 0b11110000) >> 4).astype('uint4')
+  return result
+
 def bitcast_convert_type(operand, dtype):
-  return np.asarray(operand).view(dtype)
+  operand = np.asarray(operand)
+  nbits_in = dtypes.itemsize_bits(operand.dtype)
+  nbits_out = dtypes.itemsize_bits(dtype)
+
+  if nbits_out > nbits_in:
+    assert operand.shape[-1] == nbits_out // nbits_in
+    out_shape = operand.shape[:-1]
+  elif nbits_out == nbits_in:
+    out_shape = operand.shape
+  else:
+    out_shape = (*operand.shape, nbits_in // nbits_out)
+
+  # Special handling for 4-bit integers.
+  if nbits_in == 4:
+    operand = _bitcast_uint4_to_uint8(operand.view('uint4'))
+  if nbits_out == 4:
+    operand = _bitcast_uint8_to_uint4(operand.view('uint8'))
+
+  return operand.view(dtype).reshape(out_shape)
 
 def clamp(min, operand, max):
   return np.clip(operand, np.clip(min, None, max), max).astype(operand.dtype)
@@ -209,8 +270,8 @@ dot = np.dot
 def dot_general(lhs, rhs, dimension_numbers):
   (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
   new_id = itertools.count()
-  lhs_axis_ids = [next(new_id) for _ in lhs.shape]
-  rhs_axis_ids = [next(new_id) for _ in rhs.shape]
+  lhs_axis_ids: list[int | None] = [next(new_id) for _ in lhs.shape]
+  rhs_axis_ids: list[int | None] = [next(new_id) for _ in rhs.shape]
   lhs_out_axis_ids = lhs_axis_ids[:]
   rhs_out_axis_ids = rhs_axis_ids[:]
 
@@ -235,8 +296,9 @@ def dot_general(lhs, rhs, dimension_numbers):
                         batch_ids + lhs_out_axis_ids + rhs_out_axis_ids)
   assert lhs.dtype == rhs.dtype
   dtype = np.float32 if lhs.dtype == dtypes.bfloat16 else None
-  out = np.einsum(lhs, lhs_axis_ids, rhs, rhs_axis_ids, out_axis_ids,
-                   dtype=dtype)
+  out = np.einsum(  # pyrefly: ignore[no-matching-overload]
+      lhs, lhs_axis_ids, rhs, rhs_axis_ids, out_axis_ids, dtype=dtype
+  )
   return out.astype(dtypes.bfloat16) if lhs.dtype == dtypes.bfloat16 else out
 
 def ragged_dot(
@@ -253,7 +315,8 @@ def ragged_dot(
 
   out = np.zeros((m, n), dtype=lhs.dtype)
   result_iota = np.expand_dims(np.arange(out.shape[0]), list(range(1, out.ndim)))
-  start = 0
+  result_iota = result_iota.astype(group_sizes.dtype)
+  start = np.asarray(0, dtype=group_sizes.dtype)
   for i, size in enumerate(group_sizes):
     out += np.where(
         np.logical_and(start <= result_iota, result_iota < (start + size)),
@@ -287,7 +350,7 @@ def reshape(operand, new_sizes, dimensions=None):
   return np.reshape(np.transpose(operand, dimensions), new_sizes)
 
 def pad(operand, padding_value, padding_config):
-  # https://www.tensorflow.org/xla/operation_semantics#pad
+  # https://www.openxla.org/xla/operation_semantics#pad
   lo, hi, interior = util.unzip3(padding_config)
   # Handle first the positive edge padding and interior
   lo_pos, hi_pos = np.clip(lo, 0, None), np.clip(hi, 0, None)
@@ -309,7 +372,7 @@ def rev(operand, dimensions):
 
 select = np.where
 
-def slice(operand, start_indices, limit_indices, strides=None):  # pylint: disable=redefined-builtin
+def slice(operand, start_indices, limit_indices, strides=None):
   if strides is None:
     strides = np.ones(len(start_indices)).astype(int)
   slices = tuple(_map(_slice, start_indices, limit_indices, strides))
@@ -331,7 +394,7 @@ def dynamic_update_slice(operand, update, start_indices):
 
 transpose = np.transpose
 
-def reduce(operand, init_value, computation, dimensions):  # pylint: disable=redefined-builtin
+def reduce(operand, init_value, computation, dimensions):
   reducer = _make_reducer(computation, init_value)
   return reducer(operand, tuple(dimensions)).astype(np.asarray(operand).dtype)
 
@@ -496,3 +559,15 @@ def _reducer_from_pyfunc(py_binop, init_val):
       result[out_idx] = py_binop(result[out_idx], operand[idx])
     return result
   return reducer
+
+def top_k(operand, k, axis=-1, *, is_stable=True):
+  if axis < 0:
+    axis = operand.ndim + axis
+  assert 0 <= axis < operand.ndim
+  operand_flipped = np.flip(operand, axis)
+  sort_kind = "stable" if is_stable else "quicksort"
+  indices_flipped = np.argsort(operand_flipped, axis=axis, kind=sort_kind)
+  indices_all = (operand.shape[axis] - 1 - np.flip(indices_flipped, axis)).astype(np.int32)
+  indices = indices_all[(_slice(None),) * axis + (_slice(k),)]
+  values = np.take_along_axis(operand, indices, axis=axis)
+  return values, indices

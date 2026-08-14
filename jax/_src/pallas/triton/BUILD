@@ -17,42 +17,43 @@
 load(
     "//jaxlib:jax.bzl",
     "py_deps",
-    "py_library_providing_imports_info",
     "pytype_strict_library",
 )
 
 package(
     default_applicable_licenses = [],
     default_visibility = [
-        "//:__subpackages__",
+        "//jax:internal",
     ],
 )
 
-py_library_providing_imports_info(
-    name = "triton",
-    srcs = ["__init__.py"],
-    lib_rule = pytype_strict_library,
-    deps = [
-        ":lowering",
-        ":pallas_call_registration",
-        ":primitives",
-        "//jax/_src/lib",
+pytype_strict_library(
+    name = "core",
+    srcs = [
+        "__init__.py",
+        "core.py",
     ],
+    type_checking = "pyrefly",
+    deps = ["//jax/_src/pallas"],
 )
 
 pytype_strict_library(
     name = "primitives",
     srcs = ["primitives.py"],
+    type_checking = "pyrefly",
     deps = [
         ":lowering",
         "//jax",
-        "//jax:ad_util",
-        "//jax:api_util",
-        "//jax:core",
-        "//jax:mlir",
-        "//jax:partial_eval",
-        "//jax:source_info_util",
-        "//jax:util",
+        "//jax/_src:ad_util",
+        "//jax/_src:api_util",
+        "//jax/_src:core",
+        "//jax/_src:effects",
+        "//jax/_src:lax",
+        "//jax/_src:mlir",
+        "//jax/_src:partial_eval",
+        "//jax/_src:source_info_util",
+        "//jax/_src:tree_util",
+        "//jax/_src:util",
         "//jax/_src/lib",
         "//jax/_src/pallas",
     ] + py_deps("numpy"),
@@ -61,15 +62,25 @@ pytype_strict_library(
 pytype_strict_library(
     name = "lowering",
     srcs = ["lowering.py"],
+    type_checking = "pyrefly",
     deps = [
         "//jax",
-        "//jax:ad_util",
-        "//jax:api_util",
-        "//jax:core",
-        "//jax:mlir",
-        "//jax:partial_eval",
-        "//jax:source_info_util",
-        "//jax:util",
+        "//jax/_src:ad_util",
+        "//jax/_src:api",
+        "//jax/_src:api_util",
+        "//jax/_src:config",
+        "//jax/_src:core",
+        "//jax/_src:custom_derivatives",
+        "//jax/_src:debugging",
+        "//jax/_src:flattree",
+        "//jax/_src:lax",
+        "//jax/_src:literals",
+        "//jax/_src:mlir",
+        "//jax/_src:partial_eval",
+        "//jax/_src:source_info_util",
+        "//jax/_src:state_types",
+        "//jax/_src:tree_util",
+        "//jax/_src:util",
         "//jax/_src/lib",
         "//jax/_src/pallas",
     ] + py_deps("numpy"),
@@ -78,13 +89,29 @@ pytype_strict_library(
 pytype_strict_library(
     name = "pallas_call_registration",
     srcs = ["pallas_call_registration.py"],
+    type_checking = "pyrefly",
     deps = [
+        ":core",
+        ":gpu_info",
         ":lowering",
         "//jax",
-        "//jax:config",
-        "//jax:mlir",
-        "//jax:util",
+        "//jax/_src:api",
+        "//jax/_src:core",
+        "//jax/_src:frozen_dict",
+        "//jax/_src:mesh",
+        "//jax/_src:mlir",
         "//jax/_src/lib",
         "//jax/_src/pallas",
+    ],
+)
+
+pytype_strict_library(
+    name = "gpu_info",
+    srcs = ["gpu_info.py"],
+    type_checking = "pyrefly",
+    deps = [
+        "//jax/_src:api",
+        "//jax/_src:mesh",
+        "//jax/_src:util",
     ],
 )

@@ -1,38 +1,70 @@
-# JAX Builds on ROCm
-This directory contains files and setup instructions to build and test JAX for ROCm in Docker environment (runtime and CI). You can build, test and run JAX on ROCm yourself!
-***
-### Build JAX-ROCm in docker for the runtime
+# JAX on ROCm
 
-1.  Install Docker: Follow the [instructions on the docker website](https://docs.docker.com/engine/installation/).
+This directory contains the files and scripts used to **build, test, and package**
+JAX with ROCm support (Docker images, CI workflows, and from-source wheel builds).
 
-2. Build a runtime JAX-ROCm docker container and keep this image by running the following command. Note: must pass in Python version. The example below builds Python 3.9 container.
+If you just want to **install and run** JAX on ROCm, see the
+[AMD GPU (Linux) section of the JAX installation guide](../../docs/installation.md#amd-gpu-linux),
+which covers the `jax[rocm7-local]` pip extra, ROCm version compatibility, and the
+prebuilt `rocm/jax` Docker images. AMD's
+[JAX on ROCm installation guide](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/3rd-party/jax-install.html)
+has the authoritative, ROCm-version-specific instructions.
 
-    ./build/rocm/ci_build.sh --keep_image --py_version==3.9.0 --runtime bash -c "./build/rocm/build_rocm.sh"
+The rest of this document covers building JAX with ROCm support from source.
 
-3. To launch a JAX-ROCm container: If the build was successful, there should be a docker image with name "jax-rocm:latest" in list of docker images (use "docker images" command to list them).
+## Build ROCm JAX from Source
+
+Follow these steps to build JAX with ROCm support from source:
+
+### Step 1: Build the ROCm specific wheels from `rocm-jax`
+
+Clone the `rocm-jax` repository for the desired branch:
+
+```Bash
+> git clone https://github.com/ROCm/rocm-jax.git -b <branch_name>
+> cd rocm-jax
 ```
-sudo docker run -it --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video --entrypoint /bin/bash jax-rocm:latest
+From the `rocm-jax` directory run:
+```Bash
+> python3 build/ci_build             \
+    --python-version $PYTHON_VERSION \
+    --rocm_version $ROCM_VERSION     \
+    dist_wheels
+> pip3 install jax_rocm_plugin/wheelhouse/*.whl
+```
+The build will produce two wheels:
+
+* `jax-rocm-plugin` (ROCm-specific plugin)
+* `jax-rocm-pjrt` (ROCm-specific runtime)
+
+Detailed build instructions can be found
+[here](https://github.com/ROCm/rocm-jax/blob/master/BUILDING.md).
+
+### Step 2: Build `jaxlib` from the JAX Repository
+
+Clone the ROCm-specific fork of JAX for the desired branch:
+
+```Bash
+> git clone https://github.com/ROCm/jax -b <branch_name>
+> cd jax
 ```
 
-***
-### JAX ROCm Releases
-We strive to push all ROCm related changes to the OpenXLA repository. However, at times some JAX/JAXLIB changes for ROCm may not be present in upstream JAX repo.Therefore, we have ROCm Jax/Jaxlib branches that are associated with a Jaxlib release. These
-are available in ROCm fork of JAX https://github.com/ROCmSoftwarePlatform/jax. See branches named as rocm-jaxlib-[jaxlib-version]. For examples, for jaxlib-v0.4.10, the branch is named rocm-jaxlib-v0.4.10. See path https://github.com/ROCmSoftwarePlatform/jax/tree/rocm-jaxlib-v0.4.10
+Run the following command to build the `jaxlib` wheel:
 
-JAX and Jaxlib wheels for ROCm are available here
-```
-https://github.com/ROCmSoftwarePlatform/jax/releases
+```Bash
+> python3 ./build/build.py build --wheels=jaxlib \
+    --rocm_version=7 --rocm_path=/opt/rocm-[version]
 ```
 
-***Note:*** Some earlier jaxlib versions on ROCm were released on ***PyPi***. 
+This will generate the `jaxlib` wheel in the `dist/` directory. `jaxlib` is a
+device agnostic library.
+
+### Step 3: Then install custom JAX using:
+
+```Bash
+> python3 setup.py develop --user && pip3 -m pip install dist/*.whl
 ```
-https://pypi.org/project/jaxlib-rocm/#history
-```
-However, due to strict naming PyPI requirement we had to name our wheels slightly differently. This would then result in Jax/Jaxlib dependent not recognizing jaxlib-rocm wheels and would end up with multiple jaxlib installations and also runtime issues
 
+### Simplified Build Script
 
-***
-### XLA for JAX ROCm
-We strive to push all ROCm related changes to the OpenXLA repository. However, at times some XLA changes for ROCm may not be upstreamed to XLA repo.Therefore, we have ROCm XLA branches that are associated with a Jaxlib release. These are available in ROCm fork of XLA here https://github.com/ROCmSoftwarePlatform/xla. See branches named as rocm-jaxlib-[jaxlib version]. For example, for jaxlib-v0.4.10, the branch is named rocm-jaxlib-v0.4.10. See path https://github.com/ROCmSoftwarePlatform/xla/tree/rocm-jaxlib-v0.4.10
-
-
+For a streamlined process, consider using the `jax/build/rocm/dev_build_rocm.py` script.

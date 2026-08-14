@@ -14,8 +14,10 @@
 
 load(
     "//jaxlib:jax.bzl",
+    "if_cuda_is_configured",
     "jax_generate_backend_suites",
-    "jax_test",
+    "jax_multiplatform_test",
+    "jax_py_test",
     "py_deps",
 )
 
@@ -26,67 +28,222 @@ package(
     default_visibility = ["//visibility:private"],
 )
 
+test_suite(
+    name = "gpu_mlir_deviceless_tests",
+    tags = ["gpu_mlir_deviceless_test"],
+)
+
 jax_generate_backend_suites()
 
-DISABLED_BACKENDS = [
-    "cpu",
-    "tpu",
-]
-
-DISABLED_CONFIGS = [
-    "gpu",
-    "gpu_a100",
-    "gpu_p100",
-    "gpu_p100_x32",
-    "gpu_x32",
-    "gpu_pjrt_c_api",
-]
-
-jax_test(
+jax_multiplatform_test(
     name = "gpu_test",
     srcs = ["gpu_test.py"],
-    disable_backends = DISABLED_BACKENDS,
-    disable_configs = DISABLED_CONFIGS,
-    shard_count = 4,
-    deps = [
-        "//jax:mosaic_gpu",
-    ] + py_deps("absl/testing") + py_deps("numpy"),
+    enable_backends = [],
+    enable_configs = [
+        "gpu_a100",
+        "gpu_h100",
+        "gpu_h100_x32",
+        "gpu_b200",
+    ],
+    env = {"XLA_FLAGS": "--xla_gpu_autotune_level=0 --xla_gpu_enable_triton_gemm=0"},
+    shard_count = 16,
+    tags = [
+        "noasan",  # Times out.
+    ],
+    deps = if_cuda_is_configured([
+        "//jax/_src:hypothesis_test_util",
+        "//jax/experimental:mosaic_gpu",
+        "//jax/experimental:mosaic_gpu_test_util",
+    ]) + py_deps([
+        "absl/testing",
+        "numpy",
+        "hypothesis",
+    ]),
 )
 
-jax_test(
+jax_multiplatform_test(
+    name = "gpu_torch_test",
+    srcs = ["gpu_torch_test.py"],
+    enable_backends = [],
+    enable_configs = [
+        "gpu_h100",
+        "gpu_b200",
+    ],
+    env = {"XLA_FLAGS": "--xla_gpu_autotune_level=0 --xla_gpu_enable_triton_gemm=0"},
+    tags = [
+        "noasan",  # ASAN is unsupported.
+        "notap",  # TODO(b/477964663): Broken by PyTorch 2.10.0 upgrade.
+    ],
+    deps = if_cuda_is_configured([
+        "//jax/experimental:mosaic_gpu",
+    ]) + py_deps([
+        "absl/testing",
+        "numpy",
+        "torch",
+    ]),
+)
+
+jax_multiplatform_test(
+    name = "gpu_multidevice_test",
+    srcs = ["gpu_multidevice_test.py"],
+    enable_backends = [],
+    enable_configs = [
+        "gpu_h100x2",
+        "gpu_b200x2",
+    ],
+    env = {"XLA_FLAGS": "--xla_gpu_autotune_level=0 --xla_gpu_enable_triton_gemm=0"},
+    tags = ["multiaccelerator"],
+    deps = if_cuda_is_configured([
+        "//jax/experimental:mosaic_gpu",
+    ]) + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
+    name = "gpu_distributed_test",
+    srcs = ["gpu_distributed_test.py"],
+    args = [
+        "--num_processes=2",
+        "--gpus_per_process=1",
+    ],
+    enable_backends = [],
+    enable_configs = [
+        "gpu_h100x2",
+        "gpu_b200x2",
+    ],
+    env = {"XLA_FLAGS": "--xla_gpu_autotune_level=0 --xla_gpu_enable_triton_gemm=0"},
+    tags = ["multiaccelerator"],
+    deps = [
+        "//jax/_src:test_multiprocess",
+    ] + if_cuda_is_configured([
+        "//jax/experimental:mosaic_gpu",
+    ]) + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_py_test(
+    name = "gpu_dialect_test",
+    srcs = ["gpu_dialect_test.py"],
+    tags = ["gpu_mlir_deviceless_test"],
+    deps = [
+        "//jax",
+        "//jax/_src:hypothesis_test_util",
+        "//jax/_src:test_util",
+    ] + if_cuda_is_configured([
+        "//jax/experimental:mosaic_gpu",
+    ]) + py_deps([
+        "absl/testing",
+        "hypothesis",
+    ]),
+)
+
+jax_py_test(
+    name = "gpu_constraints_test",
+    srcs = ["gpu_constraints_test.py"],
+    deps = [
+        "//jax",
+        "//jax/_src:test_util",
+    ] + if_cuda_is_configured([
+        "//jax/experimental:mosaic_gpu",
+    ]) + py_deps("absl/testing"),
+)
+
+jax_py_test(
+    name = "gpu_layout_inference_test",
+    size = "small",
+    srcs = ["gpu_layout_inference_test.py"],
+    tags = ["gpu_mlir_deviceless_test"],
+    deps = [
+        "//jax",
+        "//jax/_src:test_util",
+    ] + if_cuda_is_configured([
+        "//jax/experimental:mosaic_gpu",
+        "//jax/experimental:mosaic_gpu_test_util",
+    ]) + py_deps("absl/testing"),
+)
+
+jax_multiplatform_test(
     name = "matmul_test",
     srcs = ["matmul_test.py"],
-    disable_backends = DISABLED_BACKENDS,
-    disable_configs = DISABLED_CONFIGS,
-    shard_count = 8,
-    deps = [
-        "//jax:mosaic_gpu",
+    enable_backends = [],
+    enable_configs = [
+        "gpu_h100",
+        "gpu_b200",
+    ],
+    env = {"XLA_FLAGS": "--xla_gpu_autotune_level=0 --xla_gpu_enable_triton_gemm=0"},
+    shard_count = 10,
+    tags = [
+        "noasan",
+    ],
+    deps = if_cuda_is_configured([
+        "//jax/_src:hypothesis_test_util",
+        "//jax/experimental:mosaic_gpu",
         "//jax/experimental/mosaic/gpu/examples:matmul",
-    ] + py_deps("absl/testing") + py_deps("numpy"),
+        "//jax/experimental/mosaic/gpu/examples:matmul_blackwell",
+    ]) + py_deps([
+        "absl/testing",
+        "numpy",
+        "hypothesis",
+    ]),
 )
 
-jax_test(
-    name = "matmul",
-    srcs = ["//third_party/py/jax/experimental/mosaic/gpu/examples:matmul.py"],
-    disable_backends = DISABLED_BACKENDS,
-    disable_configs = DISABLED_CONFIGS,
-    main = "//third_party/py/jax/experimental/mosaic/gpu/examples:matmul.py",
+jax_multiplatform_test(
+    name = "flash_attention",
+    srcs = ["//jax/experimental/mosaic/gpu/examples:flash_attention.py"],
+    enable_backends = [],
+    enable_configs = [
+        "gpu_h100",
+        "gpu_b200",
+    ],
+    main = "//jax/experimental/mosaic/gpu/examples:flash_attention.py",
     tags = [
         "manual",
+        "noasan",
         "notap",
     ],
-    deps = [
-        "//jax:mosaic_gpu",
-    ] + py_deps("absl/testing") + py_deps("numpy"),
+    deps = if_cuda_is_configured([
+        "//jax/experimental:mosaic_gpu",
+    ]) + py_deps([
+        "numpy",
+        "absl/testing",
+    ]),
 )
 
-jax_test(
-    name = "flash_attention",
-    srcs = ["//third_party/py/jax/experimental/mosaic/gpu/examples:flash_attention.py"],
-    disable_backends = DISABLED_BACKENDS,
-    disable_configs = DISABLED_CONFIGS,
-    main = "//third_party/py/jax/experimental/mosaic/gpu/examples:flash_attention.py",
-    deps = [
-        "//jax:mosaic_gpu",
-    ] + py_deps("numpy"),
+jax_multiplatform_test(
+    name = "flash_attention_test",
+    srcs = ["flash_attention_test.py"],
+    enable_backends = [],
+    enable_configs = [
+        "gpu_h100",
+        "gpu_b200",
+    ],
+    shard_count = 8,
+    tags = [
+        "noasan",  # Remove the tag once the CUPTI issue is fixed.
+    ],
+    deps = if_cuda_is_configured([
+        "//jax/experimental:mosaic_gpu",
+        "//jax/experimental/mosaic/gpu/examples:flash_attention",
+    ]) + py_deps("absl/testing"),
+)
+
+jax_multiplatform_test(
+    name = "profiler_cupti_test",
+    srcs = ["profiler_cupti_test.py"],
+    enable_backends = [],
+    enable_configs = [
+        "gpu_h100",
+        "gpu_b200",
+    ],
+    tags = [
+        "noasan",  # CUPTI leaks memory
+        "nomsan",
+    ],
+    deps = if_cuda_is_configured([
+        "//jax/experimental:mosaic_gpu",
+    ]) + py_deps("absl/testing"),
 )

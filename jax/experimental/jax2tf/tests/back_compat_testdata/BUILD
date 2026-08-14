@@ -12,19 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@rules_python//python:defs.bzl", "py_library")
+load("//jaxlib:jax.bzl", "py_library")
 
 licenses(["notice"])
 
 package(
     default_applicable_licenses = [],
-    default_visibility = ["//third_party/py/jax/experimental/jax2tf:__subpackages__"],
+    default_visibility = ["//jax/experimental/jax2tf:__subpackages__"],
 )
 
 py_library(
     name = "back_compat_testdata",
     srcs = glob(["*.py"]),
-    srcs_version = "PY3",
     deps = [
         "//third_party/py/numpy",
         "//third_party/py/typing_extensions",

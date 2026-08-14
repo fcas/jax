@@ -67,6 +67,9 @@ class AnnTest(jtu.JaxTestCase):
     recall=[0.95],
   )
   def test_approx_max_k(self, qy_shape, db_shape, dtype, k, recall):
+    # TODO(magaonka-amd): re-enable once issue is fixed.
+    if jtu.is_device_rocm():
+      self.skipTest("Skipping due to flakiness in infra nodes in ROCm 7.2.0.")
     rng = jtu.rand_default(self.rng())
     qy = rng(qy_shape, dtype)
     db = rng(db_shape, dtype)
@@ -85,6 +88,9 @@ class AnnTest(jtu.JaxTestCase):
     recall=[0.95],
   )
   def test_approx_min_k(self, qy_shape, db_shape, dtype, k, recall):
+    # TODO(magaonka-amd): re-enable once issue is fixed.
+    if jtu.is_device_rocm():
+      self.skipTest("Skipping due to flakiness in infra nodes in ROCm 7.2.0.")
     rng = jtu.rand_default(self.rng())
     qy = rng(qy_shape, dtype)
     db = rng(db_shape, dtype)
@@ -119,6 +125,12 @@ class AnnTest(jtu.JaxTestCase):
   )
   def test_pmap(self, qy_shape, db_shape, dtype, k, recall):
     num_devices = jax.device_count()
+    if num_devices % 2 != 0:
+      self.skipTest("Works only when number of devices is a multiple of 2.")
+    # TODO(araganes): Re-enable once upstream HloShardingV3 lands (JAX 0.9.2+).
+    # New pmap's SPMD tiling can't convert back to 1D pmap mesh on ROCm.
+    if jtu.is_device_rocm():
+      self.skipTest("IndivisibleError: SPMD tiling incompatible with 1D pmap mesh on ROCm")
     rng = jtu.rand_default(self.rng())
     qy = rng(qy_shape, dtype)
     db = rng(db_shape, dtype)
@@ -179,7 +191,7 @@ class AnnTest(jtu.JaxTestCase):
 
 
   def test_vmap_after(self):
-    batch = 4
+    batch = 8
     qy_size = 128
     db_size = 1024
     feature_dim = 32

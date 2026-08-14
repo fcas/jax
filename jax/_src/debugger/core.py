@@ -19,12 +19,13 @@ import inspect
 import threading
 from typing import Any, Protocol
 
-import jax
-from jax import tree_util
+from jax._src import callback
 from jax._src import core
 from jax._src import debugging
 from jax._src import traceback_util
+from jax._src import tree_util
 from jax._src import util
+from jax._src.lax import lax
 
 
 @tree_util.register_pytree_node_class
@@ -67,7 +68,7 @@ def _safe_flatten_dict(dct: dict[Any, Any]
 
 
 @tree_util.register_pytree_node_class
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class DebuggerFrame:
   """Encapsulates Python frame information."""
   filename: str
@@ -112,6 +113,11 @@ class DebuggerFrame:
       # then we subtract it off from the `lineno` and don't need to subtract 1
       # since both start and lineno are 1-indexed.
       offset = frame_info.lineno - max(start, 1)
+      if offset >= len(source):
+        # Sometimes we don't get a valid source/offset pair. This seems to
+        # happen sometimes when code uses eval(). If that happens, give up.
+        source = []
+        offset = None
     except OSError:
       source = []
       offset = None
@@ -153,7 +159,7 @@ debug_lock = threading.Lock()
 
 def breakpoint(*, backend: str | None = None, filter_frames: bool = True,
                num_frames: int | None = None, ordered: bool = False,
-               token = None, **kwargs):  # pylint: disable=redefined-builtin
+               token = None, **kwargs):
   """Enters a breakpoint at a point in a program.
 
   Args:
@@ -220,5 +226,5 @@ def breakpoint(*, backend: str | None = None, filter_frames: bool = True,
     def _breakpoint_callback_wrapper(x, *flat_args):
       _breakpoint_callback(*flat_args)
       return x
-    token, flat_args = jax.lax.stop_gradient((token, flat_args))
-    return jax.pure_callback(_breakpoint_callback_wrapper, token, token, *flat_args)
+    token, flat_args = lax.stop_gradient((token, flat_args))
+    return callback.pure_callback(_breakpoint_callback_wrapper, token, token, *flat_args)

@@ -23,7 +23,7 @@ import numpy as np
 
 import jax
 from jax import lax
-from jax.ad_checkpoint import checkpoint
+from jax import checkpoint
 from jax._src import test_util as jtu
 import jax.numpy as jnp  # scan tests use numpy
 import jax.scipy as jsp
@@ -291,7 +291,7 @@ class CustomLinearSolveTest(jtu.JaxTestCase):
 
     jtu.check_grads(linear_solve, (a, b), order=2, rtol=2e-3)
 
-    # regression test for https://github.com/google/jax/issues/1536
+    # regression test for https://github.com/jax-ml/jax/issues/1536
     jtu.check_grads(jax.jit(linear_solve), (a, b), order=2,
                     rtol={np.float32: 2e-3})
 
@@ -396,7 +396,7 @@ class CustomLinearSolveTest(jtu.JaxTestCase):
   def test_custom_linear_solve_pytree_with_aux(self):
     # Check that lax.custom_linear_solve handles
     # pytree inputs + has_aux=True
-    # https://github.com/google/jax/pull/13093
+    # https://github.com/jax-ml/jax/pull/13093
 
     aux_orig = {'a': 1, 'b': 2}
     b = {'c': jnp.ones(2), 'd': jnp.ones(3)}
@@ -481,6 +481,41 @@ class CustomLinearSolveTest(jtu.JaxTestCase):
 
     # doesn't crash
     jax.vmap(solve_aux)(b)
+
+  def test_custom_linear_solve_ordered_effects(self):
+    # See https://github.com/jax-ml/jax/issues/26087
+    def mat_vec(v):
+      jax.debug.callback(lambda: print("mat_vec"), ordered=True)
+      return v
+
+    def solve(b):
+      return lax.custom_linear_solve(mat_vec, b, lambda matvec, x: matvec(x))
+
+    b = self.rng().randn(24)
+    with jtu.capture_stdout() as output:
+      expected = solve(b)
+      jax.effects_barrier()
+    self.assertEqual(output(), "mat_vec\n")
+    with jtu.capture_stdout() as output:
+      computed = jax.jit(solve)(b)
+      jax.effects_barrier()
+    self.assertEqual(output(), "mat_vec\n")
+    self.assertAllClose(computed, expected)
+
+  def test_symbolic_zero_cotangents(self):
+    # https://github.com/jax-ml/jax/issues/29342
+    def g(x):
+      def p(z):
+        return jnp.linalg.solve(z.sum()*jnp.eye(3), jnp.array([1., 0., 0.]))[0]
+      h = lambda y: jax.jvp(jax.vmap(p), (x,), (y,))[1]
+      return h
+
+    def f(x):
+      return jax.vjp(g(x), jnp.ones_like(x))[1](x)[0]
+
+    x = jnp.array([200.0])
+    f(x)
+    jax.jacrev(f)(x)  # don't crash
 
 
 if __name__ == '__main__':

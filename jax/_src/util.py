@@ -15,24 +15,31 @@
 from __future__ import annotations
 
 import abc
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass
 import functools
 from functools import partial
 import itertools as it
 import logging
+import math
 import operator
-from typing import (Any, Callable, Generic, TypeVar, overload, TYPE_CHECKING, cast)
+from typing import (Any, Generic, ParamSpec, Protocol, SupportsIndex,
+                    TypeVar, overload, TYPE_CHECKING, cast)
 import weakref
 
 import numpy as np
 
 from jax._src import config
-from jax._src.lib import xla_client as xc
+from jax._src.lib import pytree as lib_pytree
+from jax._src.lib import weakref_lru_cache as lib_weakref_lru_cache
 from jax._src.lib import utils as jaxlib_utils
 
 logger = logging.getLogger(__name__)
 
 Seq = Sequence
+
+# TODO(jakevdp): fix import cycles and import Array.
+Array = Any
 
 T = TypeVar("T")
 T1 = TypeVar("T1")
@@ -45,21 +52,32 @@ if TYPE_CHECKING:
   # to that used for builtins.zip in python/typeshed. This supports
   # return types matching input types for up to three arguments.
   @overload
-  def safe_zip(__arg1: Iterable[T1]) -> list[tuple[T1]]: ...
+  def safe_zip(__arg1: Iterable[T1], /) -> list[tuple[T1]]:
+    ...
   @overload
-  def safe_zip(__arg1: Iterable[T1], __arg2: Iterable[T2]) -> list[tuple[T1, T2]]: ...
+  def safe_zip(__arg1: Iterable[T1], __arg2: Iterable[T2], /) -> list[tuple[T1, T2]]:
+    ...
   @overload
-  def safe_zip(__arg1: Iterable[T1], __arg2: Iterable[T2], __arg3: Iterable[T3]) -> list[tuple[T1, T2, T3]]: ...
+  def safe_zip(__arg1: Iterable[T1], __arg2: Iterable[T2], __arg3: Iterable[T3], /) -> list[tuple[T1, T2, T3]]:
+    ...
   @overload
-  def safe_zip(__arg1: Iterable[Any], __arg2: Iterable[Any], __arg3: Iterable[Any], __arg4: Iterable[Any], *args) -> list[tuple[Any, ...]]: ...
+  def safe_zip(__arg1: Iterable[Any], __arg2: Iterable[Any], __arg3: Iterable[Any], __arg4: Iterable[Any], /, *args) -> list[tuple[Any, ...]]:
+    ...
 
   def safe_zip(*args):
-    args = list(map(list, args))
-    n = len(args[0])
-    for arg in args[1:]:
-      assert len(arg) == n, f'length mismatch: {list(map(len, args))}'
-    return list(zip(*args))
+    """
+    Like builtin :func:`zip`, but with additional safety checks.
 
+    The differences from :func:`zip` are:
+
+    - :func:`safe_zip` checks that at least one argument is provided.
+    - :func:`safe_zip` checks that all arguments have the same length.
+    - :func:`safe_zip` returns an eagerly-evaluated list instead of a
+      lazily-evaluated iterator.
+    """
+    if not args:
+      raise TypeError("safe_zip requires at least 1 argument.")
+    return list(zip(*args, strict=True))
 else:
   safe_zip = jaxlib_utils.safe_zip
 
@@ -69,16 +87,16 @@ if TYPE_CHECKING:
   # to that used for builtins.map in python/typeshed. This supports
   # checking input types for the callable with up to three arguments.
   @overload
-  def safe_map(f: Callable[[T1], T], __arg1: Iterable[T1]) -> list[T]: ...
+  def safe_map(f: Callable[[T1], T], __arg1: Iterable[T1], /) -> list[T]: ...
 
   @overload
-  def safe_map(f: Callable[[T1, T2], T], __arg1: Iterable[T1], __arg2: Iterable[T2]) -> list[T]: ...
+  def safe_map(f: Callable[[T1, T2], T], __arg1: Iterable[T1], __arg2: Iterable[T2], /) -> list[T]: ...
 
   @overload
-  def safe_map(f: Callable[[T1, T2, T3], T], __arg1: Iterable[T1], __arg2: Iterable[T2], __arg3: Iterable[T3]) -> list[T]: ...
+  def safe_map(f: Callable[[T1, T2, T3], T], __arg1: Iterable[T1], __arg2: Iterable[T2], __arg3: Iterable[T3], /) -> list[T]: ...
 
   @overload
-  def safe_map(f: Callable[..., T], __arg1: Iterable[Any], __arg2: Iterable[Any], __arg3: Iterable[Any], __arg4: Iterable[Any], *args) -> list[T]: ...
+  def safe_map(f: Callable[..., T], __arg1: Iterable[Any], __arg2: Iterable[Any], __arg3: Iterable[Any], __arg4: Iterable[Any], /, *args) -> list[T]: ...
 
   def safe_map(f, *args):
     args = list(map(list, args))
@@ -89,6 +107,27 @@ if TYPE_CHECKING:
 
 else:
   safe_map = jaxlib_utils.safe_map
+
+if TYPE_CHECKING:
+  @overload
+  def foreach(f: Callable[[T1], Any], __arg1: Iterable[T1], /) -> None: ...
+
+  @overload
+  def foreach(f: Callable[[T1, T2], Any], __arg1: Iterable[T1], __arg2: Iterable[T2], /) -> None: ...
+
+  @overload
+  def foreach(f: Callable[[T1, T2, T3], Any], __arg1: Iterable[T1], __arg2: Iterable[T2], __arg3: Iterable[T3], /) -> None: ...
+
+  @overload
+  def foreach(f: Callable[..., Any], __arg1: Iterable[Any], __arg2: Iterable[Any], __arg3: Iterable[Any], __arg4: Iterable[Any], /, *args) -> None: ...
+
+  def foreach(f, *args):
+    safe_map(f, *args)
+    return None
+
+else:
+  foreach = jaxlib_utils.foreach
+
 
 def unzip2(xys: Iterable[tuple[T1, T2]]
     ) -> tuple[tuple[T1, ...], tuple[T2, ...]]:
@@ -116,13 +155,15 @@ def unzip3(xyzs: Iterable[tuple[T1, T2, T3]]
     zs.append(z)
   return tuple(xs), tuple(ys), tuple(zs)
 
-def subvals(lst, replace):
+def subvals(lst: Sequence[T], replace: Iterable[tuple[int, T]]) -> tuple[T, ...]:
+  """Substitute values within a list."""
   lst = list(lst)
   for i, v in replace:
     lst[i] = v
   return tuple(lst)
 
 def split_list(args: Sequence[T], ns: Sequence[int]) -> list[list[T]]:
+  """Split list into sublists of the specified sizes."""
   args = list(args)
   lists = []
   for n in ns:
@@ -132,8 +173,9 @@ def split_list(args: Sequence[T], ns: Sequence[int]) -> list[list[T]]:
   return lists
 
 def split_list_checked(args: Sequence[T], ns: Sequence[int]) -> list[list[T]]:
+  """Split list into sublists of the specified sizes."""
   args = list(args)
-  assert sum(ns) == len(args)
+  assert sum(ns) == len(args) and all(n >= 0 for n in ns)
   lists = []
   for n in ns:
     lists.append(args[:n])
@@ -141,21 +183,20 @@ def split_list_checked(args: Sequence[T], ns: Sequence[int]) -> list[list[T]]:
   return lists
 
 def partition_list(bs: Sequence[bool], l: Sequence[T]) -> tuple[list[T], list[T]]:
+  """Partition a list into two based on a mask."""
   assert len(bs) == len(l)
-  lists = [], []  # type: ignore
+  lists: tuple[list[T], list[T]] = ([], [])
   for b, x in zip(bs, l):
     lists[b].append(x)
   return lists
 
-def merge_lists(bs: Sequence[bool],
-                l0: Sequence[T1],
-                l1: Sequence[T2]
+def merge_lists(bs: Sequence[bool], l0: Sequence[T1], l1: Sequence[T2]
                 ) -> list[T1 | T2]:
+  """Merge the elements of two lists based on a mask."""
   assert sum(bs) == len(l1) and len(bs) - sum(bs) == len(l0)
   i0, i1 = iter(l0), iter(l1)
   out: list[T1 | T2] = [next(i1) if b else next(i0) for b in bs]
-  sentinel = object()
-  assert next(i0, sentinel) is next(i1, sentinel) is sentinel
+  assert next(i0, sentinel := object()) is next(i1, sentinel) is sentinel
   return out
 
 def subs_list(
@@ -163,8 +204,7 @@ def subs_list(
 ) -> list[T]:
   base_ = iter(base)
   out = [src[i] if i is not None else next(base_) for i in subs]
-  sentinel = object()
-  assert next(base_, sentinel) is sentinel
+  assert next(base_, sentinel := object()) is sentinel
   return out
 
 def subs_list2(
@@ -175,15 +215,8 @@ def subs_list2(
   base_ = iter(base)
   out = [src1[f1] if f1 is not None else src2[f2] if f2 is not None else
          next(base_) for f1, f2, in zip(subs1, subs2)]
-  sentinel = object()
-  assert next(base_, sentinel) is sentinel
+  assert next(base_, sentinel := object()) is sentinel
   return out
-
-def split_dict(dct, names):
-  dct = dict(dct)
-  lst = [dct.pop(name) for name in names]
-  assert not dct
-  return lst
 
 def concatenate(xs: Iterable[Sequence[T]]) -> list[T]:
   """Concatenates/flattens a list of lists."""
@@ -219,110 +252,167 @@ def curry(f):
   """
   return wraps(f)(partial(partial, f))
 
-def toposort(end_nodes):
-  if not end_nodes: return []
-  end_nodes = _remove_duplicates(end_nodes)
+toposort: Callable[[Iterable[Any]], list[Any]]
+toposort = partial(jaxlib_utils.topological_sort, "parents")
 
-  child_counts = {}
-  stack = list(end_nodes)
-  while stack:
-    node = stack.pop()
-    if id(node) in child_counts:
-      child_counts[id(node)] += 1
-    else:
-      child_counts[id(node)] = 1
-      stack.extend(node.parents)
-  for node in end_nodes:
-    child_counts[id(node)] -= 1
 
-  sorted_nodes = []
-  childless_nodes = [node for node in end_nodes if child_counts[id(node)] == 0]
-  assert childless_nodes
-  while childless_nodes:
-    node = childless_nodes.pop()
-    sorted_nodes.append(node)
-    for parent in node.parents:
-      if child_counts[id(parent)] == 1:
-        childless_nodes.append(parent)
-      else:
-        child_counts[id(parent)] -= 1
-  sorted_nodes = sorted_nodes[::-1]
+def cache(max_size=4096, trace_context_in_key: bool | Callable = True, num_shards=64):
+  def decorator(f):
+    context_fn = (trace_context_in_key if callable(trace_context_in_key)
+                  else config.trace_context if trace_context_in_key else None)
+    cached_f = lib_weakref_lru_cache.strong_lru_cache(
+        f, context_fn, max_size, num_shards=num_shards)
+    register_cache(cached_f, str(f))
+    return cached_f
+  return decorator
 
-  check_toposort(sorted_nodes)
-  return sorted_nodes
+# Maps caches to the name of the callable they apply to. All caches in
+# this dictionary support `cache_clear()`.
+_caches: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
 
-def check_toposort(nodes):
-  visited = set()
-  for node in nodes:
-    assert all(id(parent) in visited for parent in node.parents)
-    visited.add(id(node))
+def register_cache(cache: Any, for_what: str):
+  """Registers a cache with JAX's cache management.
 
-def _remove_duplicates(node_list):
-  seen = set()
-  out = []
-  for n in node_list:
-    if id(n) not in seen:
-      seen.add(id(n))
-      out.append(n)
-  return out
+  Args:
+    cache: an object supporting `cache_clear()`, `cache_info()`, and
+      `cache_keys()`, like the result of `functools.lru_cache()`.
+    for_what: a string to identify what this cache is used for. This is
+       used for debugging.
+  """
+  _caches[cache] = for_what
 
-def split_merge(predicate, xs):
-  sides = list(map(predicate, xs))
-  lhs = [x for x, s in zip(xs, sides) if s]
-  rhs = [x for x, s in zip(xs, sides) if not s]
-  def merge(new_lhs, new_rhs):
-    out = []
-    for s in sides:
-      if s:
-        out.append(new_lhs[0])
-        new_lhs = new_lhs[1:]
-      else:
-        out.append(new_rhs[0])
-        new_rhs = new_rhs[1:]
-    assert not new_rhs
-    assert not new_lhs
-    return out
-
-  return lhs, rhs, merge
-
-def cache(max_size=4096):
-  def wrap(f):
-    @functools.lru_cache(max_size)
-    def cached(_, *args, **kwargs):
-      return f(*args, **kwargs)
-
-    @functools.wraps(f)
-    def wrapper(*args, **kwargs):
-      if config.check_tracer_leaks.value:
-        return f(*args, **kwargs)
-      else:
-        return cached(config.trace_context(), *args, **kwargs)
-
-    wrapper.cache_clear = cached.cache_clear
-    wrapper.cache_info = cached.cache_info
-    return wrapper
-  return wrap
+def clear_all_caches():
+  for cache in list(_caches.keys()):
+    cache.cache_clear()
 
 memoize = cache(max_size=None)
 
-def weakref_lru_cache(call: Callable, maxsize=2048):
+def _ignore(): return None
+
+P = ParamSpec("P")
+R = TypeVar("R", covariant=True)
+
+class WeakrefCachedFunc(Protocol, Generic[P, R]):
+  def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R: ...
+  def cache_clear(self) -> None: ...
+  def cache_info(self) -> lib_weakref_lru_cache.WeakrefLRUCache.WeakrefLRUCacheInfo: ...
+  def cache_keys(self) -> list[Any]: ...
+  def evict_weakref(self, arg0: Any) -> None: ...
+
+@overload
+def weakref_lru_cache(
+    f: Callable[P, R], /, *, maxsize: int | None = 2048,
+    trace_context_in_key: bool = True, explain: Callable | None = None
+) -> WeakrefCachedFunc[P, R]: ...
+
+@overload
+def weakref_lru_cache(
+    f: None = None, /, *, maxsize: int | None = 2048,
+    trace_context_in_key: bool = True, explain: Callable | None = None
+) -> Callable[[Callable[P, R]], WeakrefCachedFunc[P, R]]: ...
+
+def weakref_lru_cache(
+    f: Callable[P, R] | None = None, *, maxsize: int | None = 2048,
+    trace_context_in_key: bool = True, explain: Callable | None = None
+):
   """
   Least recently used cache decorator with weakref support.
 
   The cache will take a weakref to the first argument of the wrapped function
-  and strong refs to all subsequent operations. In all other respects it should
-  behave similar to `functools.lru_cache`.
+  and strong refs to all other arguments. In all other respects it should
+  behave similar to `functools.lru_cache`. The cache is thread local.
   """
-  global _weakref_lru_caches
-  cached_call = xc.weakref_lru_cache(config.trace_context, call, maxsize)
-  _weakref_lru_caches.add(cached_call)
+  kwargs = dict(maxsize=maxsize, trace_context_in_key=trace_context_in_key,
+                explain=explain)
+  if f is None:
+    return lambda g: _weakref_lru_cache(g, **kwargs)
+  return _weakref_lru_cache(f, **kwargs)
+
+def _weakref_lru_cache(f, maxsize, trace_context_in_key, explain):
+  cached_f = lib_weakref_lru_cache.weakref_lru_cache(
+      config.trace_context if trace_context_in_key else _ignore, f, maxsize,
+      explain = lambda: explain if config.explain_cache_misses.value else None)
+  register_cache(cached_f, str(f))
+  return cached_f
+
+
+# Interner from strong keys to weak values, intended for us to intern object
+# construction, thereby making subsequent __eq__ and __hash__ calls cheap and
+# based on object identity.
+#
+# Caution: The interner does not know about the *signature* of the cached
+# function. In particular, if the same argument value can be passed as either
+# an arg or a kwarg, then the interner may store multiple entries for the same
+# logical call. If this troubles you canonicalize the arguments first, e.g.
+# via a wrapper function.
+weak_value_interner = lib_weakref_lru_cache.weak_value_interner
+
+
+def immutable(cls):
+  """Decorator to avoid boilerplate for immutable interned classes."""
+  def __deepcopy__(self, memo):
+    # Deep copy of a singleton interned object is the identity.
+    return self
+  cls.__deepcopy__ = __deepcopy__
+
+  # Pickling calls __getstate__ and __setstate__, but we're assuming the
+  # caller will implement __getnewargs_ex__.
+  def __getstate__(self):
+    return None
+  def __setstate__(self, state):
+    pass
+  cls.__getstate__ = __getstate__
+  cls.__setstate__ = __setstate__
+
+  # Discourage mutation after construction.
+  def __setattr__(self, name, value):
+    raise AttributeError(f"cannot assign to field {name!r}")
+  def __delattr__(self, name):
+    raise AttributeError(f"cannot delete field {name!r}")
+  cls.__setattr__ = __setattr__
+  cls.__delattr__ = __delattr__
+  return cls
+
+
+# The types of arguments for which `multi_weakref_lru_cache` should keep
+# weak references.
+weakref_cache_key_types: set[type] = set()
+
+
+_multi_weakref_registry = lib_pytree.PyTreeRegistry(
+    enable_none=False,
+    enable_tuple=True,
+    enable_namedtuple=False,
+    enable_list=False,
+    enable_dict=True,
+)
+
+
+def multi_weakref_lru_cache(
+    call: Callable,
+    *,
+    maxsize: int | None = 2048,
+    trace_context_in_key: bool = True,
+):
+  """Least recently used cache decorator with weakref support.
+
+  Similar to `weakref_lru_cache`, except that it keeps weak references
+  to all positional and keyword arguments for which
+  `is_weakref_cache_key_type()` is true, and strong references to
+  other arguments. The cache entry is removed if any of the weakref
+  arguments dies.
+  """
+  cached_call = lib_weakref_lru_cache.multi_weakref_lru_cache(
+      config.trace_context if trace_context_in_key else _ignore,
+      call,
+      maxsize=maxsize,
+      explain=None,
+      registry=_multi_weakref_registry,
+      weak_types=weakref_cache_key_types,
+  )
+  register_cache(cached_call, str(call))
   return cached_call
 
-_weakref_lru_caches = weakref.WeakSet()  # type: ignore
-
-def clear_all_weakref_lru_caches():
-  for cached_call in _weakref_lru_caches:
-    cached_call.cache_clear()
 
 class Unhashable:
   __slots__ = ["val"]
@@ -345,22 +435,29 @@ class Hashable:
   def __eq__(self, other):
     return self.val == other.val
 
-class WrapKwArgs:
-  __slots__ = ["val"]
+def wrap_name(transform_name: str, name: str) -> str:
+  return f"{transform_name}({name})"
 
-  def __init__(self, val):
-    self.val = val
 
-  def __hash__(self):
-    return hash(tuple((k, v) for k, v in sorted(self.val.items())))
+def fun_name(fun: Callable, default_name: str = "<unnamed function>") -> str:
+  name = getattr(fun, "__name__", None)
+  if name is not None:
+    return name
+  if isinstance(fun, partial):
+    return fun_name(fun.func)
+  else:
+    return default_name
 
-  def __eq__(self, other):
-    return self.val == other.val
 
-def wrap_name(name, transform_name):
-  return transform_name + '(' + name + ')'
+def fun_qual_name(fun: Callable) -> str:
+  qual_name = getattr(fun, "__qualname__", None)
+  if qual_name is not None:
+    return qual_name
+  if isinstance(fun, partial):
+    return fun_qual_name(fun.func)
+  return fun_name(fun)
 
-def canonicalize_axis(axis, num_dims) -> int:
+def canonicalize_axis(axis: SupportsIndex, num_dims: int) -> int:
   """Canonicalize an axis in [-num_dims, num_dims) to [0, num_dims)."""
   axis = operator.index(axis)
   if not -num_dims <= axis < num_dims:
@@ -369,7 +466,18 @@ def canonicalize_axis(axis, num_dims) -> int:
     axis = axis + num_dims
   return axis
 
-def moveaxis(x, src, dst):
+def canonicalize_axis_tuple(axis: int | Sequence[int] | None, ndim: int, allow_duplicate: bool = False) -> tuple[int, ...]:
+  if axis is None:
+    return tuple(range(ndim))
+  if isinstance(axis, Sequence):
+    axis = tuple(canonicalize_axis(i, ndim) for i in axis)
+    if not allow_duplicate and len(set(axis)) != len(axis):
+      raise ValueError(f"repeated axis: {axis}")
+    return axis
+  else:
+    return (canonicalize_axis(axis, ndim),)
+
+def moveaxis(x: Array, src: int | Sequence[int], dst: int | Sequence[int]) -> Array:
   if src == dst:
     return x
   if isinstance(src, int):
@@ -383,7 +491,7 @@ def moveaxis(x, src, dst):
     perm.insert(d, s)
   return x.transpose(perm)
 
-def ceil_of_ratio(x, y):
+def ceil_of_ratio(x: int, y: int) -> int:
   return -(-x // y)
 
 
@@ -399,35 +507,30 @@ def wraps(
   """
   def wrapper(fun: T) -> T:
     try:
-      name = getattr(wrapped, "__name__", "<unnamed function>")
+      name = fun_name(wrapped)
       doc = getattr(wrapped, "__doc__", "") or ""
       fun.__dict__.update(getattr(wrapped, "__dict__", {}))
       fun.__annotations__ = getattr(wrapped, "__annotations__", {})
-      fun.__name__ = name if namestr is None else namestr.format(fun=name)
+      fun.__name__ = name if namestr is None else namestr.format(fun=name)  # pyrefly: ignore[missing-attribute]
       fun.__module__ = getattr(wrapped, "__module__", "<unknown module>")
       fun.__doc__ = (doc if docstr is None
                      else docstr.format(fun=name, doc=doc, **kwargs))
-      fun.__qualname__ = getattr(wrapped, "__qualname__", fun.__name__)
-      fun.__wrapped__ = wrapped
-    finally:
-      return fun
+      fun.__qualname__ = getattr(wrapped, "__qualname__", fun.__name__)  # pyrefly: ignore[missing-attribute]
+      fun.__wrapped__ = wrapped  # pyrefly: ignore[missing-attribute]
+    except Exception:
+      pass
+    return fun
   return wrapper
 
-
-# NOTE: Ideally we would annotate both the argument and return type as NoReturn
-#       but it seems like pytype doesn't support that...
-def assert_unreachable(x):
-  raise AssertionError(f"Unhandled case: {type(x).__name__}")
-
-def tuple_insert(t, idx, val):
+def tuple_insert(t: tuple[T, ...], idx: int, val: T) -> tuple[T, ...]:
   assert 0 <= idx <= len(t), (idx, len(t))
   return t[:idx] + (val,) + t[idx:]
 
-def tuple_delete(t, idx):
+def tuple_delete(t: tuple[T, ...], idx: int) -> tuple[T, ...]:
   assert 0 <= idx < len(t), (idx, len(t))
   return t[:idx] + t[idx + 1:]
 
-def tuple_update(t, idx, val):
+def tuple_update(t: tuple[T, ...], idx: int, val: T) -> tuple[T, ...]:
   assert 0 <= idx < len(t), (idx, len(t))
   return t[:idx] + (val,) + t[idx+1:]
 
@@ -469,8 +572,6 @@ class HashableFunction:
   def __repr__(self):
     return f'<hashable {self.f.__name__} with closure={self.closure}>'
 
-def as_hashable_function(closure):
-  return lambda f: HashableFunction(f, closure)
 
 class HashablePartial:
   def __init__(self, f, *args, **kwargs):
@@ -484,13 +585,8 @@ class HashablePartial:
             self.args == other.args and self.kwargs == other.kwargs)
 
   def __hash__(self):
-    return hash(
-      (
-        self.f.__code__,
-        self.args,
-        tuple(sorted(self.kwargs.items(), key=lambda kv: kv[0])),
-      ),
-    )
+    kwargs = tuple(sorted(self.kwargs.items(), key=lambda kv: kv[0]))
+    return hash((self.f.__code__, self.args, kwargs))
 
   def __call__(self, *args, **kwargs):
     return self.f(*self.args, *args, **self.kwargs, **kwargs)
@@ -498,10 +594,10 @@ class HashablePartial:
 def maybe_named_axis(axis, if_pos, if_named):
   try:
     pos = operator.index(axis)
-    named = False
   except TypeError:
-    named = True
-  return if_named(axis) if named else if_pos(pos)
+    return if_named(axis)
+  else:
+    return if_pos(pos)
 
 def distributed_debug_log(*pairs):
   """Format and log `pairs` if config.jax_distributed_debug is enabled.
@@ -572,10 +668,73 @@ class HashableWrapper:
       return False
     return self.x == other.x if self.hash is not None else self.x is other.x
 
+@dataclass(frozen=True)
+class Either():
+  is_right : bool
+  val : Any
 
-def _original_func(f):
+  def from_left(self):
+    assert not self.is_right
+    return self.val
+
+  def from_right(self):
+    assert self.is_right
+    return self.val
+
+  @property
+  def is_left(self): return not self.is_right
+
+  @staticmethod
+  def left(x): return Either(False, x)
+
+  @staticmethod
+  def right(x): return Either(True, x)
+
+  def __repr__(self):
+    if self.is_left:
+      return f"Left({self.val})"
+    else:
+      return f"Right({self.val})"
+
+# A handy container for (args, kwargs) pairs that lets you map over it etc
+# with an API similar to FlatTree.
+# TODO: hashing, equality, printing etc
+class PyArgs:
+  def __init__(self, args, kwargs):
+    assert isinstance(args, tuple)
+    assert isinstance(kwargs, dict)
+    self.args = args
+    self.kwargs = kwargs
+
+  # True means keep
+  def filter_with_mask(self, mask):
+    assert len(mask) == len(self)
+    keeps = iter(mask)
+    return PyArgs(
+        tuple(x for x in self.args if next(keeps)),
+        {k: v for k, v in self.kwargs.items() if next(keeps)})
+
+  @property
+  def args_kwargs(self):
+    return (self.args, self.kwargs)
+
+  def map(self, f):
+    return PyArgs(
+        tuple(f(x) for x in self.args),
+        {k: f(x) for k, x in self.kwargs.items()})
+
+  def map2(self, ys, f):
+    ys_iter = iter(ys)
+    return self.map(lambda x: f(x, next(ys_iter)))
+
+  def __len__(self):
+    return len(self.args) + len(self.kwargs)
+
+def _original_func(f: Callable) -> Callable:
   if isinstance(f, property):
-    return cast(property, f).fget
+    fget = cast(property, f).fget
+    assert fget is not None
+    return fget
   elif isinstance(f, functools.cached_property):
     return f.func
   return f
@@ -589,63 +748,35 @@ def set_module(module: str) -> Callable[[T], T]:
   return wrapper
 
 
-if TYPE_CHECKING:
-  def use_cpp_class(cpp_cls: Any) -> Callable[[T], T]:
-    def wrapper(cls: T) -> T:
+def use_cpp_class(cpp_cls: type[Any]) -> Callable[[type[T]], type[T]]:
+  """A decorator replacing a Python class with its C++ version at runtime."""
+
+  def wrapper(cls):
+    if cpp_cls is None:
       return cls
-    return wrapper
 
-  def use_cpp_method(is_enabled: bool = True) -> Callable[[T], T]:
-    def wrapper(cls: T) -> T:
-      return cls
-    return wrapper
+    exclude_methods = {'__module__', '__dict__', '__doc__'}
 
-else:
-  def use_cpp_class(cpp_cls):
-    """A helper decorator to replace a python class with its C++ version"""
+    for attr_name, attr in cls.__dict__.items():
+      if attr_name not in exclude_methods:
+        if not hasattr(_original_func(attr), "_use_cpp"):
+          setattr(cpp_cls, attr_name, attr)
 
-    def wrapper(cls):
-      if cpp_cls is None:
-        return cls
+    cpp_cls.__doc__ = cls.__doc__
+    return cpp_cls
 
-      exclude_methods = {'__module__', '__dict__', '__doc__'}
+  return wrapper
 
-      originals = {}
-      for attr_name, attr in cls.__dict__.items():
-        if attr_name not in exclude_methods:
-          if hasattr(_original_func(attr), "_use_cpp"):
-            originals[attr_name] = attr
-          else:
-            setattr(cpp_cls, attr_name, attr)
-
-      cpp_cls.__doc__ = cls.__doc__
-      # TODO(pschuh): Remove once fastpath is gone.
-      cpp_cls._original_py_fns = originals
-      return cpp_cls
-
-    return wrapper
-
-  def use_cpp_method(is_enabled=True):
-    """A helper decorator to exclude methods from the set that are forwarded to C++ class"""
-    def decorator(f):
-      if is_enabled:
-        original_func = _original_func(f)
-        original_func._use_cpp = True
-      return f
-
-    if not isinstance(is_enabled, bool):
-      raise TypeError(
-          "Decorator got wrong type: @use_cpp_method(is_enabled: bool=True)"
-      )
-    return decorator
-
-
-try:
-  # numpy 1.25.0 or newer
-  NumpyComplexWarning: type[Warning] = np.exceptions.ComplexWarning
-except AttributeError:
-  # legacy numpy
-  NumpyComplexWarning = np.ComplexWarning
+def use_cpp_method(is_enabled: bool = True) -> Callable[[T], T]:
+  """A decorator excluding methods from the set that are forwarded to C++ class."""
+  if not isinstance(is_enabled, bool):
+    raise TypeError("``is_enabled`` must be a bool")
+  def decorator(f):
+    if is_enabled:
+      original_func = _original_func(f)
+      original_func._use_cpp = True  # pyrefly: ignore[missing-attribute]
+    return f
+  return decorator
 
 
 class StrictABCMeta(abc.ABCMeta):
@@ -659,9 +790,30 @@ class StrictABCMeta(abc.ABCMeta):
     del subclass  # Unused.
     raise NotImplementedError(f"{cls} does not support virtual subclasses")
 
-  __instancecheck__ = type.__instancecheck__  # type: ignore[assignment]
-  __subclasscheck__ = type.__subclasscheck__  # type: ignore[assignment]
+  __instancecheck__ = type.__instancecheck__
+  __subclasscheck__ = type.__subclasscheck__
 
 
 class StrictABC(metaclass=StrictABCMeta):
   __slots__ = ()
+
+
+test_event_listener: Callable | None = None
+
+def test_event(name: str, *args) -> None:
+  if not test_event_listener:
+    return
+  test_event_listener(name, *args)
+
+Mutex = jaxlib_utils.Mutex
+
+
+def pprint_bytes(num_bytes: int | float) -> str:
+  prefixes = ("", "K", "M", "G", "T")
+  if num_bytes <= 0:
+    return "0.00B"
+  exponent = min(math.floor(math.log(num_bytes, 1000)), len(prefixes) - 1)
+  scaled_value = num_bytes / (1000**exponent)
+  return f"{scaled_value:.2f}{prefixes[exponent]}B"
+
+install_failure_signal_handler = jaxlib_utils.install_failure_signal_handler

@@ -29,20 +29,29 @@
 import inspect
 import operator
 import os
+from pathlib import Path
 import sys
+from typing import ForwardRef
+import urllib.request
 
 sys.path.insert(0, os.path.abspath('..'))
 
-
-# Currently type aliases are expanded. We tried a workaround along the lines of:
+# Workaround to avoid expanding type aliases. See:
 # https://github.com/sphinx-doc/sphinx/issues/6518#issuecomment-589613836
-# Unfortunately, this workaround makes Sphinx drop module-level documentation.
-# See https://github.com/google/jax/issues/3452.
+
+def _do_not_evaluate_in_jax(
+    self, globalns, *args, _evaluate=ForwardRef._evaluate, **kwargs,
+):
+  if globalns.get('__name__', '').startswith('jax'):
+    return self
+  return _evaluate(self, globalns, *args, **kwargs)
+
+ForwardRef._evaluate = _do_not_evaluate_in_jax
 
 # -- Project information -----------------------------------------------------
 
 project = 'JAX'
-copyright = '2024, The JAX Authors. NumPy and SciPy documentation are copyright the respective authors.'
+copyright = '2024, The JAX Authors'
 author = 'The JAX authors'
 
 # The short X.Y version
@@ -70,18 +79,42 @@ extensions = [
     'sphinx.ext.napoleon',
     'matplotlib.sphinxext.plot_directive',
     'myst_nb',
-    "sphinx_remove_toctrees",
+    'sphinx_remove_toctrees',
     'sphinx_copybutton',
     'jax_extensions',
+    'jax_list_config_options',
     'sphinx_design',
     'sphinxext.rediraffe',
+    'source_include',
+    'sphinxcontrib.mermaid'
 ]
 
+# Define local cache paths
+cache_dir = os.path.join(os.path.dirname(__file__), 'intersphinx_cache')
+
 intersphinx_mapping = {
-    'python': ('https://docs.python.org/3/', None),
-    'numpy': ('https://numpy.org/doc/stable/', None),
-    'scipy': ('https://docs.scipy.org/doc/scipy/reference/', None),
+    'array_api': ('https://data-apis.org/array-api/2023.12/', (os.path.join(cache_dir, 'array_api.inv'), None)),
+    'python': ('https://docs.python.org/3/', (os.path.join(cache_dir, 'python.inv'), None)),
+    'numpy': ('https://numpy.org/doc/stable/', (os.path.join(cache_dir, 'numpy.inv'), None)),
+    # TODO(phawkins,jakevdp): revert to stable scipy docs when it is up again.
+    'scipy': ('https://scipy.github.io/devdocs/', (os.path.join(cache_dir, 'scipy.inv'), None)),
 }
+
+os.makedirs(cache_dir, exist_ok=True)
+for name, (url, (inv_path, _)) in intersphinx_mapping.items():
+  if not os.path.exists(inv_path):
+    print(f"Intersphinx cache miss for '{name}': downloading from {url}...")
+    try:
+      req = urllib.request.Request(
+          url + 'objects.inv',
+          headers={'User-Agent': 'Mozilla/5.0 (compatible; JAX-docs/1.0)'},
+      )
+      with urllib.request.urlopen(req) as resp, open(inv_path, 'wb') as out:
+        out.write(resp.read())
+    except Exception as e:
+      print(f"Warning: failed to download intersphinx inventory for {name}: {e}")
+  else:
+    print(f"Intersphinx cache hit for '{name}': using local inventory file at {inv_path}")
 
 suppress_warnings = [
     'ref.citation',  # Many duplicated citations in numpy/scipy docstrings.
@@ -124,10 +157,24 @@ exclude_patterns = [
     # These are kept in sync using the jupytext pre-commit hook.
     'notebooks/*.md',
     'pallas/quickstart.md',
+    'pallas/gpu/quickstart.md',
+    'pallas/tpu/quickstart.md',
+    'pallas/pipelining.md',
+    'pallas/gpu/pipelining.md',
     'pallas/tpu/pipelining.md',
+    'pallas/tpu/distributed.md',
+    'pallas/tpu/sparse.md',
+    'pallas/tpu/matmul.md',
+    'pallas/tpu/core_map.md',
+    'pallas/tpu/sparsecore.md',
     'jep/9407-type-promotion.md',
     'autodidax.md',
-    'sharded-computation.md',
+    'autodidax2_part1.md',
+    'array_refs.md',
+    'hijax_custom_derivatives.md',
+    'hijax_types.md',
+    'parallel.md',
+    'ffi.ipynb',
 ]
 
 # The name of the Pygments (syntax highlighting) style to use.
@@ -156,9 +203,10 @@ html_theme = 'sphinx_book_theme'
 # documentation.
 html_theme_options = {
     'show_toc_level': 2,
-    'repository_url': 'https://github.com/google/jax',
+    'repository_url': 'https://github.com/jax-ml/jax',
     'use_repository_button': True,     # add a "link to repository" button
     'navigation_with_keys': False,
+    'article_header_start': ['toggle-primary-sidebar.html', 'breadcrumbs'],
 }
 
 # The name of an image file (relative to this directory) to place at the top
@@ -189,9 +237,12 @@ html_css_files = [
 # -- Options for myst ----------------------------------------------
 myst_heading_anchors = 3  # auto-generate 3 levels of heading anchors
 myst_enable_extensions = ['dollarmath']
+myst_ref_domains = ["py"]
+myst_all_links_external = False
 nb_execution_mode = "force"
 nb_execution_allow_errors = False
 nb_merge_streams = True
+nb_execution_show_tb = True
 
 # Notebook cell execution timeout; defaults to 30.
 nb_execution_timeout = 100
@@ -205,15 +256,25 @@ nb_execution_excludepatterns = [
     'notebooks/Neural_Network_and_Data_Loading.*',
     # Has extra requirements: networkx, pandas, pytorch, tensorflow, etc.
     'jep/9407-type-promotion.*',
-    # TODO(jakevdp): enable execution on the following if possible:
-    'notebooks/xmap_tutorial.*',
-    'notebooks/Distributed_arrays_and_automatic_parallelization.*',
     'notebooks/autodiff_remat.*',
+    # Example only gives the specific output demonstrated on some platforms
+    'notebooks/layout.*',
+    # Fails on readthedocs with Kernel Died
+    'notebooks/convolutions.ipynb',
     # Requires accelerators
     'pallas/quickstart.*',
+    'pallas/pipelining.*',
+    'pallas/gpu/pipelining.*',
     'pallas/tpu/pipelining.*',
-    'sharded-computation.*',
-    'distributed_data_loading.*'
+    'pallas/tpu/distributed.*',
+    'pallas/tpu/sparse.*',
+    'pallas/tpu/matmul.*',
+    'pallas/tpu/core_map.*',
+    'pallas/tpu/sparsecore.*',
+    'distributed_data_loading.*',
+    'notebooks/host-offloading.*',
+    'notebooks/cute_dsl_jax.*',
+    'new_docs/401/cute-dsl.*',
 ]
 
 # -- Options for HTMLHelp output ---------------------------------------------
@@ -292,6 +353,10 @@ epub_exclude_files = ['search.html']
 
 
 # -- Extension configuration -------------------------------------------------
+# Define prompt text pattern to be removed for copybutton
+# See  https://sphinx-copybutton.readthedocs.io/en/latest/use.html#using-regexp-prompt-identifiers
+copybutton_prompt_text = r">>> |\.\.\. |\$ |In \[\d*\]: | {2,5}\.\.\.: | {5,8}: "
+copybutton_prompt_is_regexp = True
 
 # Tell sphinx autodoc how to render type aliases.
 autodoc_typehints = "description"
@@ -315,6 +380,8 @@ def linkcode_resolve(domain, info):
     return None
   if not info['fullname']:
     return None
+  if info['module'].split(".")[0] != 'jax':
+     return None
   try:
     mod = sys.modules.get(info['module'])
     obj = operator.attrgetter(info['fullname'])(mod)
@@ -326,21 +393,47 @@ def linkcode_resolve(domain, info):
     source, linenum = inspect.getsourcelines(obj)
   except:
     return None
-  filename = os.path.relpath(filename, start=os.path.dirname(jax.__file__))
+  try:
+    filename = Path(filename).relative_to(Path(jax.__file__).parent)
+  except ValueError:
+    # Source file is not a relative to jax; this must be a re-exported function.
+    return None
   lines = f"#L{linenum}-L{linenum + len(source)}" if linenum else ""
-  return f"https://github.com/google/jax/blob/main/jax/{filename}{lines}"
+  return f"https://github.com/jax-ml/jax/blob/main/jax/{filename}{lines}"
 
 # Generate redirects from deleted files to new sources
 rediraffe_redirects = {
-    'notebooks/quickstart.md': 'quickstart.md',
-    'jax-101/01-jax-basics.md': 'key-concepts.md',
-    'jax-101/02-jitting.md': 'jit-compilation.md',
-    'jax-101/03-vectorization.md': 'automatic-vectorization.md',
-    'jax-101/04-advanced-autodiff.md': 'automatic-differentiation.md',
-    'jax-101/05-random-numbers.md': 'random-numbers.md',
-    'jax-101/05.1-pytrees.md': 'working-with-pytrees.md',
-    'jax-101/06-parallelism.md': 'sharded-computation.md',
-    'jax-101/07-state.md': 'stateful-computations.md',
-    'jax-101/08-pjit.rst': 'sharded-computation.md',
-    'jax-101/index.rst': 'tutorials.rst',
+  "jax-101/01-jax-basics.md": "key-concepts.md",
+  "jax-101/02-jitting.md": "jit-compilation.md",
+  "jax-101/03-vectorization.md": "automatic-vectorization.md",
+  "jax-101/04-advanced-autodiff.md": "automatic-differentiation.md",
+  "jax-101/05-random-numbers.md": "random-numbers.md",
+  "jax-101/05.1-pytrees.md": "pytrees.md",
+  "jax-101/06-parallelism.md": "parallel.md",
+  "jax-101/07-state.md": "stateful-computations.md",
+  "jax-101/08-pjit.rst": "parallel.md",
+  "jax-101/index.rst": "jax-101.rst",
+  "tutorials.rst": "jax-101.rst",
+  "notebooks/external_callbacks.md": "external-callbacks.md",
+  "notebooks/How_JAX_primitives_work.md": "jax-primitives.md",
+  "jax.extend.ffi.rst": "jax.ffi.rst",
+  "Custom_Operation_for_GPUs.md": "ffi.md",
+  "notebooks/quickstart.md": "quickstart.md",
+  "quickstart.md": "notebooks/thinking_in_jax.md",
+  "advanced_guide.rst": "advanced_guides.rst",
+  "user_guides.rst": "advanced_guides.rst",
+  "working_with_pytrees.md": "pytrees.md",
+  "notebooks/Distributed_arrays_and_automatic_parallelization.md": "parallel.md",
+  "notebooks/explicit-sharding.md": "parallel.md",
+  "sharded-computation.md": "parallel.md",
 }
+
+from jupyter_client.provisioning import KernelProvisionerFactory
+from importlib.metadata import EntryPoint
+
+KernelProvisionerFactory.provisioners["portpicker-provisioner"] = EntryPoint(
+    name="portpicker-provisioner",
+    value="jax_portpicker:PortpickerProvisioner",
+    group="jupyter_client.kernel_provisioners"
+)
+KernelProvisionerFactory.default_provisioner_name = "portpicker-provisioner"

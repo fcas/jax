@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the jax2tf conversion for control-flow primitives."""
 
 from absl.testing import absltest
 
@@ -26,6 +25,7 @@ from jax.experimental.jax2tf.tests import tf_test_util
 jax.config.parse_flags_with_absl()
 
 
+@jtu.thread_unsafe_test_class()
 class ControlFlowOpsTest(tf_test_util.JaxToTfTestCase):
 
   @jtu.ignore_warning(category=UserWarning,

@@ -1,17 +1,37 @@
+/* Copyright 2022 The JAX Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <cstddef>
 #include <cstdint>
-#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
-#include "nanobind/nanobind.h"
-#include "nanobind/stl/pair.h"
-#include "nanobind/stl/string.h"
-#include "nanobind/stl/string_view.h"
-#include "nanobind/stl/tuple.h"
-#include "nanobind/stl/vector.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
+#include "nanobind/nanobind.h"
+#include "nanobind/stl/optional.h"  // IWYU pragma: keep
+#include "nanobind/stl/pair.h"  // IWYU pragma: keep
+#include "nanobind/stl/string.h"  // IWYU pragma: keep
+#include "nanobind/stl/string_view.h"  // IWYU pragma: keep
+#include "nanobind/stl/tuple.h"  // IWYU pragma: keep
+#include "nanobind/stl/vector.h"  // IWYU pragma: keep
 #include "jaxlib/absl_status_casters.h"
 #include "jaxlib/gpu/gpu_kernel_helpers.h"
 #include "jaxlib/gpu/triton.pb.h"
@@ -26,10 +46,28 @@ namespace nb = nanobind;
 
 namespace jax::JAX_GPU_NAMESPACE {
 
+nb::dict Registrations() {
+  nb::dict dict;
+  nb::dict gpu_dict;
+  gpu_dict["instantiate"] =
+      EncapsulateFfiHandler(kTritonKernelCallFfiInstantiate);
+  gpu_dict["initialize"] =
+      EncapsulateFfiHandler(kTritonKernelCallFfiInitialize);
+  gpu_dict["execute"] = EncapsulateFfiHandler(kTritonKernelCallFfi);
+  dict["triton_kernel_call_ffi"] = gpu_dict;
+  return dict;
+}
+
 NB_MODULE(_triton, m) {
   nb::class_<Kernel>(m, "TritonKernel")
-      .def(nb::init<std::string, uint32_t, uint32_t, std::string, std::string,
-                    int, uint32_t, uint32_t, uint32_t>());
+      .def(nb::init<std::string, uint32_t, uint32_t, uint32_t, std::string,
+                    std::string, int, std::optional<uint32_t>,
+                    std::optional<uint32_t>>(),
+           nb::arg("kernel_name"), nb::arg("num_warps"), nb::arg("num_ctas"),
+           nb::arg("shared_mem_bytes"), nb::arg("ptx"), nb::arg("ttir"),
+           nb::arg("compute_capability"),
+           nb::arg("global_scratch_size") = nb::none(),
+           nb::arg("global_scratch_align") = nb::none());
 
   nb::class_<KernelCall::Parameter>(m, "TritonParameter");
 
@@ -38,6 +76,18 @@ NB_MODULE(_triton, m) {
           return KernelCall::Parameter{
               KernelCall::Parameter::Array{bytes_to_zero, ptr_divisibility}};
         });
+
+  m.def(
+      "create_tma_descriptor_parameter",
+      [](uint32_t elem_type, uint32_t swizzle, std::vector<uint64_t> shape,
+         std::vector<uint64_t> strides, std::vector<uint32_t> block_shape,
+         uint32_t oob_fill) {
+        return KernelCall::Parameter{KernelCall::Parameter::TmaDescriptor{
+            elem_type, swizzle, std::move(shape), std::move(strides),
+            std::move(block_shape), oob_fill}};
+      },
+      nb::arg("elem_type"), nb::arg("swizzle"), nb::arg("shape"),
+      nb::arg("strides"), nb::arg("block_shape"), nb::arg("oob_fill"));
 
   m.def("create_scalar_parameter",
         ValueOrThrowWrapper([](bool value, std::string_view dtype)
@@ -132,15 +182,27 @@ NB_MODULE(_triton, m) {
           return major * 10 + minor;
         }));
 
+  m.def("get_arch_details",
+        ValueOrThrowWrapper([](int device) -> absl::StatusOr<std::string> {
+#ifdef JAX_GPU_HIP
+          hipDeviceProp_t prop;
+          GPU_RETURN_IF_ERROR(hipGetDeviceProperties(&prop, device));
+          return prop.gcnArchName;
+#else
+          return absl::UnimplementedError("Not a HIP GPU");
+#endif
+        }));
+
   m.def("get_serialized_metadata",
-        ValueOrThrowWrapper(
-            [](nb::bytes opaque) -> absl::StatusOr<nb::bytes> {
-              JAX_ASSIGN_OR_RETURN(
-                  std::string metadata,
-                  GetTritonKernelCallSerializedMetadata(
-                      absl::string_view(opaque.c_str(), opaque.size())));
-              return nb::bytes(metadata.c_str(), metadata.size());
-            }));
+        ValueOrThrowWrapper([](nb::bytes opaque) -> absl::StatusOr<nb::bytes> {
+          JAX_ASSIGN_OR_RETURN(
+              std::string metadata,
+              GetTritonKernelCallSerializedMetadata(
+                  std::string_view(opaque.c_str(), opaque.size())));
+          return nb::bytes(metadata.c_str(), metadata.size());
+        }));
+
+  m.def("registrations", &Registrations);
 }
 
 }  // namespace jax::JAX_GPU_NAMESPACE

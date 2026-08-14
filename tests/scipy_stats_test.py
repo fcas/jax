@@ -20,17 +20,14 @@ from absl.testing import absltest
 
 import numpy as np
 import scipy.stats as osp_stats
-import scipy.version
 
 import jax
 import jax.numpy as jnp
-from jax._src import dtypes, test_util as jtu
+from jax._src import test_util as jtu
 from jax.scipy import stats as lsp_stats
 from jax.scipy.special import expit
 
 jax.config.parse_flags_with_absl()
-
-scipy_version = jtu.parse_version(scipy.version.version)
 
 all_shapes = [(), (4,), (3, 4), (3, 1), (1, 4), (2, 1, 4)]
 one_and_two_dim_shapes = [(4,), (3, 4), (3, 1), (1, 4)]
@@ -217,9 +214,6 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
     scipy_fun = osp_stats.bernoulli.ppf
     lax_fun = lsp_stats.bernoulli.ppf
 
-    if scipy_version < (1, 9, 2):
-      self.skipTest("Scipy 1.9.2 needed for fix https://github.com/scipy/scipy/pull/17166.")
-
     def args_maker():
       q, p = map(rng, shapes, dtypes)
       q = expit(q)
@@ -314,7 +308,7 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
                             rtol={np.float32: 2e-3, np.float64: 1e-4})
 
   def testBetaLogPdfZero(self):
-    # Regression test for https://github.com/google/jax/issues/7645
+    # Regression test for https://github.com/jax-ml/jax/issues/7645
     a = b = 1.
     x = np.array([0., 1.])
     self.assertAllClose(
@@ -523,6 +517,98 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
                               tol=1e-4)
       self._CompileAndCheck(lax_fun, args_maker)
 
+  @genNamedParametersNArgs(3)
+  def testExponLogCdf(self, shapes, dtypes):
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = osp_stats.expon.logcdf
+    lax_fun = lsp_stats.expon.logcdf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(
+        scipy_fun, lax_fun, args_maker, check_dtypes=False, tol=5e-4
+      )
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testExponCdf(self, shapes, dtypes):
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = osp_stats.expon.cdf
+    lax_fun = lsp_stats.expon.cdf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(
+        scipy_fun, lax_fun, args_maker, check_dtypes=False, tol=5e-4
+      )
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testExponSf(self, shapes, dtypes):
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = osp_stats.expon.sf
+    lax_fun = lsp_stats.expon.sf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(
+        scipy_fun, lax_fun, args_maker, check_dtypes=False, tol=5e-4
+      )
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testExponLogSf(self, shapes, dtypes):
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = osp_stats.expon.logsf
+    lax_fun = lsp_stats.expon.logsf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(
+        scipy_fun, lax_fun, args_maker, check_dtypes=False, tol=5e-4
+      )
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testExponPpf(self, shapes, dtypes):
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = osp_stats.expon.ppf
+    lax_fun = lsp_stats.expon.ppf
+
+    def args_maker():
+      q, loc, scale = map(rng, shapes, dtypes)
+      return [q, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(
+        scipy_fun, lax_fun, args_maker, check_dtypes=False, tol=5e-4
+      )
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  def testExponPpfNonUnitScale(self):
+    # Regression test for https://github.com/jax-ml/jax/issues/36757
+    # Previously expon.ppf ignored ``scale`` and returned the unit-rate value.
+    q = 0.5
+    for scale in (0.5, 2.0, 10.0):
+      for loc in (0.0, 1.5):
+        self.assertAllClose(
+          osp_stats.expon.ppf(q, loc=loc, scale=scale),
+          lsp_stats.expon.ppf(q, loc=loc, scale=scale),
+          atol=1e-6,
+        )
+
   @genNamedParametersNArgs(4)
   def testGammaLogPdf(self, shapes, dtypes):
     rng = jtu.rand_positive(self.rng())
@@ -539,9 +625,16 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
       self._CompileAndCheck(lax_fun, args_maker)
 
   def testGammaLogPdfZero(self):
-    # Regression test for https://github.com/google/jax/issues/7256
+    # Regression test for https://github.com/jax-ml/jax/issues/7256
     self.assertAllClose(
       osp_stats.gamma.pdf(0.0, 1.0), lsp_stats.gamma.pdf(0.0, 1.0), atol=1E-6)
+
+  def testGammaDebugNans(self):
+    # Regression test for https://github.com/jax-ml/jax/issues/24939
+    with jax.debug_nans(True):
+      self.assertAllClose(
+          osp_stats.gamma.pdf(0.0, 1.0, 1.0), lsp_stats.gamma.pdf(0.0, 1.0, 1.0)
+      )
 
   @genNamedParametersNArgs(4)
   def testGammaLogCdf(self, shapes, dtypes):
@@ -710,7 +803,7 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
       self._CompileAndCheck(lax_fun, args_maker)
 
   def testLogisticLogpdfOverflow(self):
-    # Regression test for https://github.com/google/jax/issues/10219
+    # Regression test for https://github.com/jax-ml/jax/issues/10219
     self.assertAllClose(
       np.array([-100, -100], np.float32),
       lsp_stats.logistic.logpdf(np.array([-100, 100], np.float32)),
@@ -855,7 +948,7 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
       self._CompileAndCheck(lax_fun, args_maker)
 
   def testNormSfNearZero(self):
-    # Regression test for https://github.com/google/jax/issues/17199
+    # Regression test for https://github.com/jax-ml/jax/issues/17199
     value = np.array(10, np.float32)
     self.assertAllClose(osp_stats.norm.sf(value).astype('float32'),
                         lsp_stats.norm.sf(value),
@@ -913,7 +1006,6 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
     with jtu.strict_promotion_if_dtypes_match(dtypes):
       self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
                               tol=1e-3)
-      self._CompileAndCheck(lax_fun, args_maker)
 
   @genNamedParametersNArgs(5)
   def testTruncnormPdf(self, shapes, dtypes):
@@ -933,7 +1025,6 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
     with jtu.strict_promotion_if_dtypes_match(dtypes):
       self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
                               tol=1e-3)
-      self._CompileAndCheck(lax_fun, args_maker)
 
   @genNamedParametersNArgs(5)
   def testTruncnormLogCdf(self, shapes, dtypes):
@@ -951,7 +1042,6 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
     with jtu.strict_promotion_if_dtypes_match(dtypes):
       self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
                               tol=1e-3)
-      self._CompileAndCheck(lax_fun, args_maker)
 
   @genNamedParametersNArgs(5)
   def testTruncnormCdf(self, shapes, dtypes):
@@ -969,8 +1059,6 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
     with jtu.strict_promotion_if_dtypes_match(dtypes):
       self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
                               tol=1e-3)
-      self._CompileAndCheck(lax_fun, args_maker, rtol={np.float32: 1e-5},
-                            atol={np.float32: 1e-5})
 
   @genNamedParametersNArgs(5)
   def testTruncnormLogSf(self, shapes, dtypes):
@@ -988,7 +1076,6 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
     with jtu.strict_promotion_if_dtypes_match(dtypes):
       self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
                               tol=1e-3)
-      self._CompileAndCheck(lax_fun, args_maker)
 
   @genNamedParametersNArgs(5)
   def testTruncnormSf(self, shapes, dtypes):
@@ -1006,7 +1093,6 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
     with jtu.strict_promotion_if_dtypes_match(dtypes):
       self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
                               tol=1e-3)
-      self._CompileAndCheck(lax_fun, args_maker)
 
   @genNamedParametersNArgs(4)
   def testParetoLogPdf(self, shapes, dtypes):
@@ -1023,6 +1109,103 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
                               tol=1e-3)
       self._CompileAndCheck(lax_fun, args_maker)
 
+  @genNamedParametersNArgs(4)
+  def testParetoPdf(self, shapes, dtypes):
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = osp_stats.pareto.pdf
+    lax_fun = lsp_stats.pareto.pdf
+
+    def args_maker():
+      x, b, loc, scale = map(rng, shapes, dtypes)
+      return [x, b, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(
+        scipy_fun, lax_fun, args_maker, check_dtypes=False, tol=1e-3
+      )
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(4)
+  def testParetoLogCdf(self, shapes, dtypes):
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = osp_stats.pareto.logcdf
+    lax_fun = lsp_stats.pareto.logcdf
+
+    def args_maker():
+      x, b, loc, scale = map(rng, shapes, dtypes)
+      return [x, b, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(
+        scipy_fun, lax_fun, args_maker, check_dtypes=False, tol=1e-3
+      )
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(4)
+  def testParetoCdf(self, shapes, dtypes):
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = osp_stats.pareto.cdf
+    lax_fun = lsp_stats.pareto.cdf
+
+    def args_maker():
+      x, b, loc, scale = map(rng, shapes, dtypes)
+      return [x, b, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(
+        scipy_fun, lax_fun, args_maker, check_dtypes=False, tol=1e-3
+      )
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(4)
+  def testParetoPpf(self, shapes, dtypes):
+    rng_positive = jtu.rand_positive(self.rng())
+    rng_uniform = jtu.rand_uniform(self.rng())
+    scipy_fun = osp_stats.pareto.ppf
+    lax_fun = lsp_stats.pareto.ppf
+
+    def args_maker():
+      q = rng_uniform(shapes[0], dtypes[0])
+      b, loc, scale = map(rng_positive, shapes[1:], dtypes[1:])
+      return [q, b, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(
+        scipy_fun, lax_fun, args_maker, check_dtypes=False, tol=1e-3
+      )
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(4)
+  def testParetoSf(self, shapes, dtypes):
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = osp_stats.pareto.sf
+    lax_fun = lsp_stats.pareto.sf
+
+    def args_maker():
+      x, b, loc, scale = map(rng, shapes, dtypes)
+      return [x, b, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(
+        scipy_fun, lax_fun, args_maker, check_dtypes=False, tol=1e-3
+      )
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(4)
+  def testParetoLogSf(self, shapes, dtypes):
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = osp_stats.pareto.logsf
+    lax_fun = lsp_stats.pareto.logsf
+
+    def args_maker():
+      x, b, loc, scale = map(rng, shapes, dtypes)
+      return [x, b, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(
+        scipy_fun, lax_fun, args_maker, check_dtypes=False, tol=1e-3
+      )
+      self._CompileAndCheck(lax_fun, args_maker)
 
   @genNamedParametersNArgs(4)
   def testTLogPdf(self, shapes, dtypes):
@@ -1173,8 +1356,6 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
       k, n, a, b, loc = map(rng, shapes, dtypes)
       k = np.floor(k)
       n = np.ceil(n)
-      a = np.clip(a, a_min = 0.1, a_max=None).astype(a.dtype)
-      b = np.clip(a, a_min = 0.1, a_max=None).astype(b.dtype)
       loc = np.floor(loc)
       return [k, n, a, b, loc]
 
@@ -1182,7 +1363,10 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
       scipy_fun = osp_stats.betabinom.logpmf
       self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
                               tol=5e-4)
-      self._CompileAndCheck(lax_fun, args_maker, rtol=1e-5, atol=1e-5)
+
+  def testBetaBinomLogPmfZerokZeron(self):
+    self.assertEqual(lsp_stats.betabinom.logpmf(0, 0, 10, 5, 0),
+                     osp_stats.betabinom.logpmf(0, 0, 10, 5, 0))
 
   @genNamedParametersNArgs(4)
   def testBinomLogPmf(self, shapes, dtypes):
@@ -1192,22 +1376,23 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
 
     def args_maker():
       k, n, logit, loc = map(rng, shapes, dtypes)
-      k = np.floor(np.abs(k))
-      n = np.ceil(np.abs(n))
+      k = np.floor(k)
+      n = np.ceil(n)
       p = expit(logit)
       loc = np.floor(loc)
       return [k, n, p, loc]
 
-    tol = {np.float32: 1e-6, np.float64: 1e-8}
-
     with jtu.strict_promotion_if_dtypes_match(dtypes):
       self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
                               tol=5e-4)
-      self._CompileAndCheck(lax_fun, args_maker, rtol=tol, atol=tol)
 
   def testBinomPmfOutOfRange(self):
-    # Regression test for https://github.com/google/jax/issues/19150
+    # Regression test for https://github.com/jax-ml/jax/issues/19150
     self.assertEqual(lsp_stats.binom.pmf(k=6.5, n=5, p=0.8), 0.0)
+
+  def testBinomLogPmfZerokZeron(self):
+    self.assertEqual(lsp_stats.binom.logpmf(0, 0, 0.8, 0),
+                     osp_stats.binom.logpmf(0, 0, 0.8, 0))
 
   def testIssue972(self):
     self.assertAllClose(
@@ -1236,7 +1421,6 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
 
     self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
                             tol=5e-4)
-    self._CompileAndCheck(lax_fun, args_maker, rtol=1e-5, atol=1e-5)
 
   @jtu.sample_product(
     [dict(x_shape=x_shape, mean_shape=mean_shape, cov_shape=cov_shape)
@@ -1347,6 +1531,248 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
     result1 = lsp_stats.multivariate_normal.logpdf(x, mean, cov)
     result2 = jax.vmap(lsp_stats.multivariate_normal.logpdf)(x, mean, cov)
     self.assertArraysAllClose(result1, result2, check_dtypes=False)
+
+
+  @genNamedParametersNArgs(3)
+  def testGumbelRLogPdf(self, shapes, dtypes):
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_r.logpdf
+    lax_fun = lsp_stats.gumbel_r.logpdf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testGumbelRPdf(self, shapes, dtypes):
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_r.pdf
+    lax_fun = lsp_stats.gumbel_r.pdf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testGumbelRLogCdf(self, shapes, dtypes):
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_r.logcdf
+    lax_fun = lsp_stats.gumbel_r.logcdf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testGumbelRCdf(self, shapes, dtypes):
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_r.cdf
+    lax_fun = lsp_stats.gumbel_r.cdf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testGumbelRPpf(self, shapes, dtypes):
+    rng_p = jtu.rand_uniform(self.rng(), low=0.01, high=0.99)
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_r.ppf
+    lax_fun = lsp_stats.gumbel_r.ppf
+
+    def args_maker():
+      p = rng_p(shapes[0], dtypes[0])
+      loc = rng(shapes[1], dtypes[1])
+      scale = rng(shapes[2], dtypes[2])
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [p, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testGumbelRSf(self, shapes, dtypes):
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_r.sf
+    lax_fun = lsp_stats.gumbel_r.sf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testGumbelRLogSf(self, shapes, dtypes):
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_r.logsf
+    lax_fun = lsp_stats.gumbel_r.logsf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testGumbelLLogPdf(self, shapes, dtypes):
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_l.logpdf
+    lax_fun = lsp_stats.gumbel_l.logpdf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testGumbelLPdf(self, shapes, dtypes):
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_l.pdf
+    lax_fun = lsp_stats.gumbel_l.pdf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testGumbelLLogCdf(self, shapes, dtypes):
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_l.logcdf
+    lax_fun = lsp_stats.gumbel_l.logcdf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testGumbelLCdf(self, shapes, dtypes):
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_l.cdf
+    lax_fun = lsp_stats.gumbel_l.cdf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testGumbelLPpf(self, shapes, dtypes):
+    rng_p = jtu.rand_uniform(self.rng(), low=0.01, high=0.99)
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_l.ppf
+    lax_fun = lsp_stats.gumbel_l.ppf
+
+    def args_maker():
+      p = rng_p(shapes[0], dtypes[0])
+      loc = rng(shapes[1], dtypes[1])
+      scale = rng(shapes[2], dtypes[2])
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [p, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testGumbelLSf(self, shapes, dtypes):
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_l.sf
+    lax_fun = lsp_stats.gumbel_l.sf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @genNamedParametersNArgs(3)
+  def testGumbelLLogSf(self, shapes, dtypes):
+    rng = jtu.rand_default(self.rng())
+    scipy_fun = osp_stats.gumbel_l.logsf
+    lax_fun = lsp_stats.gumbel_l.logsf
+
+    def args_maker():
+      x, loc, scale = map(rng, shapes, dtypes)
+      scale = np.abs(scale) + np.array(0.1, dtype=scale.dtype)  # Ensure scale > 0
+      return [x, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=5e-3)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  # Edge case tests
+  def testGumbelRPdfZero(self):
+    # Test at specific values
+    self.assertAllClose(
+      osp_stats.gumbel_r.pdf(0.0, 0.0, 1.0), lsp_stats.gumbel_r.pdf(0.0, 0.0, 1.0), atol=1E-6)
+
+  def testGumbelLPdfZero(self):
+    # Test at specific values
+    self.assertAllClose(
+      osp_stats.gumbel_l.pdf(0.0, 0.0, 1.0), lsp_stats.gumbel_l.pdf(0.0, 0.0, 1.0), atol=1E-6)
 
   @jtu.sample_product(
     inshape=[(50,), (3, 50), (2, 12)],
@@ -1491,16 +1917,10 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
     ndim = shape[0] if len(shape) > 1 else 1
 
     func = partial(resample, shape=())
-    with jax.debug_key_reuse(False):
-      self._CompileAndCheck(
-        func, args_maker, rtol={np.float32: 3e-07, np.float64: 4e-15})
     result = func(*args_maker())
     assert result.shape == (ndim,)
 
     func = partial(resample, shape=(4,))
-    with jax.debug_key_reuse(False):
-      self._CompileAndCheck(
-        func, args_maker, rtol={np.float32: 3e-07, np.float64: 4e-15})
     result = func(*args_maker())
     assert result.shape == (ndim, 4)
 
@@ -1549,9 +1969,9 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
         ((47, 8), 0),
         ((47, 8), 1),
         ((0, 2, 3), None),
-        ((0, 2, 3), 0),
-        ((0, 2, 3), 1),
-        ((0, 2, 3), 2),
+        ((0, 2, 3), -3),
+        ((0, 2, 3), -2),
+        ((0, 2, 3), -1),
         ((10, 5, 21), None),
         ((10, 5, 21), 0),
         ((10, 5, 21), 1),
@@ -1562,10 +1982,15 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
     contains_nans=[True, False],
     keepdims=[True, False]
   )
+  @jtu.ignore_warning(
+      category=RuntimeWarning,
+      message="One or more sample arguments is too small; all returned values will be NaN"
+  )
+  @jtu.ignore_warning(
+      category=RuntimeWarning,
+      message="All axis-slices of one or more sample arguments are too small",
+  )
   def testMode(self, shape, dtype, axis, contains_nans, keepdims):
-    if scipy_version < (1, 9, 0) and keepdims != True:
-      self.skipTest("scipy < 1.9.0 only support keepdims == True")
-
     if contains_nans:
       rng = jtu.rand_some_nan(self.rng())
     else:
@@ -1574,25 +1999,7 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
 
     def scipy_mode_wrapper(a, axis=0, nan_policy='propagate', keepdims=None):
       """Wrapper to manage the shape discrepancies between scipy and jax"""
-      if scipy_version < (1, 11, 0) and a.size == 0:
-        if keepdims:
-          if axis == None:
-            output_shape = tuple(1 for _ in a.shape)
-          else:
-            output_shape = tuple(1 if i == axis else s for i, s in enumerate(a.shape))
-        else:
-          if axis == None:
-            output_shape = ()
-          else:
-            output_shape = np.delete(np.array(a.shape, dtype=np.int64), axis)
-        t = dtypes.canonicalize_dtype(jax.numpy.float_)
-        return (np.full(output_shape, np.nan, dtype=t),
-                np.zeros(output_shape, dtype=t))
-
-      if scipy_version < (1, 9, 0):
-        result = osp_stats.mode(a, axis=axis, nan_policy=nan_policy)
-      else:
-        result = osp_stats.mode(a, axis=axis, nan_policy=nan_policy, keepdims=keepdims)
+      result = osp_stats.mode(a, axis=axis, nan_policy=nan_policy, keepdims=keepdims)
 
       if a.size != 0 and axis == None and keepdims == True:
         output_shape = tuple(1 for _ in a.shape)
@@ -1617,11 +2024,12 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
       for axis in [None, *range(len(shape))
     ]],
     dtype=jtu.dtypes.integer + jtu.dtypes.floating,
-    method=['average', 'min', 'max', 'dense', 'ordinal']
+    method=['average', 'min', 'max', 'dense', 'ordinal'],
+    sampler=[jtu.rand_default, jtu.rand_some_nan],
   )
-  def testRankData(self, shape, dtype, axis, method):
+  def testRankData(self, shape, dtype, axis, method, sampler):
 
-    rng = jtu.rand_default(self.rng())
+    rng = sampler(self.rng())
     args_maker = lambda: [rng(shape, dtype)]
 
     scipy_fun = partial(osp_stats.rankdata, method=method, axis=axis)
@@ -1633,26 +2041,89 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
     self._CompileAndCheck(lax_fun, args_maker, rtol=tol)
 
   @jtu.sample_product(
-    [dict(shape=shape, axis=axis, ddof=ddof, nan_policy=nan_policy)
+    [dict(shape=shape, axis=axis, ddof=ddof, nan_policy=nan_policy, keepdims=keepdims)
       for shape in [(5,), (5, 6), (5, 6, 7)]
       for axis in [None, *range(len(shape))]
       for ddof in [0, 1, 2, 3]
       for nan_policy in ["propagate", "omit"]
+      for keepdims in [True, False]
     ],
     dtype=jtu.dtypes.integer + jtu.dtypes.floating,
   )
-  def testSEM(self, shape, dtype, axis, ddof, nan_policy):
+  def testSEM(self, shape, dtype, axis, ddof, nan_policy, keepdims):
 
     rng = jtu.rand_default(self.rng())
     args_maker = lambda: [rng(shape, dtype)]
 
-    scipy_fun = partial(osp_stats.sem, axis=axis, ddof=ddof, nan_policy=nan_policy)
-    lax_fun = partial(lsp_stats.sem, axis=axis, ddof=ddof, nan_policy=nan_policy)
+    scipy_fun = partial(osp_stats.sem, axis=axis, ddof=ddof, nan_policy=nan_policy,
+                        keepdims=keepdims)
+    lax_fun = partial(lsp_stats.sem, axis=axis, ddof=ddof, nan_policy=nan_policy,
+                      keepdims=keepdims)
     tol_spec = {np.float32: 2e-4, np.float64: 5e-6}
     tol = jtu.tolerance(dtype, tol_spec)
     self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
                             atol=tol)
     self._CompileAndCheck(lax_fun, args_maker, atol=tol)
+
+  @jtu.sample_product(
+    shape=[(), (5,), (3, 4)],
+    dtype=jtu.dtypes.floating,
+  )
+  def testPoissonEntropy(self, shape, dtype):
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = osp_stats.poisson.entropy
+    lax_fun = lsp_stats.poisson.entropy
+
+    args_maker = lambda: [rng(shape, dtype)]
+    tol = ({np.float32: 1e-2, np.float64: 1e-4} if jtu.test_device_matches(["tpu"])
+           else {np.float32: 2e-4, np.float64: 5e-6})
+    self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker,check_dtypes=False, tol=tol)
+
+  @genNamedParametersNArgs(2)
+  def testPoissonEntropyWithLoc(self, shapes, dtypes):
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = lambda mu, loc: osp_stats.poisson.entropy(mu, loc=loc)
+    lax_fun = lambda mu, loc: lsp_stats.poisson.entropy(mu, loc)
+
+    args_maker = lambda: [rng(shapes[0], dtypes[0]), rng(shapes[1], dtypes[1])]
+    tol = ({np.float32: 1e-2, np.float64: 1e-4} if jtu.test_device_matches(["tpu"])
+           else {np.float32: 2e-4, np.float64: 5e-6})
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,  tol=tol)
+
+  @jtu.sample_product(
+    dtype=jtu.dtypes.floating,
+  )
+  def testPoissonEntropyEdgeCases(self, dtype):
+    """Test edge cases: invalid mu and very small mu"""
+    tol = ({np.float32: 1e-2, np.float64: 1e-4} if jtu.test_device_matches(["tpu"])
+           else {np.float32: 2e-4, np.float64: 5e-6})
+
+    # Invalid mu (should return NaN)
+    invalid_mu = jnp.array([-1.0, 0.0, -5.0], dtype=dtype)
+    jax_result = lsp_stats.poisson.entropy(invalid_mu)
+    scipy_result = osp_stats.poisson.entropy(np.array(invalid_mu))
+    self.assertAllClose(jax_result, scipy_result, check_dtypes=False, rtol=tol)
+
+    # Very small mu
+    small_mu = jnp.array([0.01, 0.1, 0.5], dtype=dtype)
+    jax_result = lsp_stats.poisson.entropy(small_mu)
+    scipy_result = osp_stats.poisson.entropy(np.array(small_mu))
+    self.assertAllClose(jax_result, scipy_result,check_dtypes=False, rtol=tol)
+
+  @jtu.sample_product(
+    dtype=jtu.dtypes.floating,
+  )
+  def testPoissonEntropyRegimes(self, dtype):
+    """Test all three computational regimes"""
+    mu = jnp.array([2.0, 5.0, 9.0, 15.0, 50.0, 99.0, 100.0, 200.0, 500.0], dtype=dtype)
+    scipy_fun = lambda m: osp_stats.poisson.entropy(m)
+    lax_fun = lambda m: lsp_stats.poisson.entropy(m)
+    args_maker = lambda: [mu]
+
+    tol = ({np.float32: 1e-2, np.float64: 1e-4} if jtu.test_device_matches(["tpu"])
+           else {np.float32: 2e-4, np.float64: 5e-6})
+    self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker,check_dtypes=False, tol=tol)
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

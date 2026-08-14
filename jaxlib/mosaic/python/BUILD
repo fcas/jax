@@ -14,8 +14,27 @@
 
 # Mosaic Python bindings
 
-load("@rules_python//python:defs.bzl", "py_library")
 load("@llvm-project//mlir:tblgen.bzl", "gentbl_filegroup")
+load("//jaxlib:jax.bzl", "py_library", "pytype_strict_library")
+
+package(
+    default_applicable_licenses = [],
+)
+
+py_library(
+    name = "gpu_dialect",
+    srcs = [
+        "mosaic_gpu.py",
+        "//jaxlib/mosaic/dialect/gpu:_mosaic_gpu_gen_enums.py",
+        "//jaxlib/mosaic/dialect/gpu:_mosaic_gpu_gen_ops.py",
+    ],
+    strict_deps = False,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//jaxlib/mlir",
+        "//jaxlib/mlir/_mlir_libs:_mosaic_gpu_ext",
+    ],
+)
 
 gentbl_filegroup(
     name = "tpu_python_gen_raw",
@@ -25,7 +44,14 @@ gentbl_filegroup(
                 "-gen-python-op-bindings",
                 "-bind-dialect=tpu",
             ],
-            "_tpu_gen_raw.py",
+            "_tpu_ops_gen_raw.py",
+        ),
+        (
+            [
+                "-gen-python-enum-bindings",
+                "-bind-dialect=tpu",
+            ],
+            "_tpu_enum_gen_raw.py",
         ),
     ],
     tblgen = "@llvm-project//mlir:mlir-tblgen",
@@ -33,22 +59,32 @@ gentbl_filegroup(
     deps = [
         "//jaxlib/mosaic:tpu_td_files",
         "@llvm-project//mlir:OpBaseTdFiles",
+        "@xla//xla/mosaic:tpu_td_files",
     ],
 )
 
 genrule(
-    name = "tpu_python_gen",
-    srcs = ["_tpu_gen_raw.py"],
-    outs = ["_tpu_gen.py"],
-    cmd = "cat $(location _tpu_gen_raw.py) | sed -e 's/^from \\./from jaxlib\\.mlir\\.dialects\\./g' > $@",
+    name = "tpu_python_ops_gen",
+    srcs = ["_tpu_ops_gen_raw.py"],
+    outs = ["_tpu_ops_gen.py"],
+    cmd = "cat $(location _tpu_ops_gen_raw.py) | sed -e 's/^from \\./from jaxlib\\.mlir\\.dialects\\./g' > $@",
+)
+
+genrule(
+    name = "tpu_python_enum_gen",
+    srcs = ["_tpu_enum_gen_raw.py"],
+    outs = ["_tpu_enum_gen.py"],
+    cmd = "cat $(location _tpu_enum_gen_raw.py) | sed -e 's/^from \\.\\./from jaxlib\\.mlir\\./g;s/^from \\./from jaxlib\\.mlir\\.dialects\\./g' > $@",
 )
 
 py_library(
     name = "tpu_dialect",
     srcs = [
-        "_tpu_gen.py",
+        "_tpu_enum_gen.py",
+        "_tpu_ops_gen.py",
         "tpu.py",
     ],
+    strict_deps = False,
     visibility = ["//visibility:public"],
     deps = [
         "//jaxlib/mlir",
@@ -56,11 +92,12 @@ py_library(
     ],
 )
 
-py_library(
+pytype_strict_library(
     name = "layout_defs",
     srcs = [
         "layout_defs.py",
     ],
+    type_checking = "pyrefly",
     visibility = [
         "//visibility:public",
     ],

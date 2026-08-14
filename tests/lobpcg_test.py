@@ -21,7 +21,6 @@ Requires matplotlib.
 import functools
 import re
 import os
-import unittest
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -50,6 +49,8 @@ def _make_concrete_cases(f64):
       m *= 2
     if f64:
       m *= 2
+    if not f64:
+      tol = 1e-6
     if name.startswith('cluster') and not f64:
       tol = 2e-6
     clean_matrix_name = _clean_matrix_name(name)
@@ -197,6 +198,7 @@ def _callable_generators(dtype):
     jax_debug_nans=True,
     jax_numpy_rank_promotion='raise',
     jax_traceback_filtering='off')
+@jtu.thread_unsafe_test_class()  # matplotlib isn't thread-safe
 class LobpcgTest(jtu.JaxTestCase):
 
   def checkLobpcgConsistency(self, matrix_name, n, k, m, tol, dtype):
@@ -271,7 +273,7 @@ class LobpcgTest(jtu.JaxTestCase):
     self._possibly_plot(A, eigs, X, m, matrix_name)
 
   def _possibly_plot(self, A, eigs, X, m, matrix_name):
-    if not os.getenv('LOBPCG_EMIT_DEBUG_PLOTS'):
+    if os.getenv('LOBPCG_EMIT_DEBUG_PLOTS', '0') != '1':
       return
 
     if isinstance(A, (np.ndarray, jax.Array)):
@@ -369,12 +371,6 @@ class LobpcgTest(jtu.JaxTestCase):
 
 class F32LobpcgTest(LobpcgTest):
 
-  def setUp(self):
-    # TODO(phawkins): investigate this failure
-    if jtu.test_device_matches(["gpu"]):
-      raise unittest.SkipTest("Test is failing on CUDA gpus")
-    super().setUp()
-
   def testLobpcgValidatesArguments(self):
     A, _ = _concrete_generators(np.float32)['id'](100, 10)
     X = self.rng().standard_normal(size=(100, 10)).astype(np.float32)
@@ -393,7 +389,7 @@ class F32LobpcgTest(LobpcgTest):
       linalg.lobpcg_standard(A[:50, :50], X[:50])
 
   @parameterized.named_parameters(_make_concrete_cases(f64=False))
-  @jtu.skip_on_devices("gpu")
+  @jtu.skip_on_devices("cuda")
   def testLobpcgConsistencyF32(self, matrix_name, n, k, m, tol):
     self.checkLobpcgConsistency(matrix_name, n, k, m, tol, jnp.float32)
 
@@ -409,24 +405,18 @@ class F32LobpcgTest(LobpcgTest):
 @jtu.with_config(jax_enable_x64=True)
 class F64LobpcgTest(LobpcgTest):
 
-  def setUp(self):
-    # TODO(phawkins): investigate this failure
-    if jtu.test_device_matches(["gpu"]):
-      raise unittest.SkipTest("Test is failing on CUDA gpus")
-    super().setUp()
-
   @parameterized.named_parameters(_make_concrete_cases(f64=True))
-  @jtu.skip_on_devices("tpu", "iree", "gpu")
+  @jtu.skip_on_devices("tpu", "cuda")
   def testLobpcgConsistencyF64(self, matrix_name, n, k, m, tol):
     self.checkLobpcgConsistency(matrix_name, n, k, m, tol, jnp.float64)
 
   @parameterized.named_parameters(_make_concrete_cases(f64=True))
-  @jtu.skip_on_devices("tpu", "iree", "gpu")
+  @jtu.skip_on_devices("tpu", "cuda")
   def testLobpcgMonotonicityF64(self, matrix_name, n, k, m, tol):
     self.checkLobpcgMonotonicity(matrix_name, n, k, m, tol, jnp.float64)
 
   @parameterized.named_parameters(_make_callable_cases(f64=True))
-  @jtu.skip_on_devices("tpu", "iree", "gpu")
+  @jtu.skip_on_devices("tpu", "cuda")
   def testCallableMatricesF64(self, matrix_name):
     self.checkApproxEigs(matrix_name, jnp.float64)
 

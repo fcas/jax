@@ -31,20 +31,26 @@ import jax
 from jax import lax
 from jax import numpy as jnp
 from jax import random
+from jax._src import api
 from jax._src import config
 from jax._src import core
+from jax._src import deprecations
+from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import test_util as jtu
 from jax import vmap
-from jax.interpreters import xla
 
 from jax._src import random as jax_random
-from jax._src import prng as prng_internal
+from jax._src.random import prng as prng_internal
+from jax._src.random import threefry2x32 as threefry2x32_internal
 
 config.parse_flags_with_absl()
 
 
 PRNG_IMPLS = list(prng_internal.prngs.items())
+# Remove Pallas keys from this test, which do not run in XLA.
+PRNG_IMPLS = [
+    (name, impl) for (name, impl) in PRNG_IMPLS if "pallas" not in name]
 
 
 class OnX64(enum.Enum):
@@ -195,8 +201,11 @@ class PrngTest(jtu.JaxTestCase):
     # jax_default_prng_impl config enum state definition directly,
     # rather than copying manually here?
     self.assertIn('threefry2x32', prng_internal.prngs)
-    self.assertIn('rbg',          prng_internal.prngs)
-    self.assertIn('unsafe_rbg',   prng_internal.prngs)
+    self.assertIn('threefry4x32', prng_internal.prngs)
+    self.assertIn('philox2x32', prng_internal.prngs)
+    self.assertIn('philox4x32', prng_internal.prngs)
+    self.assertIn('rbg', prng_internal.prngs)
+    self.assertIn('unsafe_rbg', prng_internal.prngs)
 
   def testThreefry2x32(self):
     # We test the hash by comparing to known values provided in the test code of
@@ -206,24 +215,24 @@ class PrngTest(jtu.JaxTestCase):
       return tuple(hex(x.copy()).rstrip("L") for x in result)
 
     expected = ("0x6b200159", "0x99ba4efe")
-    result = prng_internal.threefry_2x32(np.uint32([0, 0]), np.uint32([0, 0]))
+    result = threefry2x32_internal.threefry_2x32(np.uint32([0, 0]), np.uint32([0, 0]))
 
     self.assertEqual(expected, result_to_hex(result))
 
     expected = ("0x1cb996fc", "0xbb002be7")
     u32_max = np.iinfo(np.uint32).max
-    result = prng_internal.threefry_2x32(np.uint32([u32_max, u32_max]), np.uint32([u32_max, u32_max]))
+    result = threefry2x32_internal.threefry_2x32(np.uint32([u32_max, u32_max]), np.uint32([u32_max, u32_max]))
     self.assertEqual(expected, result_to_hex(result))
 
     expected = ("0xc4923a9c", "0x483df7a0")
-    result = prng_internal.threefry_2x32(
+    result = threefry2x32_internal.threefry_2x32(
         np.uint32([0x13198a2e, 0x03707344]),
         np.uint32([0x243f6a88, 0x85a308d3]))
     self.assertEqual(expected, result_to_hex(result))
 
   def testThreefry2x32Large(self):
     n = 10000000
-    result = prng_internal.threefry_2x32(
+    result = threefry2x32_internal.threefry_2x32(
       (np.uint32(0x13198a2e), np.uint32(0x03707344)),
       jnp.concatenate([
         jnp.full((n,), 0x243f6a88, jnp.uint32),
@@ -235,18 +244,19 @@ class PrngTest(jtu.JaxTestCase):
   def testThreefry2x32Empty(self):
     # Regression test for an op-by-op crash for empty arrays in CUDA mode.
     with jax.disable_jit():
-      result = prng_internal.threefry_2x32(
+      result = threefry2x32_internal.threefry_2x32(
         (np.uint32(0x13198a2e), np.uint32(0x03707344)),
         jnp.ones((10, 0,), jnp.uint32))
     np.testing.assert_equal(result, np.zeros((10, 0,), dtype=np.uint32))
 
+  @jtu.thread_unsafe_test()
   def testNoOpByOpUnderHash(self):
     def fail(*args, **kwargs): assert False
-    apply_primitive, xla.apply_primitive = xla.apply_primitive, fail
+    apply_primitive, dispatch.apply_primitive = dispatch.apply_primitive, fail
     try:
-      _ = prng_internal.threefry_2x32(np.zeros(2, np.uint32), np.arange(10, dtype=np.uint32))
+      _ = threefry2x32_internal.threefry_2x32(np.zeros(2, np.uint32), np.arange(10, dtype=np.uint32))
     finally:
-      xla.apply_primitive = apply_primitive
+      dispatch.apply_primitive = apply_primitive
 
   @skipIf(config.threefry_partitionable.value, 'changed random bit values')
   @parameterized.parameters([{'make_key': ctor} for ctor in KEY_CTORS])
@@ -275,13 +285,18 @@ class PrngTest(jtu.JaxTestCase):
       expected64 = np.array([56197195, 4200222568, 961309823], dtype=np.uint32)
     self.assertArraysEqual(bits64, expected64)
 
-  @jtu.sample_product(prng_name=[name for name, _ in PRNG_IMPLS],
-                      make_key=KEY_CTORS)
-  def testRngRandomBitsShapeDtype(self, prng_name, make_key):
+  @jtu.sample_product(
+      prng_name=[name for name, _ in PRNG_IMPLS],
+      make_key=KEY_CTORS,
+      explicit_x64_dtypes=config.ExplicitX64Mode.__members__.values(),
+  )
+  def testRngRandomBitsShapeDtype(self, prng_name, make_key,
+                                  explicit_x64_dtypes):
     # Like testRngRandomBits, but only meant to exercise random_bits
     # on every PRNG implementation. Instead of values, only checks
     # that shapes/dtypes are as expected.
 
+    @config.explicit_x64_dtypes(explicit_x64_dtypes)
     def random_bits(key, width, shape):
       dtype = jnp.dtype(f'uint{width}')
       return jax.random.bits(key, shape, dtype)
@@ -301,11 +316,20 @@ class PrngTest(jtu.JaxTestCase):
       self.assertEqual(bits32.shape, (3,))
       self.assertEqual(bits32.dtype, np.dtype('uint32'))
 
-      with jtu.ignore_warning(category=UserWarning, message="Explicitly requested dtype.*"):
-        bits64 = random_bits(make_key(seed), 64, (3,))
-      expected_dtype = np.dtype('uint64' if config.enable_x64.value else 'uint32')
-      self.assertEqual(bits64.shape, (3,))
-      self.assertEqual(bits64.dtype, expected_dtype)
+      if explicit_x64_dtypes == config.ExplicitX64Mode.ERROR and not config.enable_x64.value:
+        with self.assertRaisesRegex(ValueError, "Explicitly requested dtype.*"):
+          bits64 = random_bits(make_key(seed), 64, (3,))
+      else:
+        with jtu.ignore_warning(category=UserWarning, message="Explicitly requested dtype.*"):
+          bits64 = random_bits(make_key(seed), 64, (3,))
+        expected_dtype = np.dtype(
+            "uint64"
+            if config.enable_x64.value
+            or explicit_x64_dtypes == config.ExplicitX64Mode.ALLOW
+            else "uint32"
+        )
+        self.assertEqual(bits64.shape, (3,))
+        self.assertEqual(bits64.dtype, expected_dtype)
 
   @skipIf(config.threefry_partitionable.value, 'changed random bit values')
   @parameterized.parameters([{'make_key': ctor} for ctor in KEY_CTORS])
@@ -323,7 +347,6 @@ class PrngTest(jtu.JaxTestCase):
     rand_bits_32 = np.array([np.array(r).view(np.uint32) for r in rand_bits])
     assert np.all(rand_bits_32 == rand_bits_32[0])
 
-
   @jtu.sample_product(case=_RANDOM_VALUES_CASES, make_key=KEY_CTORS)
   @skipIf(config.threefry_partitionable.value, 'changed random bit values')
   @jtu.skip_on_devices("tpu")  # TPU precision causes issues.
@@ -335,7 +358,7 @@ class PrngTest(jtu.JaxTestCase):
 
     Any refactoring of random distributions that leads to non-trivial
     differences in this test should follow the procedure outlined at
-    https://jax.readthedocs.io/en/latest/api_compatibility.html#numerics-and-randomness
+    https://docs.jax.dev/en/latest/api_compatibility.html#numerics-and-randomness
 
     This includes:
     * Announcing the change in the CHANGELOG.md
@@ -361,9 +384,9 @@ class PrngTest(jtu.JaxTestCase):
     # Test to ensure consistent random values between JAX versions
     seed = 0
     self.assertEqual(random.randint(make_key(seed), (3, 3), 0, 8).dtype,
-                     dtypes.canonicalize_dtype(jnp.int_))
+                     dtypes.default_int_dtype())
     if config.enable_x64.value:
-        self.assertAllClose(
+      self.assertAllClose(
             random.randint(make_key(seed), (3, 3), 0, 8, dtype='int64'),
             np.array([[7, 2, 6],
                        [2, 1, 0],
@@ -390,10 +413,20 @@ class PrngTest(jtu.JaxTestCase):
     f = lambda key: jax.random.uniform(key, (1,))
     with jax._src.config.threefry_gpu_kernel_lowering(False):
       hlo_text = jax.jit(f).lower(jax.random.key(17)).as_text()
-      self.assertNotIn("cu_threefry2x32", hlo_text)
+      if jtu.is_device_rocm():
+        self.assertNotIn("hip_threefry2x32", hlo_text)
+      elif jtu.is_device_oneapi():
+        self.assertNotIn("oneapi_threefry2x32", hlo_text)
+      else:
+        self.assertNotIn("cu_threefry2x32", hlo_text)
     with jax._src.config.threefry_gpu_kernel_lowering(True):
       hlo_text = jax.jit(f).lower(jax.random.key(17)).as_text()
-      self.assertIn("cu_threefry2x32", hlo_text)
+      if jtu.is_device_rocm():
+        self.assertIn("hip_threefry2x32", hlo_text)
+      elif jtu.is_device_oneapi():
+        self.assertIn("oneapi_threefry2x32", hlo_text)
+      else:
+        self.assertIn("cu_threefry2x32", hlo_text)
 
   @parameterized.parameters([{'make_key': ctor} for ctor in KEY_CTORS])
   def test_random_seed_offset(self, make_key):
@@ -427,7 +460,7 @@ class PrngTest(jtu.JaxTestCase):
   @skipIf(not config.threefry_partitionable.value, 'enable after upgrade')
   @parameterized.parameters([{'make_key': ctor} for ctor in KEY_CTORS])
   def test_threefry_split_vmapped_fold_in_symmetry(self, make_key):
-    # See https://github.com/google/jax/issues/7708
+    # See https://github.com/jax-ml/jax/issues/7708
     with jax.default_prng_impl('threefry2x32'):
       key = make_key(72)
       f1, f2, f3 = vmap(lambda k, _: random.fold_in(k, lax.axis_index('batch')),
@@ -441,7 +474,7 @@ class PrngTest(jtu.JaxTestCase):
 
   @skipIf(config.threefry_partitionable.value, 'changed random bit values')
   def test_loggamma_nan_corner_case(self):
-    # regression test for https://github.com/google/jax/issues/17922
+    # regression test for https://github.com/jax-ml/jax/issues/17922
     # This particular key previously led to NaN output.
     # If the underlying implementation ever changes, this test will no longer
     # exercise this corner case, so we compare to a particular output value
@@ -529,6 +562,43 @@ class PrngTest(jtu.JaxTestCase):
     key = make_key(42, impl=name)
     self.check_key_has_impl(key, impl)
 
+  @jtu.sample_product(name=[name for name, _ in PRNG_IMPLS])
+  def test_key_dtype(self, name):
+    self.assertEqual(random.key_dtype(name), random.key(0, impl=name).dtype)
+
+  @parameterized.parameters([
+      {'dtype_spec': "threefry2x32"},
+      {'dtype_spec': random.key_dtype("threefry2x32")},
+  ])
+  def test_key_construction_with_dtype(self, dtype_spec):
+    key = random.key(42, dtype=dtype_spec)
+    self.check_key_has_impl(key, prng_internal.prngs["threefry2x32"])
+
+  def test_key_construction_with_both_impl_and_dtype(self):
+    dtype = random.key_dtype("threefry2x32")
+    with self.assertRaisesRegex(
+        ValueError, "Cannot specify both `impl` and `dtype`"):
+      random.key(42, impl="threefry2x32", dtype=dtype)
+
+  @parameterized.parameters([
+      {"dtype_spec": "threefry2x32"},
+      {"dtype_spec": random.key_dtype("threefry2x32")},
+  ])
+  def test_wrap_key_data_with_dtype(self, dtype_spec):
+    data = jnp.zeros(2, dtype="uint32")
+    key = random.wrap_key_data(data, dtype=dtype_spec)
+    expected_dtype = (
+        dtype_spec if isinstance(dtype_spec, prng_internal.KeyTy)
+        else random.key_dtype(dtype_spec))
+    self.assertEqual(key.dtype, expected_dtype)
+
+  def test_wrap_key_data_with_both_impl_and_dtype(self):
+    dtype = random.key_dtype("threefry2x32")
+    data = jnp.zeros(2, dtype="uint32")
+    with self.assertRaisesRegex(
+        ValueError, "Cannot specify both `impl` and `dtype`"):
+      random.wrap_key_data(data, impl="threefry2x32", dtype=dtype)
+
   @parameterized.parameters([{'make_key': ctor} for ctor in KEY_CTORS])
   def test_isinstance(self, make_key):
     key = make_key(0)
@@ -536,7 +606,7 @@ class PrngTest(jtu.JaxTestCase):
 
   @parameterized.parameters([{'make_key': ctor} for ctor in KEY_CTORS])
   def test_key_output_vjp(self, make_key):
-    # See https://github.com/google/jax/issues/14856
+    # See https://github.com/jax-ml/jax/issues/14856
     def f(seed): return make_key(seed)
     jax.vjp(f, 1)  # doesn't crash
 
@@ -569,7 +639,7 @@ class ThreefryPrngTest(jtu.JaxTestCase):
       partial(random.PRNGKey, impl='threefry2x32'),
       partial(random.key, impl='threefry2x32')]])
   def test_seed_no_implicit_transfers(self, make_key):
-    # See https://github.com/google/jax/issues/15613
+    # See https://github.com/jax-ml/jax/issues/15613
     with jax.transfer_guard('disallow'):
       make_key(jax.device_put(42))  # doesn't crash
 
@@ -593,9 +663,25 @@ class KeyArrayTest(jtu.JaxTestCase):
     self.assertEqual(key1.dtype, key2.dtype)
     self.assertArraysEqual(random.key_data(key1), random.key_data(key2))
 
+  def make_keys(self, *shape, seed=28, impl='threefry2x32'):
+    seeds = seed + jnp.arange(math.prod(shape), dtype=jnp.uint32)
+    return jax.vmap(partial(random.key, impl=impl))(seeds).reshape(shape)
+
   def test_construction(self):
     key = random.key(42)
     self.assertIsInstance(key, prng_internal.PRNGKeyArray)
+
+  def test_numpy_construction(self):
+    key = random.wrap_key_data(np.array([42, 173], dtype=np.uint32),
+                               impl='threefry2x32')
+    self.assertIsInstance(key, prng_internal.PRNGKeyArray)
+    self.assertIsInstance(key._base_array, jax.Array)
+    self.assertEqual(key._base_array.device, jax.devices()[0])
+    self.assertEqual(key.device, jax.devices()[0])
+
+  def test_device_property(self):
+    key = random.key(42)
+    self.assertEqual(key.device, key._base_array.device)
 
   def test_random_clone(self):
     # Here we test value semantics and compatibility with jit/vmap
@@ -615,17 +701,22 @@ class KeyArrayTest(jtu.JaxTestCase):
 
     self.assertFalse(jnp.issubdtype(key.dtype, np.integer))
     self.assertFalse(jnp.issubdtype(key.dtype, np.number))
-    with self.assertRaisesRegex(TypeError, "Cannot interpret"):
-      jnp.issubdtype(key, dtypes.prng_key)
+    if jtu.numpy_version() < (2, 4, 0):
+      with self.assertRaisesRegex(TypeError, "Cannot interpret"):
+        jnp.issubdtype(key, dtypes.prng_key)
+    elif deprecations.is_accelerated("jax-array-numpy-dtype"):
+      with self.assertRaisesRegex(TypeError, "Implicit conversion of an array to a dtype"):
+        jnp.issubdtype(key, dtypes.prng_key)
+    else:
+      with jtu.ignore_warning(category=DeprecationWarning,
+                              message="Implicit conversion of an array to a dtype"):
+        with self.assertRaisesRegex(ValueError, "Could not convert Array"):
+          jnp.issubdtype(key, dtypes.prng_key)
 
   @skipIf(not config.enable_custom_prng.value, 'relies on typed key upgrade flag')
   def test_construction_upgrade_flag(self):
     key = random.PRNGKey(42)
     self.assertIsInstance(key, prng_internal.PRNGKeyArray)
-
-  def make_keys(self, *shape, seed=28):
-    seeds = seed + jnp.arange(math.prod(shape), dtype=jnp.uint32)
-    return jax.vmap(random.key)(seeds).reshape(shape)
 
   def test_key_as_seed(self):
     key = self.make_keys()
@@ -647,6 +738,11 @@ class KeyArrayTest(jtu.JaxTestCase):
       random.PRNGKey(seed)
     with self.assertRaisesRegex(TypeError, "PRNG key seed must be an integer"):
       random.key(seed)
+
+  def test_nbytes_property(self):
+    key = self.make_keys()
+    self.assertEqual(key.nbytes, key._base_array.nbytes)
+    self.assertEqual(key.nbytes, key.itemsize * key.size)
 
   def test_dtype_property(self):
     k1, k2 = self.make_keys(), self.make_keys()
@@ -700,7 +796,7 @@ class KeyArrayTest(jtu.JaxTestCase):
       f(key).block_until_ready()
       f(key).block_until_ready()
 
-    self.assertEqual(count[0], 1)
+    self.assertEqual(count(), 1)
 
   # TODO(jakevdp) remove this decorator when reuse checks move to C++
   @jax.debug_key_reuse(False)
@@ -717,7 +813,7 @@ class KeyArrayTest(jtu.JaxTestCase):
       f(key).block_until_ready()
       f(key).block_until_ready()
 
-    self.assertEqual(count[0], 1)
+    self.assertEqual(count(), 1)
 
   def test_cpp_dispatch_aot_normal(self):
     # Ensure we stay on the C++ dispatch path when calling an
@@ -730,7 +826,7 @@ class KeyArrayTest(jtu.JaxTestCase):
       f(key).block_until_ready()
       f(key).block_until_ready()
 
-    self.assertEqual(count[0], 1)
+    self.assertEqual(count(), 1)
 
   def test_cpp_dispatch_aot_split(self):
     # Ensure we stay on the C++ dispatch path when calling an
@@ -744,12 +840,12 @@ class KeyArrayTest(jtu.JaxTestCase):
       f(key).block_until_ready()
       f(key).block_until_ready()
 
-    self.assertEqual(count[0], 1)
+    self.assertEqual(count(), 1)
 
   # -- prng primitives
 
   def test_random_wrap_vmap(self):
-    f = partial(prng_internal.random_wrap, impl=prng_internal.threefry_prng_impl)
+    f = partial(prng_internal.random_wrap, impl=threefry2x32_internal.threefry_prng_impl)
     base_arr = jnp.arange(6, dtype=jnp.uint32).reshape(3, 2)
     keys = jax.vmap(f, in_axes=0)(base_arr)
     self.assertIsInstance(keys, prng_internal.PRNGKeyArray)
@@ -827,7 +923,7 @@ class KeyArrayTest(jtu.JaxTestCase):
   def test_scan_jaxpr(self):
     ks = self.make_keys(3, 4, 5)
     f = lambda ks: jax.lax.scan(lambda _, k: (None, k.T), None, ks)
-    jaxpr = jax.make_jaxpr(f)(ks).jaxpr
+    jaxpr = jax.make_jaxpr(f)(ks)
     # { lambda ; a:key<fry>[3,4,5]. let
     #     b:key<fry>[3,5,4] = scan[
     #       jaxpr={ lambda ; c:key<fry>[4,5]. let
@@ -905,6 +1001,20 @@ class KeyArrayTest(jtu.JaxTestCase):
     self.assertIsInstance(ys, prng_internal.PRNGKeyArray)
     self.assertEqual(ys.shape, (3, 2, 1))
 
+  @parameterized.parameters("threefry2x32", "rbg", "unsafe_rbg")
+  def test_gather_fill(self, impl):
+    # Regression test for https://github.com/jax-ml/jax/issues/33476
+    keys = self.make_keys(4, impl=impl)
+
+    # Expected fill value is a key wrapping an array containing uint32 max.
+    expected = random.wrap_key_data(
+      jnp.full_like(random.key_data(keys)[0], fill_value=np.iinfo('uint32').max),
+      impl=keys.dtype)
+
+    out = jax.jit(lambda x: x.at[100].get(mode='fill'))(keys)
+    self.assertIsInstance(out, prng_internal.PRNGKeyArray)
+    self.assertKeysEqual(out, expected)
+
   def test_select(self):
     ks = self.make_keys(3, 2)
     cs = jnp.array([True, False, False, True, False, True]).reshape(3, 2)
@@ -913,19 +1023,24 @@ class KeyArrayTest(jtu.JaxTestCase):
     self.assertEqual(ys.shape, (3, 2))
 
   def test_select_scalar_cond(self):
-    # regression test for https://github.com/google/jax/issues/16422
+    # regression test for https://github.com/jax-ml/jax/issues/16422
     ks = self.make_keys(3)
     ys = lax.select(True, ks, ks)
     self.assertIsInstance(ys, prng_internal.PRNGKeyArray)
     self.assertEqual(ys.shape, (3,))
 
   def test_vmap_of_cond(self):
-    # See https://github.com/google/jax/issues/15869
+    # See https://github.com/jax-ml/jax/issues/15869
     def f(x):
       keys = self.make_keys(*x.shape)
       return lax.select(x, keys, keys)
     x = jnp.array([True, False, False])
     f(x)  # doesn't crash
+
+  def test_device_get(self):
+    keys = self.make_keys(4)
+    keys_on_host = jax.device_get(keys)
+    self.assertKeysEqual(keys, keys_on_host)
 
   def test_device_put(self):
     device = jax.devices()[0]
@@ -936,19 +1051,19 @@ class KeyArrayTest(jtu.JaxTestCase):
   def test_device_put_sharded(self):
     devices = jax.devices()
     keys = self.make_keys(len(devices))
-    keys_on_device = jax.device_put_sharded(list(keys), devices)
+    keys_on_device = api.device_put_sharded(list(keys), devices)
     self.assertKeysEqual(keys, keys_on_device)
 
   def test_device_put_replicated(self):
     devices = jax.devices()
     key = self.make_keys()
-    keys_on_device = jax.device_put_replicated(key, devices)
+    keys_on_device = api.device_put_replicated(key, devices)
     self.assertKeysEqual(jnp.broadcast_to(key, keys_on_device.shape), keys_on_device)
 
   def test_make_array_from_callback(self):
     devices = jax.devices()
     shape = (len(devices),)
-    mesh = jtu.create_global_mesh((len(devices),), ('x',))
+    mesh = jtu.create_mesh((len(devices),), ('x',))
     sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('x'))
     def callback(index):
       i = jnp.arange(len(devices))[index[0]]
@@ -960,7 +1075,7 @@ class KeyArrayTest(jtu.JaxTestCase):
   def test_make_array_from_single_device_arrays(self):
     devices = jax.devices()
     shape = (len(devices),)
-    mesh = jtu.create_global_mesh((len(devices),), ('x',))
+    mesh = jtu.create_mesh((len(devices),), ('x',), iota_order=True)
     sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('x'))
     keys = random.split(random.key(0), len(devices))
     arrays = [jax.device_put(keys[i:i + 1], device) for i, device in enumerate(devices)]
@@ -1100,6 +1215,23 @@ class KeyArrayTest(jtu.JaxTestCase):
     self.assertKeysEqual(k1, k2)
     self.assertEqual(k1.dtype, k2.dtype)
 
+  @jtu.sample_product(prng_name=[name for name, _ in PRNG_IMPLS])
+  def test_key_make_like_other_key_via_dtype(self, prng_name):
+    k1 = jax.random.key(42, impl=prng_name)
+    dtype = k1.dtype
+    k2 = jax.random.key(42, dtype=dtype)
+    self.assertKeysEqual(k1, k2)
+    self.assertEqual(k1.dtype, k2.dtype)
+
+  @jtu.sample_product(prng_name=[name for name, _ in PRNG_IMPLS])
+  def test_key_wrap_like_other_key_via_dtype(self, prng_name):
+    k1 = jax.random.key(42, impl=prng_name)
+    data = jax.random.key_data(k1)
+    dtype = k1.dtype
+    k2 = jax.random.wrap_key_data(data, dtype=dtype)
+    self.assertKeysEqual(k1, k2)
+    self.assertEqual(k1.dtype, k2.dtype)
+
   def test_key_impl_from_string_error(self):
     with self.assertRaisesRegex(ValueError, 'unrecognized PRNG implementation'):
       jax.random.key(42, impl='unlikely name')
@@ -1110,8 +1242,14 @@ class KeyArrayTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(TypeError, 'unrecognized type .* PRNG'):
       jax.random.key(42, impl=A())
 
+  @jtu.sample_product(name=[name for name, _ in PRNG_IMPLS])
+  def test_key_impl_builtin_is_string_name(self, name):
+    key = jax.random.key(42, impl=name)
+    spec = jax.random.key_impl(key)
+    self.assertEqual(spec, name)
+
   def test_keyarray_custom_vjp(self):
-    # Regression test for https://github.com/google/jax/issues/18442
+    # Regression test for https://github.com/jax-ml/jax/issues/18442
     @jax.custom_vjp
     def f(_, state):
       return state
@@ -1140,13 +1278,19 @@ class KeyArrayTest(jtu.JaxTestCase):
     result = jax.grad(lambda theta: f(theta, state)[0])(3.0)
     self.assertEqual(result, 1.0)
 
+  def test_keyarray_array_conversion_fails(self):
+    key = jax.random.key(0)
+    msg = "JAX array with PRNGKey dtype cannot be converted to a NumPy array."
+    with self.assertRaisesRegex(TypeError, msg):
+      np.asarray(key)
+
   # TODO(frostig,mattjj): more polymorphic primitives tests
 
 
-threefry_seed = prng_internal.threefry_seed
-threefry_split = prng_internal.threefry_split
-threefry_random_bits = prng_internal.threefry_random_bits
-threefry_fold_in = prng_internal.threefry_fold_in
+threefry_seed = threefry2x32_internal.threefry_seed
+threefry_split = threefry2x32_internal.threefry_split
+threefry_random_bits = threefry2x32_internal.threefry_random_bits
+threefry_fold_in = threefry2x32_internal.threefry_fold_in
 
 def _double_threefry_seed(seed):
   int_t = seed.dtype.type if hasattr(seed, 'dtype') else type(seed)
@@ -1400,7 +1544,7 @@ class JnpWithKeyArrayTest(jtu.JaxTestCase):
 
   def test_eval_shape(self):
     key = random.key(1701)
-    shapedtype = jax.ShapeDtypeStruct(key.shape, key.dtype)
+    shapedtype = jax.ShapeDtypeStruct.like(key)
     out = jax.eval_shape(lambda x: x, shapedtype)
     self.assertEqual(out, shapedtype)
 
@@ -1419,7 +1563,8 @@ class JnpWithKeyArrayTest(jtu.JaxTestCase):
 
     key_func = arr_func = lambda x: func(x, *args)
     self.check_shape(key_func, keys)
-    self.check_against_reference(key_func, arr_func, keys)
+    if func != jnp.empty_like:
+      self.check_against_reference(key_func, arr_func, keys)
 
   def test_full_like_with_key_fillvalue(self):
     keys = random.split(random.key(789543))
@@ -1439,7 +1584,8 @@ class JnpWithKeyArrayTest(jtu.JaxTestCase):
 
     key_func = arr_func = lambda x: func(x.shape, dtype=x.dtype, **kwds)
     self.check_shape(key_func, keys)
-    self.check_against_reference(key_func, arr_func, keys)
+    if func != jnp.empty:
+      self.check_against_reference(key_func, arr_func, keys)
 
   def test_full_with_key_fillvalue(self):
     keys = random.split(random.key(789543))
@@ -1449,6 +1595,14 @@ class JnpWithKeyArrayTest(jtu.JaxTestCase):
     self.check_shape(func, keys, fill_value)
     self.check_against_reference(func, func, keys, fill_value)
 
+  def test_int_shape(self):
+    # It's not clear if we want to accept ints as the shape argument; the point
+    # of this test is not to check the API functionality but rather to ensure
+    # this doesn't fail in core.py like it used to.
+    @jax.jit
+    def f():
+      jax.random.normal(jax.random.key(0), 1000)
+    f()  # don't crash
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

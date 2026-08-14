@@ -5,7 +5,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.16.1
+    jupytext_version: 1.16.4
 kernelspec:
   display_name: Python 3
   name: python3
@@ -13,28 +13,27 @@ kernelspec:
 
 +++ {"id": "LqiaKasFjH82"}
 
+(advanced-autodiff-custom-derivative-rules)=
 # Custom derivative rules for JAX-transformable Python functions
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/google/jax/blob/main/docs/notebooks/Custom_derivative_rules_for_Python_code.ipynb) [![Open in Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/google/jax/blob/main/docs/notebooks/Custom_derivative_rules_for_Python_code.ipynb)
+<!--* freshness: { reviewed: '2025-12-10' } *-->
 
-*mattjj@ Mar 19 2020, last updated Oct 14 2020*
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jax-ml/jax/blob/main/docs/notebooks/Custom_derivative_rules_for_Python_code.ipynb) [![Open in Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/jax-ml/jax/blob/main/docs/notebooks/Custom_derivative_rules_for_Python_code.ipynb)
 
 There are two ways to define differentiation rules in JAX:
 
-1. using `jax.custom_jvp` and `jax.custom_vjp` to define custom differentiation rules for Python functions that are already JAX-transformable; and
+1. using [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) and [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) to define custom differentiation rules for Python functions that are already JAX-transformable; and
 2. defining new `core.Primitive` instances along with all their transformation rules, for example to call into functions from other systems like solvers, simulators, or general numerical computing systems.
 
-This notebook is about #1. To read instead about #2, see the [notebook on adding primitives](https://jax.readthedocs.io/en/latest/notebooks/How_JAX_primitives_work.html).
+This notebook is about #1. To read instead about #2, see the [notebook on adding primitives](https://docs.jax.dev/en/latest/notebooks/How_JAX_primitives_work.html).
 
-For an introduction to JAX's automatic differentiation API, see [The Autodiff Cookbook](https://jax.readthedocs.io/en/latest/notebooks/autodiff_cookbook.html). This notebook assumes some familiarity with [jax.jvp](https://jax.readthedocs.io/en/latest/jax.html#jax.jvp) and [jax.grad](https://jax.readthedocs.io/en/latest/jax.html#jax.grad), and the mathematical meaning of JVPs and VJPs.
+There are also new experimental APIs that unify these two approaches: hijax primitives, which carry a JAX-traceable Python implementation along with custom rules for differentiation (and other transformations). Check out {ref}`hijax-custom-derivatives`, which mirrors this notebook's content.
+
+For an introduction to JAX's automatic differentiation API, see [The Autodiff Cookbook](https://docs.jax.dev/en/latest/notebooks/autodiff_cookbook.html). This notebook assumes some familiarity with [jax.jvp](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html) and [jax.grad](https://docs.jax.dev/en/latest/_autosummary/jax.grad.html), and the mathematical meaning of JVPs and VJPs.
 
 +++ {"id": "9Fg3NFNY-2RY"}
 
-## TL;DR
-
-+++ {"id": "ZgMNRtXyWIW8"}
-
-### Custom JVPs with `jax.custom_jvp`
+### TL;DR: Custom JVPs with `jax.custom_jvp`
 
 ```{code-cell} ipython3
 :id: zXic8tr--1PK
@@ -94,7 +93,7 @@ print(grad(f)(2., 3.))
 
 +++ {"id": "N2DOGCREWXFj"}
 
-### Custom VJPs with `jax.custom_vjp`
+### TL;DR: Custom VJPs with `jax.custom_vjp`
 
 ```{code-cell} ipython3
 :id: 35ScHqhrBwPh
@@ -106,7 +105,7 @@ def f(x, y):
   return jnp.sin(x) * y
 
 def f_fwd(x, y):
-# Returns primal output and residuals to be used in backward pass by f_bwd.
+  # Returns primal output and residuals to be used in backward pass by f_bwd.
   return f(x, y), (jnp.cos(x), jnp.sin(x), y)
 
 def f_bwd(res, g):
@@ -131,7 +130,7 @@ To get an idea of what problems `jax.custom_jvp` and `jax.custom_vjp` are meant 
 
 +++ {"id": "AR02eyd1GQhC"}
 
-### Numerical stability
+### Example: Numerical stability
 
 One application of `jax.custom_jvp` is to improve the numerical stability of differentiation.
 
@@ -143,7 +142,6 @@ Say we want to write a function called `log1pexp`, which computes $x \mapsto \lo
 :id: 6lWbTvs40ET-
 :outputId: 8caff99e-add1-4c70-ace3-212c0c5c6f4e
 
-import jax.numpy as jnp
 
 def log1pexp(x):
   return jnp.log(1. + jnp.exp(x))
@@ -198,7 +196,7 @@ Stepping through how the jaxpr would be evaluated, we can see that the last line
 
 Instead of generating such large and small values, hoping for a cancellation that floats can't always provide, we'd rather just express the derivative function as a more numerically stable program. In particular, we can write a program that more closely evaluates the equal mathematical expression $1 - \frac{1}{1 + e^x}$, with no cancellation in sight.
 
-This problem is interesting because even though our definition of `log1pexp` could already be JAX-differentiated (and transformed with `jit`, `vmap`, ...), we're not happy with the result of applying standard autodiff rules to the primitives comprising `log1pexp` and composing the result. Instead, we'd like to specify how the whole function `log1pexp` should be differentiated, as a unit, and thus arrange those exponentials better.
+This problem is interesting because even though our definition of `log1pexp` could already be JAX-differentiated (and transformed with [`jit`](https://docs.jax.dev/en/latest/_autosummary/jax.jit.html), [`vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.vmap.html), ...), we're not happy with the result of applying standard autodiff rules to the primitives comprising `log1pexp` and composing the result. Instead, we'd like to specify how the whole function `log1pexp` should be differentiated, as a unit, and thus arrange those exponentials better.
 
 This is one application of custom derivative rules for Python functions that are already JAX transformable: specifying how a composite function should be differentiated, while still using its original Python definition for other transformations (like `jit`, `vmap`, ...).
 
@@ -240,7 +238,7 @@ print(vmap(jit(grad(log1pexp)))(jnp.arange(3.)))
 
 +++ {"id": "9sVUGbGkUOqO"}
 
-Here's a `defjvps` convenience wrapper to express the same thing:
+Here's a [`defjvps`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvps.html) convenience wrapper to express the same thing:
 
 ```{code-cell} ipython3
 :id: xfQTp8F7USEM
@@ -264,7 +262,7 @@ print(vmap(jit(grad(log1pexp)))(jnp.arange(3.)))
 
 +++ {"id": "V9tHAfrSF1N-"}
 
-### Enforcing a differentiation convention
+### Example: Enforcing a differentiation convention
 
 A related application is to enforce a differentiation convention, perhaps at a boundary.
 
@@ -342,11 +340,11 @@ print(grad(f)(0.))
 
 +++ {"id": "7J2A85wbSAmF"}
 
-### Gradient clipping
+### Example: Gradient clipping
 
 While in some cases we want to express a mathematical differentiation computation, in other cases we may even want to take a step away from mathematics to adjust the computation autodiff performs. One canonical example is reverse-mode gradient clipping.
 
-For gradient clipping, we can use `jnp.clip` together with a `jax.custom_vjp` reverse-mode-only rule:
+For gradient clipping, we can use [`jnp.clip`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.clip.html) together with a [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) reverse-mode-only rule:
 
 ```{code-cell} ipython3
 :id: 8jfjSanIW_tJ
@@ -395,7 +393,7 @@ plt.plot(vmap(grad(clip_sin))(t))
 
 +++ {"id": "CICQuI86WK4_"}
 
-### Python debugging
+### Example: Python debugging
 
 Another application that is motivated by development workflow rather than numerics is to set a `pdb` debugger trace in the backward pass of reverse-mode autodiff.
 
@@ -407,13 +405,13 @@ We'll defer an example until the next section.
 
 +++ {"id": "IC7tEcr1-Fc5"}
 
-### Implicit function differentiation of iterative implementations
+### Example: Implicit function differentiation of iterative implementations
 
 This example gets pretty deep in the mathematical weeds!
 
 +++ {"id": "szAt97t80hew"}
 
-Another application for `jax.custom_vjp` is reverse-mode differentiation of functions that are JAX-transformable (by `jit`, `vmap`, ...) but not efficiently JAX-differentiable for some reason, perhaps because they involve `lax.while_loop`. (It's not possible to produce an XLA HLO program that efficiently computes the reverse-mode derivative of an XLA HLO While loop because that would require a program with unbounded memory use, which isn't possible to express in XLA HLO, at least without side-effecting interactions through infeed/outfeed.)
+Another application for `jax.custom_vjp` is reverse-mode differentiation of functions that are JAX-transformable (by `jit`, `vmap`, ...) but not efficiently JAX-differentiable for some reason, perhaps because they involve [`lax.while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html). (It's not possible to produce an XLA HLO program that efficiently computes the reverse-mode derivative of an XLA HLO While loop because that would require a program with unbounded memory use, which isn't possible to express in XLA HLO, at least without side-effecting interactions through infeed/outfeed.)
 
 For example, consider this `fixed_point` routine which computes a fixed point by iteratively applying a function in a `while_loop`:
 
@@ -522,7 +520,7 @@ def fixed_point_rev(f, res, x_star_bar):
                              (a, x_star, x_star_bar),
                              x_star_bar))
   return a_bar, jnp.zeros_like(x_star)
-  
+
 def rev_iter(f, packed, u):
   a, x_star, x_star_bar = packed
   _, vjp_x = vjp(lambda x: f(a, x), x_star)
@@ -560,7 +558,7 @@ print(grad(grad(jnp.sqrt))(2.))
 
 +++ {"id": "HowvqayEuy-H"}
 
-A limitation to this approach is that the argument `f` can't close over any values involved in differentiation. That is, you might notice that we kept the parameter `a` explicit in the argument list of `fixed_point`. For this use case, consider using the low-level primitive `lax.custom_root`, which allows for deriviatives in closed-over variables with custom root-finding functions.
+A limitation to this approach is that the argument `f` can't close over any values involved in differentiation. That is, you might notice that we kept the parameter `a` explicit in the argument list of `fixed_point`. For this use case, consider using the low-level primitive `lax.custom_root`, which allows for derivatives in closed-over variables with custom root-finding functions.
 
 +++ {"id": "Dr0aNkBslfQf"}
 
@@ -570,7 +568,7 @@ A limitation to this approach is that the argument `f` can't close over any valu
 
 ### Use `jax.custom_jvp` to define forward-mode (and, indirectly, reverse-mode) rules
 
-Here's a canonical basic example of using `jax.custom_jvp`, where the comments use
+Here's a canonical basic example of using [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html), where the comments use
 [Haskell-like type signatures](https://wiki.haskell.org/Type_signature):
 
 ```{code-cell} ipython3
@@ -671,7 +669,7 @@ print(grad(f)(2., 3.))
 
 +++ {"id": "YPsPS3rdaGo2"}
 
-The `defjvps` convenience wrapper lets us define a JVP for each argument separately, and the results are computed separately then summed:
+The [`defjvps`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvps.html) convenience wrapper lets us define a JVP for each argument separately, and the results are computed separately then summed:
 
 ```{code-cell} ipython3
 :id: CsQIUhUkajua
@@ -846,7 +844,7 @@ print(grad(f)(-1.))
 
 ### Use `jax.custom_vjp` to define custom reverse-mode-only rules
 
-While `jax.custom_jvp` suffices for controlling both forward- and, via JAX's automatic transposition, reverse-mode differentiation behavior, in some cases we may want to directly control a VJP rule, for example in the latter two example problems presented above. We can do that with `jax.custom_vjp`:
+While `jax.custom_jvp` suffices for controlling both forward- and, via JAX's automatic transposition, reverse-mode differentiation behavior, in some cases we may want to directly control a VJP rule, for example in the latter two example problems presented above. We can do that with [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html):
 
 ```{code-cell} ipython3
 :id: zAZk1n3dUw76
@@ -963,7 +961,6 @@ print(grad(f)(3.))
 :id: s1Pn_qCIODcF
 :outputId: 423d34e0-35b8-4b57-e89d-f70f20e28ea9
 
-from jax import vjp
 
 y, f_vjp = vjp(f, 3.)
 print(y)
@@ -1013,7 +1010,7 @@ def debug_fwd(x):
   return x, x
 
 def debug_bwd(x, g):
-  import pdb; pdb.set_trace()
+  pdb.set_trace()
   return g
 
 debug.defvjp(debug_fwd, debug_bwd)
@@ -1050,7 +1047,7 @@ Array(-0.91113025, dtype=float32)
 
 ### Working with `list` / `tuple` / `dict` containers (and other pytrees)
 
-You should expect standard Python containers like lists, tuples, namedtuples, and dicts to just work, along with nested versions of those. In general, any [pytrees](https://jax.readthedocs.io/en/latest/pytrees.html) are permissible, so long as their structures are consistent according to the type constraints. 
+You should expect standard Python containers like lists, tuples, namedtuples, and dicts to just work, along with nested versions of those. In general, any [pytrees](https://docs.jax.dev/en/latest/pytrees.html) are permissible, so long as their structures are consistent according to the type constraints. 
 
 Here's a contrived example with `jax.custom_jvp`:
 
@@ -1143,7 +1140,7 @@ print(grad(fun)(pt))
 
 +++ {"id": "JKTNivxbmKWO"}
 
-### Handling  non-differentiable arguments
+### Handling non-differentiable arguments
 
 +++ {"id": "7g9sXSp_uc36"}
 

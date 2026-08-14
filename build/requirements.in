@@ -1,25 +1,47 @@
 #
-# test deps
-#
--r test-requirements.txt
-matplotlib
-
-#
-# build deps
-#
-numpy~=1.22.0; python_version<="3.10"
-numpy~=1.23.2; python_version=="3.11"
-numpy>=1.26.0; python_version>="3.12"
-numpy>=1.26.0; python_version=="3.13"
-
-#
 # runtime deps
 #
-scipy~=1.9.0; python_version<"3.12"
-scipy>=1.11.1; python_version>="3.12"
+numpy~=2.1.0; python_version<="3.13"
+numpy>=2.3.2; python_version>="3.14"
+scipy>=1.15.0; python_version<="3.12"
+scipy>=1.15.2; python_version>="3.13"
 
-importlib_metadata; python_version<"3.10"
-ml_dtypes>=0.4.0
-opt_einsum
-zstandard
+ml_dtypes>=0.5.3
 etils[epath]
+opt-einsum
+
+# zstandard is available in the Python 3.14 standard library as
+# compression.zstd, and we'll use that if available.
+zstandard; python_version<"3.14"
+
+tensorstore
+
+# For jax2tf_test
+# TODO(phawkins): re-enable on Python 3.14+ once TensorFlow supports Python 3.14+
+tensorflow; python_version<"3.14"
+
+# Needed to build wheels
+build
+setuptools
+wheel
+
+# JAX's own libraries. We include these in the requirements so you can
+# bazel test without building jaxlib and without manually updating the
+# the requirements files.
+jax
+# TODO(phawkins): update to include Python 3.15 once jaxlib 3.15 wheels are published
+jaxlib; python_version<="3.14"
+
+# TODO(phawkins): update to include Python 3.15 once CUDA plugin wheels are published for 3.15
+jax-cuda12-plugin; sys_platform == "linux" and python_version<="3.14"
+jax-cuda13-plugin; python_version<="3.14"
+jax-cuda12-pjrt; sys_platform == "linux" and python_version<="3.14"
+jax-cuda13-pjrt; python_version<="3.14"
+
+# TPU dependencies
+libtpu; sys_platform == "linux" and platform_machine == "x86_64"
+
+# Colorama is only needed on windows. Pip-compile ignores platform-specific
+# requirements therefore we include it unconditionally here so that the lockfile
+# regeneration always includes it.
+colorama>=0.4.4

@@ -16,22 +16,23 @@ from __future__ import annotations
 
 import functools
 import os
-import sys
 import traceback
 import types
-from typing import Any, Callable, TypeVar, cast
+from typing import cast
 
 from jax._src import config
 from jax._src import util
-from jax._src.lib import xla_extension
+from jax._src.lib import _jax
 
 
-C = TypeVar("C", bound=Callable[..., Any])
-
-_exclude_paths: list[str] = [__file__, util.__file__]
+_exclude_paths: list[str] = []
 
 def register_exclusion(path: str):
   _exclude_paths.append(path)
+  _jax.add_exclude_path(path)
+
+register_exclusion(__file__)
+register_exclusion(util.__file__)
 
 _jax_message_append = (
     'The stack trace below excludes JAX-internal frames.\n'
@@ -55,8 +56,10 @@ def _path_starts_with(path: str, path_prefix: str) -> bool:
     return False
 
 def include_frame(f: types.FrameType) -> bool:
-  return not any(_path_starts_with(f.f_code.co_filename, path)
-                 for path in _exclude_paths)
+  return include_filename(f.f_code.co_filename)
+
+def include_filename(filename: str) -> bool:
+  return not any(_path_starts_with(filename, path) for path in _exclude_paths)
 
 # When scanning stack traces, we might encounter frames from cpython that are
 # removed from printed stack traces, such as frames from parts of importlib. We
@@ -64,9 +67,11 @@ def include_frame(f: types.FrameType) -> bool:
 def _ignore_known_hidden_frame(f: types.FrameType) -> bool:
   return 'importlib._bootstrap' in f.f_code.co_filename
 
-def _add_tracebackhide_to_hidden_frames(tb: types.TracebackType):
+def _add_tracebackhide_to_hidden_frames(tb: types.TracebackType | None):
+  if tb is None:
+    return
   for f, _lineno in traceback.walk_tb(tb):
-    if not include_frame(f):
+    if not include_frame(f) and not _is_reraiser_frame(f):
       f.f_locals["__tracebackhide__"] = True
 
 def filter_traceback(tb: types.TracebackType) -> types.TracebackType | None:
@@ -102,9 +107,12 @@ def _add_call_stack_frames(tb: types.TracebackType) -> types.TracebackType:
       reached_module_level = True
   return out
 
-def _is_reraiser_frame(f: traceback.FrameSummary) -> bool:
-  return (f.filename == __file__ and
-          f.name == 'reraise_with_filtered_traceback')
+def _is_reraiser_frame(f: traceback.FrameSummary | types.FrameType) -> bool:
+  if isinstance(f, traceback.FrameSummary):
+    filename, name = f.filename, f.name
+  else:
+    filename, name = f.f_code.co_filename, f.f_code.co_name
+  return filename == __file__ and name == 'reraise_with_filtered_traceback'
 
 def _is_under_reraiser(e: BaseException) -> bool:
   if e.__traceback__ is None:
@@ -130,14 +138,14 @@ SimplifiedTraceback.__module__ = "jax.errors"
 def _running_under_ipython() -> bool:
   """Returns true if we appear to be in an IPython session."""
   try:
-    get_ipython()  # type: ignore
+    get_ipython()  # pyrefly: ignore[unknown-name]
     return True
   except NameError:
     return False
 
 def _ipython_supports_tracebackhide() -> bool:
   """Returns true if the IPython version supports __tracebackhide__."""
-  import IPython  # type: ignore
+  import IPython  # pyrefly: ignore[missing-import]
   return IPython.version_info[:2] >= (7, 17)
 
 def _filtering_mode() -> str:
@@ -149,7 +157,12 @@ def _filtering_mode() -> str:
       mode = "quiet_remove_frames"
   return mode
 
-def api_boundary(fun: C) -> C:
+
+# TODO(slebedev): use [C: Callable[..., Any]] once facebook/pyrefly#3329 is fixed.
+def api_boundary[C](
+    fun: C, *,
+    repro_api_name: str | None = None,
+    repro_user_func: bool = False) -> C:
   '''Wraps ``fun`` to form a boundary for filtering exception tracebacks.
 
   When an exception occurs below ``fun``, this appends to it a custom
@@ -170,13 +183,15 @@ def api_boundary(fun: C) -> C:
   ``g``. Because the function returned by :func:`~jax.jit` is annotated as an
   :func:`~api_boundary`, such an exception is accompanied by an additional
   traceback that excludes the frames specific to JAX's implementation.
+
+  For the "repro" kwargs, see the comments for `repro.boundary`.
   '''
 
-  @functools.wraps(fun)
+  @functools.wraps(fun)  # pyrefly: ignore[bad-argument-type]
   def reraise_with_filtered_traceback(*args, **kwargs):
     __tracebackhide__ = True
     try:
-      return fun(*args, **kwargs)
+      return fun(*args, **kwargs)  # pyrefly: ignore[not-callable]
     except Exception as e:
       mode = _filtering_mode()
       if _is_under_reraiser(e) or mode == "off":
@@ -185,30 +200,15 @@ def api_boundary(fun: C) -> C:
         _add_tracebackhide_to_hidden_frames(e.__traceback__)
         raise
 
-      filtered_tb, unfiltered = None, None
+      tb = e.__traceback__
+      if tb is None:
+        raise TypeError("Traceback is None") from e
       try:
-        tb = e.__traceback__
-        filtered_tb = filter_traceback(tb)
-        e.with_traceback(filtered_tb)
-        # In Python < 3.11, there seems to be no way to alter the currently
-        # raised exception traceback, except via the C API. The interpreter
-        # keeps a copy of the traceback (exc_traceback) that is separate to the
-        # __traceback__ of exc_value. Python 3.11 removes exc_traceback and
-        # just setting __traceback__ is enough. Since it is no longer needed,
-        # the XLA extension no longer defines a traceback-replacing method at
-        # Python 3.11 and onward.
-        if hasattr(xla_extension, "replace_thread_exc_traceback"):
-          # TODO(kidger): remove this line once Python 3.11 is the minimum supported
-          # version.
-          xla_extension.replace_thread_exc_traceback(filtered_tb)
-        if sys.version_info >= (3, 11) and mode == "quiet_remove_frames":
+        e.with_traceback(filter_traceback(tb))
+        if mode == "quiet_remove_frames":
           e.add_note("--------------------\n" + _simplified_tb_msg)
         else:
-          if mode == "quiet_remove_frames":
-            # TODO(kidger): remove `SimplifiedTraceback` once Python 3.11 is the minimum
-            # supported version.
-            jax_error = SimplifiedTraceback()
-          elif mode == "remove_frames":
+          if mode == "remove_frames":
             msg = format_exception_only(e)
             msg = f'{msg}\n\n{_jax_message_append}'
             jax_error = UnfilteredStackTrace(msg)
@@ -220,9 +220,20 @@ def api_boundary(fun: C) -> C:
           jax_error.__suppress_context__ = e.__suppress_context__
           e.__cause__ = jax_error
           e.__context__ = None
+          del jax_error
         raise
       finally:
-        del filtered_tb
-        del unfiltered
-        del mode
+        del mode, tb
+  if repro and (repro_api_name or repro_user_func):
+    reraise_with_filtered_traceback = repro.boundary(
+        reraise_with_filtered_traceback, api_name=repro_api_name,
+        is_user=repro_user_func)
   return cast(C, reraise_with_filtered_traceback)
+
+try:
+  # TODO: import from the final location
+  from jax._src import repro  # pyrefly: ignore[missing-module-attribute]
+  repro_is_enabled = repro.is_enabled
+except (ImportError, AttributeError):
+  repro = None
+  repro_is_enabled = lambda: False

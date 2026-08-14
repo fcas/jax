@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from jax.scipy.special import expit, logit
 
-from jax import lax
-import jax.numpy as jnp
+from jax._src import lax
+from jax._src import numpy as jnp
 from jax._src.lax.lax import _const as _lax_const
 from jax._src.numpy.util import promote_args_inexact
+from jax._src.scipy.special import expit, logit
 from jax._src.typing import Array, ArrayLike
 
 
@@ -34,7 +34,6 @@ def logpdf(x: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
 
   Args:
     x: arraylike, value at which to evaluate the PDF
-    a: arraylike, distribution shape parameter
     loc: arraylike, distribution offset parameter
     scale: arraylike, distribution scale parameter
 

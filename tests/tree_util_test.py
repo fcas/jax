@@ -13,25 +13,36 @@
 # limitations under the License.
 
 import collections
+from collections.abc import Hashable
 import dataclasses
 import functools
 import pickle
 import re
-from typing import TypeVar
+import unittest
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax import flatten_util
 from jax import tree_util
+from jax._src import flattree as ft
 from jax._src import test_util as jtu
-from jax._src.tree_util import flatten_one_level, prefix_errors
+from jax._src.tree_util import (
+    prefix_errors, broadcast_flattened_prefix_with_treedef,
+    default_registry, dispatch_registry)
 import jax.numpy as jnp
+
+jaxlib_version = jtu.jaxlib_version()
+
+# Easier to read.
+SequenceKey = tree_util.SequenceKey
+DictKey = tree_util.DictKey
+GetAttrKey = tree_util.GetAttrKey
+FlattenedIndexKey = tree_util.FlattenedIndexKey
 
 
 def _dummy_func(*args, **kwargs):
   return
-
 
 ATuple = collections.namedtuple("ATuple", ("foo", "bar"))
 
@@ -73,6 +84,19 @@ class AnObject:
 
 tree_util.register_pytree_node(AnObject, lambda o: ((o.x, o.y), o.z),
                                lambda z, xy: AnObject(xy[0], xy[1], z))
+
+class ArrayMetadataBox:
+  # A pytree whose metadata (aux_data) is an array, hence unhashable and not
+  # comparable with plain `==` semantics. Used to test that pytree equality
+  # errors name the offending registered type. See issue #13027.
+
+  def __init__(self, x):
+    self.x = x
+
+tree_util.register_pytree_node(
+    ArrayMetadataBox,
+    lambda obj: ((), (obj.x,)),
+    lambda aux_data, children: ArrayMetadataBox(aux_data[0]))
 
 class AnObject2(AnObject): pass
 
@@ -142,27 +166,6 @@ class FlatCache:
       data, meta = tree_util.tree_flatten(tree_util.tree_unflatten(meta, data))
     return FlatCache(None, leaves=data, treedef=meta)
 
-_T = TypeVar("_T")
-
-
-# Inspired by Flax.
-def pytree_node_dataclass(clz: _T, **kwargs) -> _T:
-  data_clz = dataclasses.dataclass(**kwargs)(clz)  # type: ignore
-  meta_fields = []
-  data_fields = []
-  for field_info in dataclasses.fields(data_clz):
-    is_pytree_node = field_info.metadata.get("pytree_node", True)
-    if is_pytree_node:
-      data_fields.append(field_info.name)
-    else:
-      meta_fields.append(field_info.name)
-
-  jax.tree_util.register_dataclass(
-      data_clz, data_fields, meta_fields
-  )
-
-  return data_clz
-
 
 @tree_util.register_static
 class StaticInt(int):
@@ -231,16 +234,18 @@ TREE_STRINGS = (
     "PyTreeDef(CustomNode(StaticDict[{'foo': 4, 'bar': 5}], []))",
 )
 
-@pytree_node_dataclass
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass
 class ADataclass:
   x: tuple[int, int]
   y: int
 
-@pytree_node_dataclass
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass
 class ADataclassWithMeta:
   x: tuple[int, int]
   y: int
-  z: int = dataclasses.field(metadata={"pytree_node": False})
+  z: int = dataclasses.field(metadata={"static": True})
 
 TREES += (
     (ADataclass(x=(1, 2), y=3),),
@@ -314,6 +319,24 @@ class TreeTest(jtu.JaxTestCase):
     actual = tree_util.tree_unflatten(tree, xs)
     self.assertEqual(actual, inputs)
 
+  def testIsTreeNode(self):
+    self.assertTrue(tree_util.is_tree_node(list))
+    self.assertTrue(tree_util.is_tree_node(dict))
+    self.assertTrue(tree_util.is_tree_node(tuple))
+    self.assertTrue(tree_util.is_tree_node(type(None)))
+
+    # Custom registered type
+    self.assertTrue(tree_util.is_tree_node(AnObject))
+
+    # Namedtuple
+    self.assertTrue(tree_util.is_tree_node(ATuple))
+    self.assertTrue(tree_util.is_tree_node(ANamedTupleSubclass))
+
+    # Non-node types
+    self.assertFalse(tree_util.is_tree_node(int))
+    self.assertFalse(tree_util.is_tree_node(str))
+    self.assertFalse(tree_util.is_tree_node(float))
+
   @parameterized.parameters(*(TREES + LEAVES))
   def testRoundtripWithFlattenUpTo(self, inputs):
     _, tree = tree_util.tree_flatten(inputs)
@@ -343,7 +366,7 @@ class TreeTest(jtu.JaxTestCase):
     self.assertEqual(h.args, (3,))
 
   def testPartialFuncAttributeHasStableHash(self):
-    # https://github.com/google/jax/issues/9429
+    # https://github.com/jax-ml/jax/issues/9429
     fun = functools.partial(print, 1)
     p1 = tree_util.Partial(fun, 2)
     p2 = tree_util.Partial(fun, 2)
@@ -359,7 +382,7 @@ class TreeTest(jtu.JaxTestCase):
     self.assertEqual([c0, c1], tree.children())
 
   def testTreedefTupleFromChildren(self):
-    # https://github.com/google/jax/issues/7377
+    # https://github.com/jax-ml/jax/issues/7377
     tree = ((1, 2, (3, 4)), (5,))
     leaves, treedef1 = tree_util.tree_flatten(tree)
     treedef2 = tree_util.treedef_tuple(treedef1.children())
@@ -368,7 +391,7 @@ class TreeTest(jtu.JaxTestCase):
     self.assertEqual(treedef1.num_nodes, treedef2.num_nodes)
 
   def testTreedefTupleComparesEqual(self):
-    # https://github.com/google/jax/issues/9066
+    # https://github.com/jax-ml/jax/issues/9066
     self.assertEqual(tree_util.tree_structure((3,)),
                      tree_util.treedef_tuple((tree_util.tree_structure(3),)))
 
@@ -395,6 +418,7 @@ class TreeTest(jtu.JaxTestCase):
       ({"a": 1, "b": (2, 3)}, {"a": [7], "b": ([8], (9,))}, [[7], [8], (9,)]),
       ({"a": 1}, {"a": (7,)}, [(7,)]),
       ({"a": 1}, {"a": {"a": 7}}, [{"a": 7}]),
+      (None, None, [])
   )
   def testFlattenUpTo(self, tree, xs, expected):
     _, tree_def = tree_util.tree_flatten(tree)
@@ -407,14 +431,12 @@ class TreeTest(jtu.JaxTestCase):
       (
           {"a": 1},
           {"a": 7, "b": 8},
-          re.escape(
-              "Dict key mismatch; expected keys: ['a']; dict: {'a': 7, 'b': 8}."
-          ),
+          re.escape("Dict key mismatch; expected keys: ['a'];"),
       ),
       (
           {"a": 1},
           {"b": 7},
-          re.escape("Dict key mismatch; expected keys: ['a']; dict: {'b': 7}."),
+          re.escape("Dict key mismatch; expected keys: ['a'];"),
       ),
       ([1], {"a": 7}, re.escape("Expected list, got {'a': 7}.")),
       ([1], (7,), re.escape("Expected list, got (7,).")),
@@ -434,7 +456,7 @@ class TreeTest(jtu.JaxTestCase):
       (
           [{"a": 1}],
           [{"b": 7}],
-          re.escape("Dict key mismatch; expected keys: ['a']; dict: {'b': 7}."),
+          re.escape("Dict key mismatch; expected keys: ['a'];"),
       ),
       (([1],), (7,), re.escape("Expected list, got 7.")),
       (([1],), ((7,),), re.escape("Expected list, got (7,).")),
@@ -448,7 +470,7 @@ class TreeTest(jtu.JaxTestCase):
       (
           ({"a": 1},),
           ({"b": 7},),
-          re.escape("Dict key mismatch; expected keys: ['a']; dict: {'b': 7}."),
+          re.escape("Dict key mismatch; expected keys: ['a'];"),
       ),
       ({"a": [1]}, {"a": 7}, re.escape("Expected list, got 7.")),
       ({"a": [1]}, {"a": (7,)}, re.escape("Expected list, got (7,).")),
@@ -466,7 +488,7 @@ class TreeTest(jtu.JaxTestCase):
       (
           {"a": {"a": 1}},
           {"a": {"b": 7}},
-          re.escape("Dict key mismatch; expected keys: ['a']; dict: {'b': 7}."),
+          re.escape("Dict key mismatch; expected keys: ['a'];"),
       ),
       (
           [ATuple(foo=1, bar=2)],
@@ -483,6 +505,7 @@ class TreeTest(jtu.JaxTestCase):
           [([1], (2,), {"a": [1]})],
           re.escape("Custom node type mismatch"),
       ),
+      ((None, [2], re.escape("Expected None, got [2]."))),
   )
   def testFlattenUpToErrors(self, tree, xs, error):
     _, tree_def = tree_util.tree_flatten(tree)
@@ -507,6 +530,13 @@ class TreeTest(jtu.JaxTestCase):
   def testTreeReduceWithIsLeafArgument(self):
     out = tree_util.tree_reduce(lambda x, y: x + y, [(1, 2), [(3, 4), (5, 6)]],
                                 is_leaf=lambda l: isinstance(l, tuple))
+    self.assertEqual(out, (1, 2, 3, 4, 5, 6))
+
+  def testTreeReduceAssociativeWithIsLeafArgument(self):
+    out = tree_util.tree_reduce_associative(
+        lambda x, y: x + y, [(1, 2), [(3, 4), (5, 6)]],
+        is_leaf=lambda l: isinstance(l, tuple),
+    )
     self.assertEqual(out, (1, 2, 3, 4, 5, 6))
 
   @parameterized.parameters(
@@ -561,6 +591,18 @@ class TreeTest(jtu.JaxTestCase):
   @parameterized.parameters(*LEAVES)
   def testAllLeavesWithLeaves(self, leaf):
     self.assertTrue(tree_util.all_leaves([leaf]))
+
+  @parameterized.parameters(*TREES)
+  def testAllLeavesWithTreesAndCustomIsLeaf(self, tree):
+    def is_leaf(t):
+      return tree_util.all_leaves([t])
+    self.assertFalse(tree_util.all_leaves([tree], is_leaf=is_leaf))
+
+  @parameterized.parameters(*LEAVES)
+  def testAllLeavesWithLeavesAndCustomIsLeaf(self, leaf):
+    def is_leaf(t):
+      return tree_util.all_leaves([t])
+    self.assertTrue(tree_util.all_leaves([leaf], is_leaf=is_leaf))
 
   @parameterized.parameters(*TREES)
   def testCompose(self, tree):
@@ -625,11 +667,57 @@ class TreeTest(jtu.JaxTestCase):
                                       FlatCache({"a": [3, 4], "b": [5, 6]}))
     self.assertEqual(expected, actual)
 
+  @parameterized.parameters(*TREES)
+  def testBroadcast(self, tree):
+    if isinstance(tree, FlatCache):
+      # The tree_map construction below fails for FlatCache, because
+      # the cached metadata becomes out of sync.
+      self.skipTest("Test does not work properly for FlatCache.")
+    def make_inner(x):
+      return [x, x, x]
+    nested = tree_util.tree_map(make_inner, tree)
+    actual = tree_util.tree_broadcast(tree, nested)
+    self.assertEqual(actual, nested)
+
+    actual_flat = broadcast_flattened_prefix_with_treedef(
+        *tree_util.tree_flatten(tree), tree_util.tree_structure(nested))
+    actual = tree_util.tree_structure(nested).unflatten(actual_flat)
+    self.assertEqual(actual, nested)
+
+  def testBroadcastSimple(self):
+    prefix = (1, 2, 3)
+    full = (0, {'a': 0, 'b': 0}, (0, 0))
+    actual = tree_util.tree_broadcast(prefix, full)
+    expected = (1, {'a': 2, 'b': 2}, (3, 3))
+    self.assertEqual(actual, expected)
+
+  def testBroadcastError(self):
+    prefix = (1, 2, 3)
+    full = (0, {'a': 0, 'b': 0})
+    with self.assertRaisesRegex(ValueError, "pytree structure error"):
+      tree_util.tree_broadcast(prefix, full)
+    with self.assertRaises(Exception):
+      broadcast_flattened_prefix_with_treedef(
+          *tree_util.tree_flatten(prefix), tree_util.tree_structure(full))
+    prefix = (1, 2)
+    full = (0, {'a': 0, 'b': 0}, (0, 0))
+    with self.assertRaisesRegex(ValueError, "pytree structure error"):
+      tree_util.tree_broadcast(prefix, full)
+    with self.assertRaises(Exception):
+      broadcast_flattened_prefix_with_treedef(
+          *tree_util.tree_flatten(prefix), tree_util.tree_structure(full))
+    prefix = (1, {'a': 0})
+    full = (0, {'a': 0, 'b': 0})
+    with self.assertRaisesRegex(ValueError, "pytree structure error"):
+      tree_util.tree_broadcast(prefix, full)
+    with self.assertRaises(Exception):
+      broadcast_flattened_prefix_with_treedef(
+          *tree_util.tree_flatten(prefix), tree_util.tree_structure(full))
+
   @parameterized.parameters([(*t, s) for t, s in zip(TREES, TREE_STRINGS)])
   def testStringRepresentation(self, tree, correct_string):
     """Checks that the string representation of a tree works."""
     treedef = tree_util.tree_structure(tree)
-    print(TREES)
     self.assertRegex(str(treedef), correct_string)
 
   def testTreeDefWithEmptyDictStringRepresentation(self):
@@ -738,12 +826,25 @@ class TreeTest(jtu.JaxTestCase):
         ],
     )
 
+    strs = [f"{tree_util.keystr(kp, simple=True, separator='/')}: {x}"
+            for kp, x in flattened]
+    self.assertEqual(
+        strs,
+        [
+            "0/foo: 12",
+            "0/bar/cin/0: 1",
+            "0/bar/cin/1: 4",
+            "0/bar/cin/2: 10",
+            "1: [0 1 2 3 4]",
+        ],
+    )
+
   def testTreeMapWithPathWithIsLeafArgument(self):
     x = ((1, 2), [3, 4, 5])
     y = (([3], jnp.array(0)), ([0], 7, [5, 6]))
     out = tree_util.tree_map_with_path(
         lambda kp, *xs: (kp[0].idx, *xs), x, y,
-        is_leaf=lambda n: isinstance(n, list))
+        is_leaf=lambda _, n: isinstance(n, list), is_leaf_takes_path=True)
     self.assertEqual(out, (((0, 1, [3]),
                             (0, 2, jnp.array(0))),
                            (1, [3, 4, 5], ([0], 7, [5, 6]))))
@@ -751,7 +852,7 @@ class TreeTest(jtu.JaxTestCase):
   def testFlattenWithPathWithIsLeafArgument(self):
     def is_empty(x):
       try:
-        children, _ = flatten_one_level(x)
+        children, _ = tree_util.flatten_one_level(x)
       except ValueError:
         return True  # Cannot flatten x; means it must be a leaf
       return len(children) == 0
@@ -760,7 +861,11 @@ class TreeTest(jtu.JaxTestCase):
     tree1 = {'a': 1,
              'sub': [jnp.array((1, 2)), ATuple(foo=(), bar=[None])],
              'obj': AnObject2(x=EmptyTuple(), y=0, z='constantdef')}
-    flattened, _ = tree_util.tree_flatten_with_path(tree1, is_empty)
+
+    is_empty_new = lambda kp, x: is_empty(x)
+    flattened, _ = tree_util.tree_flatten_with_path(
+        tree1, is_empty_new, is_leaf_takes_path=True
+    )
     strs = [f"{tree_util.keystr(kp)}: {x}" for kp, x in flattened]
     self.assertEqual(
         strs,
@@ -774,21 +879,148 @@ class TreeTest(jtu.JaxTestCase):
         ],
     )
 
+  def testTreeFlattenWithPathWithIsLeafWithPathArgument(self):
+    x = ((1, 2), [3, {4: 4, 5: 5}])
+    check_max_depth = lambda kp, _: len(kp) >= 2
+    flattened, _ = tree_util.tree_flatten_with_path(
+        x, is_leaf=check_max_depth, is_leaf_takes_path=True
+    )
+    self.assertEqual(
+        flattened,
+        [
+            ((SequenceKey(0), SequenceKey(0),), 1),
+            ((SequenceKey(0), SequenceKey(1),), 2),
+            ((SequenceKey(1), SequenceKey(0),), 3),
+            ((SequenceKey(1), SequenceKey(1)), {4: 4, 5: 5}),
+        ],
+    )
+
+  def testTreeMapWithPathWithIsLeafWithPathArgument(self):
+    x = ((1, 2), [3, 4, 5])
+    y = (([3], jnp.array(0)), ([0], 7, [5, 6]))
+    out = tree_util.tree_map_with_path(
+        lambda kp, *xs: (kp[0].idx, *xs), x, y,
+        is_leaf=lambda kp, n: isinstance(n, list), is_leaf_takes_path=True)
+    self.assertEqual(out, (((0, 1, [3]),
+                            (0, 2, jnp.array(0))),
+                           (1, [3, 4, 5], ([0], 7, [5, 6]))))
+
+  def testTreeFlattenWithPathBuiltin(self):
+    x = (1, {"a": 2, "b": 3})
+    flattened = tree_util.tree_flatten_with_path(x)
+    _, tdef = tree_util.tree_flatten(x)
+    self.assertEqual(
+        flattened[0],
+        [
+            ((SequenceKey(0),), 1),
+            ((SequenceKey(1), DictKey("a")), 2),
+            ((SequenceKey(1), DictKey("b")), 3),
+        ],
+    )
+    self.assertEqual(flattened[1], tdef)
+
+  def testTreeFlattenWithPathCustom(self):
+    x = [
+        AnObject2(
+            x=12,
+            y={"foo": SpecialWithKeys(x=2, y=3), "bar": None},
+            z="constantdef",
+        ),
+        5,
+    ]
+    flattened, _ = tree_util.tree_flatten_with_path(x)
+    self.assertEqual(
+        flattened,
+        [
+            ((SequenceKey(0), "x"), 12),
+            ((SequenceKey(0), "y", DictKey("foo"), GetAttrKey("x")), 2),
+            ((SequenceKey(0), "y", DictKey("foo"), GetAttrKey("y")), 3),
+            ((SequenceKey(1),), 5),
+        ],
+    )
+
+  def testFlattenWithPathDefaultDict(self):
+    d = collections.defaultdict(int, {"b": 2, "a": 1, "c": {"b": 2, "a": 1}})
+    leaves, treedef = tree_util.tree_flatten_with_path(d)
+    self.assertEqual(
+        leaves,
+        [
+            ((DictKey("a"),), 1),
+            ((DictKey("b"),), 2),
+            ((DictKey("c"), DictKey("a")), 1),
+            ((DictKey("c"), DictKey("b")), 2),
+        ],
+    )
+    restored_d = tree_util.tree_unflatten(treedef, [l for _, l in leaves])
+    self.assertEqual(list(restored_d.keys()), ["a", "b", "c"])
+    _, from_flatten = tree_util.tree_flatten(d)
+    self.assertEqual(treedef, from_flatten)
+
+  def testFlattenWithPathOrderedDict(self):
+    d = collections.OrderedDict({"b": 2, "a": 1, "c": {"b": 2, "a": 1}})
+    leaves, treedef = tree_util.tree_flatten_with_path(d)
+    self.assertEqual(
+        leaves,
+        [
+            ((DictKey("b"),), 2),
+            ((DictKey("a"),), 1),
+            ((DictKey("c"), DictKey("a")), 1),
+            ((DictKey("c"), DictKey("b")), 2),
+        ],
+    )
+    restored_d = tree_util.tree_unflatten(treedef, [l for _, l in leaves])
+    self.assertEqual(list(restored_d.keys()), ["b", "a", "c"])
+    _, from_flatten = tree_util.tree_flatten(d)
+    self.assertEqual(treedef, from_flatten)
+
   def testFlattenOneLevel(self):
     EmptyTuple = collections.namedtuple("EmptyTuple", ())
     tree1 = {'a': 1,
              'sub': [jnp.array((1, 2)), ATuple(foo=(), bar=[None])],
              'obj': AnObject2(x=EmptyTuple(), y=0, z='constantdef')}
-    self.assertEqual(flatten_one_level(tree1["sub"])[0],
+    self.assertEqual(tree_util.flatten_one_level(tree1["sub"])[0],
                      tree1["sub"])
-    self.assertEqual(flatten_one_level(tree1["sub"][1])[0],
+    self.assertEqual(tree_util.flatten_one_level(tree1["sub"][1])[0],
                      [(), [None]])
-    self.assertEqual(flatten_one_level(tree1["obj"])[0],
+    self.assertEqual(tree_util.flatten_one_level(tree1["obj"])[0],
                      [EmptyTuple(), 0])
     with self.assertRaisesRegex(ValueError, "can't tree-flatten type"):
-      flatten_one_level(1)
+      tree_util.flatten_one_level(1)
     with self.assertRaisesRegex(ValueError, "can't tree-flatten type"):
-      flatten_one_level(jnp.array((1, 2)))
+      tree_util.flatten_one_level(jnp.array((1, 2)))
+
+  def testFlattenOneLevelWithKeys(self):
+    EmptyTuple = collections.namedtuple("EmptyTuple", ())
+    tree1 = {'a': 1,
+             'sub': [jnp.array((1, 2)), ATuple(foo=(), bar=[None])],
+             'obj': AnObject2(x=EmptyTuple(), y=0, z='constantdef')}
+
+    # Dict
+    children, meta = tree_util.flatten_one_level_with_keys(tree1)
+    self.assertEqual(list(children), [(DictKey('a'), 1),
+                                       (DictKey('obj'), tree1['obj']),
+                                       (DictKey('sub'), tree1['sub'])])
+    self.assertEqual(meta, ('a', 'obj', 'sub'))
+
+    # List
+    children, meta = tree_util.flatten_one_level_with_keys(tree1["sub"])
+    self.assertEqual(list(children), [(SequenceKey(0), tree1["sub"][0]),
+                                       (SequenceKey(1), tree1["sub"][1])])
+    self.assertIsNone(meta)
+
+    if jaxlib_version >= (0, 11, 1):
+      children, meta = tree_util.flatten_one_level_with_keys(tree1["sub"][1])
+      self.assertEqual(list(children), [(GetAttrKey("foo"), ()),
+                                        (GetAttrKey("bar"), [None])])
+      self.assertEqual(meta, ATuple)
+
+    # Custom object with keys
+    children, meta = tree_util.flatten_one_level_with_keys(tree1["obj"])
+    self.assertEqual(list(children), [("x", EmptyTuple()), ("y", 0)])
+    self.assertEqual(meta, 'constantdef')
+
+    with self.assertRaisesRegex(ValueError, "can't tree-flatten type"):
+      tree_util.flatten_one_level_with_keys(1)
 
   def testOptionalFlatten(self):
     @tree_util.register_pytree_with_keys_class
@@ -854,6 +1086,129 @@ class TreeTest(jtu.JaxTestCase):
       tree_util.tree_flatten(t)
 
 
+class TreeKeyTest(absltest.TestCase):
+
+  def testBasic(self):
+    def assert_equal_and_hash_equal(a, b):
+      self.assertEqual(a, b)
+      self.assertEqual(hash(a), hash(b))
+
+    key = SequenceKey(idx=1)
+    self.assertEqual(str(key), "[1]")
+    self.assertEqual(key.idx, 1)
+    assert_equal_and_hash_equal(key, SequenceKey(1))
+
+    class DictKeyEntry(Hashable):
+
+      def __init__(self, s: str):
+        self.s = s
+
+      def __hash__(self):
+        return hash(self.s)
+
+      def __eq__(self, other):
+        return self.s == other.s
+
+    key = DictKey(key="foo")
+    self.assertEqual(str(key), "['foo']")
+    self.assertEqual(key.key, "foo")
+    assert_equal_and_hash_equal(key, DictKey("foo"))
+    assert_equal_and_hash_equal(
+        DictKey(DictKeyEntry("foo")), DictKey(DictKeyEntry("foo"))
+    )
+
+    key = GetAttrKey(name="bar")
+    self.assertEqual(str(key), ".bar")
+    self.assertEqual(key.name, "bar")
+    assert_equal_and_hash_equal(key, GetAttrKey("bar"))
+
+    key = FlattenedIndexKey(1)
+    self.assertEqual(str(key), "[<flat index 1>]")
+    self.assertEqual(key.key, 1)
+    assert_equal_and_hash_equal(key, FlattenedIndexKey(1))
+    self.assertNotEqual(hash(key), hash(SequenceKey(1)))
+
+  def testPatternMatching(self):
+    keys = [
+        SequenceKey(1),
+        DictKey("foo"),
+        GetAttrKey("bar"),
+        FlattenedIndexKey(1),
+    ]
+    for key in keys:
+      match key:
+        case jax.tree_util.SequenceKey(idx=idx):
+          self.assertEqual(idx, 1)
+        case jax.tree_util.DictKey(key=key):
+          self.assertEqual(key, "foo")
+        case jax.tree_util.GetAttrKey(name=name):
+          self.assertEqual(name, "bar")
+        case jax.tree_util.FlattenedIndexKey(key=idx_key):
+          self.assertEqual(idx_key, 1)
+        case _:
+          raise ValueError(f"key not matched: {key}")
+    match [
+        DictKey("foo"),
+    ]:
+      case [DictKey("foo"), *_]:
+        pass
+      case _:
+        raise ValueError(f"keys are not matched: {keys}")
+
+  def testPickle(self):
+    keys = [
+        SequenceKey(1),
+        DictKey("foo"),
+        GetAttrKey("bar"),
+        FlattenedIndexKey(1),
+    ]
+    for key in keys:
+      unpickled = pickle.loads(pickle.dumps(key))
+      self.assertEqual(key, unpickled)
+
+  def testEqualityErrorWithArrayAsStaticArg(self):
+    # Regression test for https://github.com/jax-ml/jax/issues/28659
+    @tree_util.register_dataclass
+    @dataclasses.dataclass
+    class Tree:
+      x : jnp.ndarray = dataclasses.field(metadata={'static': True})
+
+    f = jax.jit(lambda x: x)
+
+    msg = "Exception raised while checking equality of metadata fields of pytree."
+
+    # First call succeeds, because there is no equality check.
+    f(Tree(jnp.arange(4)))
+
+    # Second fall fails, because arrays are marked static and compared for equality.
+    with self.assertRaisesRegex(ValueError, msg):
+      f(Tree(jnp.arange(4)))
+
+  @unittest.skipIf(jaxlib_version < (0, 11, 1),
+                    "Test requires jaxlib v0.11.1 or newer.")
+  def testEqualityErrorNamesOffendingType(self):
+    # Regression test for https://github.com/jax-ml/jax/issues/13027
+    a = ArrayMetadataBox(jnp.arange(3))
+    b = ArrayMetadataBox(jnp.arange(3))
+    _, treedef_a = tree_util.tree_flatten(a)
+    _, treedef_b = tree_util.tree_flatten(b)
+
+    # hash succeeds despite unhashable metadata (metadata isn't actually
+    # hashed); the error only appears once equality is checked.
+    hash(treedef_a)
+    hash(treedef_b)
+
+    with self.assertRaisesRegex(ValueError, "ArrayMetadataBox"):
+      treedef_a == treedef_b
+
+    # The same error, reached through jax.jit's dispatch cache, should also
+    # name the offending type.
+    f = jax.jit(lambda x: x)
+    f(a)
+    with self.assertRaisesRegex(ValueError, "ArrayMetadataBox"):
+      f(b)
+
+
 class StaticTest(parameterized.TestCase):
 
   @parameterized.parameters(
@@ -913,6 +1268,33 @@ class StaticTest(parameterized.TestCase):
     self.assertEqual(fn(3, BlackBox(1)), 5)
     self.assertEqual(num_called, 1)
 
+  def test_serialize_treedef(self):
+    tree_structure = jax.tree_util.tree_structure([1, [2], (3,), {'a': 4, 'b': 5}])
+    serialized = tree_structure.serialize_using_proto()
+    new_structure = jax.tree_util.PyTreeDef.deserialize_using_proto(
+      jax.tree_util.default_registry,
+      serialized
+    )
+    self.assertEqual(tree_structure, new_structure)
+
+  def test_compare_pytreedef_with_registries(self):
+    class MyCustomType:
+      def __init__(self, x):
+        self.x = x
+
+    tree_util.register_pytree_node(
+        MyCustomType,
+        lambda o: ((o.x,), None),
+        lambda _, xs: MyCustomType(xs[0])
+    )
+
+    obj = MyCustomType(1)
+
+    leaves1, treedef1 = default_registry.flatten(obj)
+    leaves2, treedef2 = dispatch_registry.flatten(obj)
+
+    self.assertEqual(treedef1, treedef2)
+    self.assertEqual(leaves1, leaves2)
 
 class RavelUtilTest(jtu.JaxTestCase):
 
@@ -969,7 +1351,7 @@ class RavelUtilTest(jtu.JaxTestCase):
     self.assertAllClose(tree, tree_, atol=0., rtol=0.)
 
   def testDtypePolymorphicUnravel(self):
-    # https://github.com/google/jax/issues/7809
+    # https://github.com/jax-ml/jax/issues/7809
     x = jnp.arange(10, dtype=jnp.float32)
     x_flat, unravel = flatten_util.ravel_pytree(x)
     y = x_flat < 5.3
@@ -978,7 +1360,7 @@ class RavelUtilTest(jtu.JaxTestCase):
 
   @jax.numpy_dtype_promotion('standard')  # Explicitly exercises implicit dtype promotion.
   def testDtypeMonomorphicUnravel(self):
-    # https://github.com/google/jax/issues/7809
+    # https://github.com/jax-ml/jax/issues/7809
     x1 = jnp.arange(10, dtype=jnp.float32)
     x2 = jnp.arange(10, dtype=jnp.int32)
     x_flat, unravel = flatten_util.ravel_pytree((x1, x2))
@@ -1082,7 +1464,31 @@ class TreePrefixErrorsTest(jtu.JaxTestCase):
   def test_different_num_children_print_key_diff(self):
     e, = prefix_errors({'a': 1}, {'a': 2, 'b': 3})
     expected = ("so the symmetric difference on key sets is\n"
-                "    b")
+                r"    \['b'\]")
+    with self.assertRaisesRegex(ValueError, expected):
+      raise e('in_axes')
+
+  def test_different_num_children_custom_node_with_keys(self):
+    # https://github.com/jax-ml/jax/issues/25659
+    @tree_util.register_pytree_with_keys_class
+    class Foo:
+      def __init__(self, fields):
+        self.fields = dict(fields)
+
+      def tree_flatten_with_keys(self):
+        return ([(tree_util.GetAttrKey(k), v) for k, v in self.fields.items()],
+                tuple(self.fields))
+
+      @classmethod
+      def tree_unflatten(cls, keys, children):
+        return cls(zip(keys, children))
+
+    e, = prefix_errors(Foo({'a': 1}), Foo({'a': 2, 'b': 3}))
+    expected = ("(?s)pytree structure error: different numbers of pytree "
+                "children at key path\n"
+                "    in_axes\n"
+                ".*so the symmetric difference on key sets is\n"
+                r"    \.b")
     with self.assertRaisesRegex(ValueError, expected):
       raise e('in_axes')
 
@@ -1133,23 +1539,388 @@ class TreePrefixErrorsTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(ValueError, expected):
       raise e('in_axes')
 
+  def test_curly_braces_in_keys_no_children(self):
+    e, = prefix_errors({"{oops}": {}}, {})
+    expected = ("pytree structure error: different numbers of pytree children "
+                "at key path\n"
+                "    in_axes")
+    with self.assertRaisesRegex(ValueError, expected):
+      raise e('in_axes')
+
+  def test_curly_braces_in_keys_list_length(self):
+    e, = prefix_errors({"{oops}": []}, {"{oops}": [{}]})
+    expected = ("pytree structure error: different lengths of list "
+                "at key path\n"
+                r"    in_axes\['{oops}'\]")
+    with self.assertRaisesRegex(ValueError, expected):
+      raise e('in_axes')
+
+  def test_curly_braces_in_keys_different_lengths(self):
+    e, = prefix_errors({"{oops}": {}}, {"{oops}": 1})
+    expected = ("pytree structure error: different types at key path\n"
+                r"    in_axes\['{oops}'\]")
+    with self.assertRaisesRegex(ValueError, expected):
+      raise e('in_axes')
+
+  def test_curly_braces_in_keys_different_metadata(self):
+    e, = prefix_errors({"{oops}": {"{a}": 1}}, {"{oops}": {"{b}": 1}})
+    expected = ("pytree structure error: different pytree metadata "
+                "at key path\n"
+                r"    in_axes\['{oops}'\]")
+    with self.assertRaisesRegex(ValueError, expected):
+      raise e('in_axes')
+
 
 class TreeAliasTest(jtu.JaxTestCase):
-  @parameterized.parameters(
-      ('all', 'tree_all'),
-      ('flatten', 'tree_flatten'),
-      ('leaves', 'tree_leaves'),
-      ('map', 'tree_map'),
-      ('reduce', 'tree_reduce'),
-      ('structure', 'tree_structure'),
-      ('transpose', 'tree_transpose'),
-      ('unflatten', 'tree_unflatten'),
-  )
-  def test_tree_aliases(self, tree_name, tree_util_name):
-    wrapper = getattr(jax.tree, tree_name)
-    original = getattr(jax.tree_util, tree_util_name)
-    self.assertIs(wrapper.__wrapped__, original)
+  """Simple smoke-tests for tree_util aliases under jax.tree"""
 
+  def test_tree_all(self):
+    obj = [True, True, (True, False)]
+    self.assertEqual(
+      jax.tree.all(obj),
+      tree_util.tree_all(obj),
+    )
+
+  def test_tree_all_is_leaf(self):
+    obj = [True, True, (True, False)]
+    is_leaf = lambda x: isinstance(x, tuple)
+    self.assertEqual(
+      jax.tree.all(obj, is_leaf=is_leaf),
+      tree_util.tree_all(obj, is_leaf=is_leaf),
+    )
+
+  def test_tree_flatten(self):
+    obj = [1, 2, (3, 4)]
+    self.assertEqual(
+      jax.tree.flatten(obj),
+      tree_util.tree_flatten(obj),
+    )
+
+  def test_tree_flatten_is_leaf(self):
+    obj = [1, 2, (3, 4)]
+    is_leaf = lambda x: isinstance(x, tuple)
+    self.assertEqual(
+      jax.tree.flatten(obj, is_leaf=is_leaf),
+      tree_util.tree_flatten(obj, is_leaf=is_leaf),
+    )
+
+  def test_tree_leaves(self):
+    obj = [1, 2, (3, 4)]
+    self.assertEqual(
+      jax.tree.leaves(obj),
+      tree_util.tree_leaves(obj),
+    )
+
+  def test_tree_leaves_is_leaf(self):
+    obj = [1, 2, (3, 4)]
+    is_leaf = lambda x: isinstance(x, tuple)
+    self.assertEqual(
+      jax.tree.leaves(obj, is_leaf=is_leaf),
+      tree_util.tree_leaves(obj, is_leaf=is_leaf),
+    )
+
+  def test_tree_map(self):
+    func = lambda x: x * 2
+    obj = [1, 2, (3, 4)]
+    self.assertEqual(
+      jax.tree.map(func, obj),
+      tree_util.tree_map(func, obj),
+    )
+
+  def test_tree_map_is_leaf(self):
+    func = lambda x: x * 2
+    obj = [1, 2, (3, 4)]
+    is_leaf = lambda x: isinstance(x, tuple)
+    self.assertEqual(
+      jax.tree.map(func, obj, is_leaf=is_leaf),
+      tree_util.tree_map(func, obj, is_leaf=is_leaf),
+    )
+
+  def test_tree_reduce(self):
+    func = lambda a, b: a + b
+    obj = [1, 2, (3, 4)]
+    self.assertEqual(
+      jax.tree.reduce(func, obj),
+      tree_util.tree_reduce(func, obj),
+    )
+
+  def test_tree_reduce_is_leaf(self):
+    func = lambda a, b: a + b
+    obj = [(1, 2), (3, 4)]
+    is_leaf = lambda x: isinstance(x, tuple)
+    self.assertEqual(
+      jax.tree.reduce(func, obj, is_leaf=is_leaf),
+      tree_util.tree_reduce(func, obj, is_leaf=is_leaf),
+    )
+
+  def test_tree_reduce_associative(self):
+    func = lambda a, b: a + b
+    obj = [1, 2, (3, 4)]
+    self.assertEqual(
+      jax.tree.reduce_associative(func, obj),
+      tree_util.tree_reduce_associative(func, obj),
+    )
+
+  def test_tree_reduce_associative_is_leaf(self):
+    func = lambda a, b: a + b
+    obj = [(1, 2), (3, 4)]
+    is_leaf = lambda x: isinstance(x, tuple)
+    self.assertEqual(
+      jax.tree.reduce_associative(func, obj, is_leaf=is_leaf),
+      tree_util.tree_reduce_associative(func, obj, is_leaf=is_leaf),
+    )
+
+  def test_tree_structure(self):
+    obj = [1, 2, (3, 4)]
+    self.assertEqual(
+      jax.tree.structure(obj),
+      tree_util.tree_structure(obj),
+    )
+
+  def test_tree_structure_is_leaf(self):
+    obj = [1, 2, (3, 4)]
+    is_leaf = lambda x: isinstance(x, tuple)
+    self.assertEqual(
+      jax.tree.structure(obj, is_leaf=is_leaf),
+      tree_util.tree_structure(obj, is_leaf=is_leaf),
+    )
+
+  def test_tree_transpose(self):
+    obj = [(1, 2), (3, 4), (5, 6)]
+    outer_treedef = tree_util.tree_structure(['*', '*', '*'])
+    inner_treedef = tree_util.tree_structure(('*', '*'))
+    self.assertEqual(
+      jax.tree.transpose(outer_treedef, inner_treedef, obj),
+      tree_util.tree_transpose(outer_treedef, inner_treedef, obj)
+    )
+
+  def test_tree_broadcast(self):
+    prefix = (1, 2, 3)
+    full = (0, {'a': 0, 'b': 0}, (0, 0))
+    actual = jax.tree.broadcast(prefix, full)
+    expected = (1, {'a': 2, 'b': 2}, (3, 3))
+    self.assertEqual(actual, expected)
+
+  def test_tree_unflatten(self):
+    leaves, treedef = jax.tree.flatten([1, 2, (3, 4)])
+    self.assertEqual(
+      jax.tree.unflatten(treedef, leaves),
+      tree_util.tree_unflatten(treedef, leaves)
+    )
+
+  def test_tree_flatten_with_path(self):
+    obj = [1, 2, (3, 4)]
+    self.assertEqual(
+        jax.tree.flatten_with_path(obj),
+        tree_util.tree_flatten_with_path(obj),
+    )
+
+  def test_tree_flatten_with_path_is_leaf(self):
+    obj = [1, 2, (3, 4)]
+    is_leaf = lambda x: isinstance(x, tuple)
+    is_leaf = lambda kp, x: isinstance(x, tuple)
+    self.assertEqual(
+        jax.tree.flatten_with_path(obj, is_leaf, is_leaf_takes_path=True),
+        tree_util.tree_flatten_with_path(obj, is_leaf, is_leaf_takes_path=True),
+    )
+
+  def test_tree_leaves_with_path(self):
+    obj = [1, 2, (3, 4)]
+    self.assertEqual(
+        jax.tree.leaves_with_path(obj),
+        tree_util.tree_leaves_with_path(obj),
+    )
+
+  def test_tree_leaves_with_path_is_leaf(self):
+    obj = [1, 2, (3, 4)]
+    is_leaf = lambda x: isinstance(x, tuple)
+    is_leaf = lambda kp, x: isinstance(x, tuple)
+    self.assertEqual(
+        jax.tree.leaves_with_path(
+            obj, is_leaf=is_leaf, is_leaf_takes_path=True
+        ),
+        tree_util.tree_leaves_with_path(
+            obj, is_leaf=is_leaf, is_leaf_takes_path=True
+        ),
+    )
+
+  def test_tree_map_with_path(self):
+    func = lambda kp, x, y: (sum(k.idx for k in kp), x + y)
+    obj = [1, 2, (3, 4)]
+    obj2 = [5, 6, (7, 8)]
+    self.assertEqual(
+        jax.tree.map_with_path(func, obj, obj2),
+        tree_util.tree_map_with_path(func, obj, obj2),
+    )
+
+  def test_tree_map_with_path_is_leaf(self):
+    func = lambda kp, x, y: (sum(k.idx for k in kp), x + y)
+    obj = [1, 2, (3, 4)]
+    obj2 = [5, 6, (7, 8)]
+    is_leaf = lambda x: isinstance(x, tuple)
+    is_leaf = lambda kp, x: isinstance(x, tuple)
+    self.assertEqual(
+        jax.tree.map_with_path(
+            func, obj, obj2, is_leaf=is_leaf, is_leaf_takes_path=True
+        ),
+        tree_util.tree_map_with_path(
+            func, obj, obj2, is_leaf=is_leaf, is_leaf_takes_path=True
+        ),
+    )
+
+
+class RegistrationTest(jtu.JaxTestCase):
+
+  def test_register_dataclass_with_field_specifier(self):
+    @tree_util.register_dataclass
+    @dataclasses.dataclass
+    class Foo:
+      x: int
+      y: int = dataclasses.field(metadata=dict(static=True))
+
+    f = Foo(2, 3)
+    self.assertLen(jax.tree.leaves(f), 1)
+
+  def test_register_dataclass_field_errors(self):
+    class Foo:  # not a dataclass
+      x: int
+      y: int
+
+    msg = ("register_dataclass: data_fields and meta_fields are required"
+           " when nodetype is not a dataclass. Got nodetype=<class '.*Foo'>")
+    with self.assertRaisesRegex(TypeError, msg):
+      tree_util.register_dataclass(Foo)
+
+    msg = ("register_dataclass: data_fields and meta_fields must both be specified"\
+           r" when either is specified. Got data_fields=\['x'\] meta_fields=None.")
+    with self.assertRaisesRegex(TypeError, msg):
+      tree_util.register_dataclass(Foo, data_fields=['x'])
+
+    msg = ("register_dataclass: data_fields and meta_fields must both be specified"\
+           r" when either is specified. Got data_fields=None meta_fields=\['y'\].")
+    with self.assertRaisesRegex(TypeError, msg):
+      tree_util.register_dataclass(Foo, meta_fields=['y'])
+
+  def test_register_dataclass_missing_fields(self):
+    @dataclasses.dataclass
+    class Foo:
+      x: int
+      y: int
+      z: float = dataclasses.field(init=False)
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "data_fields and meta_fields must include all dataclass fields.*"
+        "Missing fields: {'y'}",
+    ):
+      tree_util.register_dataclass(Foo, data_fields=["x"], meta_fields=[])
+
+    # ``z`` is not required, because it's not included in ``__init__``.
+    tree_util.register_dataclass(Foo, data_fields=["x"], meta_fields=["y"])
+
+  def test_register_dataclass_unexpected_fields(self):
+    @dataclasses.dataclass
+    class Foo:
+      x: int
+      y: float
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "data_fields and meta_fields must include all dataclass fields.*"
+        "Unexpected fields: {'z'}",
+    ):
+      tree_util.register_dataclass(
+          Foo, data_fields=["x"], meta_fields=["y", "z"]
+      )
+
+  def test_register_dataclass_overlapping_fields(self):
+    @dataclasses.dataclass
+    class Foo:
+      x: int
+      y: float
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "data_fields and meta_fields must not overlap.*"
+        "Overlapping fields: {'x'}",
+    ):
+      tree_util.register_dataclass(
+          Foo, data_fields=["x", "y"], meta_fields=["x"]
+      )
+
+  def test_register_dataclass_drop_fields(self):
+    @dataclasses.dataclass
+    class Foo:
+      x: int
+      y: int = dataclasses.field(default=42)
+      z: int = dataclasses.field(default=42)
+
+    # ``y`` and ``z`` are explicitly excluded.
+    tree_util.register_dataclass(
+        Foo, data_fields=["x"], meta_fields=[], drop_fields=["y", "z"]
+    )
+
+  def test_register_dataclass_init_false(self):
+    @dataclasses.dataclass
+    class Foo:
+      x: int
+      y: int = dataclasses.field(default=42)
+      z: int = dataclasses.field(default=42, init=False)
+
+    with self.assertRaises(ValueError):
+      # Requires explicit drop_fields
+      tree_util.register_dataclass(Foo)
+
+    tree_util.register_dataclass(Foo, drop_fields="z")
+
+  def test_register_dataclass_invalid_plain_class(self):
+    class Foo:
+      x: int
+      y: int
+
+      def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+    # ``y`` is missing, but no validation is done for plain classes.
+    tree_util.register_dataclass(Foo, data_fields=["x"], meta_fields=[])
+
+  def test_static(self):
+    with self.subTest("simple static"):
+      static = jax.tree.static()
+      self.assertEqual(static.default, dataclasses.MISSING)
+      self.assertEqual(static.metadata, {"static": True})
+
+    with self.subTest("with default"):
+      static = jax.tree.static(default="abc")
+      self.assertEqual(static.default, "abc")
+      self.assertEqual(static.metadata, {"static": True})
+
+    with self.subTest("with extra metadata"):
+      static = jax.tree.static(metadata={"somekey": "someval"})
+      self.assertEqual(static.metadata, {"static": True, "somekey": "someval"})
+
+    with self.subTest("with static False"):
+      static = jax.tree.static(metadata={"static": False})
+      self.assertEqual(static.metadata, {"static": False})
+
+
+class FlatTreeTest(jtu.JaxTestCase):
+
+  def test_filter_and_tupling_commute(self):
+    xs = ft.flatten({'a': 0, 'b': 1})
+    ys = ft.flatten({'c': 2, 'd': 3, 'e': 4})
+    x_mask = [True, False]
+    y_mask = [False, True, True]
+    xs_f1 = xs.filter_with_mask(x_mask)
+    ys_f1 = ys.filter_with_mask(y_mask)
+
+    zs = ft.pack((xs, ys))
+    zs_f = zs.filter_with_mask(x_mask + y_mask)
+    xs_f2, ys_f2 = zs_f.unpack()
+    print(xs_f2)
+    print(ys_f2)
+    self.assertEqual((xs_f1, ys_f1), (xs_f2, ys_f2))
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

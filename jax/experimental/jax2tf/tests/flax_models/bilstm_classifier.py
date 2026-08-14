@@ -18,13 +18,14 @@ https://github.com/google/flax/tree/main/examples/sst2
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import functools
-from typing import Any, Callable, Optional
+from typing import Any
 
 from flax import linen as nn
 import jax
 from jax import numpy as jnp
-from jax._src.typing import Array
+from jax import Array
 
 
 def sequence_mask(lengths: Array, max_length: int) -> Array:

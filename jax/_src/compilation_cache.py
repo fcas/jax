@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import logging
 import threading
+from typing import Any
 import warnings
 import zlib
 
@@ -23,17 +25,27 @@ import numpy as np
 
 # If zstandard is installed, we use zstd compression, otherwise we use zlib.
 try:
-  import zstandard
+  # compression.zstd should be present in Python 3.14+
+  from compression import zstd
 except ImportError:
+  zstd = None
+
+if zstd is None:
+  # TODO(phawkins): remove this case when we drop support for Python 3.13.
+  try:
+    import zstandard  # pyrefly: ignore[missing-import]
+  except ImportError:
+    zstandard = None
+else:
   zstandard = None
 
 from jax._src import cache_key
-from jax._src.compilation_cache_interface import CacheInterface
 from jax._src import config
 from jax._src import monitoring
-from jax._src.gfile_cache import GFileCache
+from jax._src.compilation_cache_interface import CacheInterface
 from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
+from jax._src.lru_cache import LRUCache
 
 
 logger = logging.getLogger(__name__)
@@ -42,52 +54,178 @@ _cache: CacheInterface | None = None
 
 _cache_initialized: bool = False
 
+_cache_checked: bool = False
+
 _cache_used: bool = False
 
-# Mutex to protect _cache_initialized and _cache_used.
+# Mutex to protect _cache_initialized, _cache_checked and _cache_used.
 _cache_initialized_mutex = threading.Lock()
 
+_UNSUPPORTED_RUNTIMES: set[str] = set()
 
-def set_once_cache_used(f) -> None:
-  """One-time setting of _cache_used.
+_TIME_BYTES = 4
 
-  If _cache_used is False, set it to True and execute the provided function
-  f. No action if _cache_used is True. This provides a mechanism to execute f
-  once per task. Note that reset_cache() will reset _cache_used also.
+def is_cache_used(backend: xla_client.Client) -> bool:
+  """Check if cache is used and report adoption metrics one-time per task.
+  The cache may be initialized during the first call to this function.
   """
-  global _cache_used
+  # Return _cache_used directly if _cache_checked is True. If _cache_checked is
+  # False, set it to True, report metrics and return if cache is used. This
+  # provides a mechanism to report the metrics once per task. Note that
+  # reset_cache() will reset _cache_checked and _cache_used also.
+  global _cache_checked, _cache_used
   with _cache_initialized_mutex:
-    if not _cache_used:
-      _cache_used = True
-      if f is not None:
-        f()
+    if _cache_checked:
+      return _cache_used
+
+  with _cache_initialized_mutex:
+    if not _cache_checked:
+      _cache_checked = True
+
+      # Persistent compilation cache only implemented on TPU and GPU and the
+      # backend that supports serialization of executables.
+      # TODO(skye): add warning when initializing cache on unsupported default
+      # platform
+      supported_platforms = ["tpu", "gpu", "cpu", "neuron"]
+
+      if not _is_cache_enabled():
+        monitoring.record_event('/jax/compilation_cache/task_disabled_cache')
+      elif (
+          backend.platform in supported_platforms
+          and getattr(backend, "supports_executable_serialization", True)
+      ):
+        monitoring.record_event('/jax/compilation_cache/tasks_using_cache')
+        _cache_used = True
+      return _cache_used
+
+  return False
 
 
 def get_file_cache(path: str) -> tuple[CacheInterface, str] | None:
   """Returns the file cache and the path to the cache."""
-  return GFileCache(path), path
+  max_size = config.compilation_cache_max_size.value
+  cache = LRUCache(path, max_size=max_size)
+  if config.compilation_cache_check_contents.value:
+    return VerificationCache(cache), path
+  return cache, path
+
+
+class CacheVerificationError(RuntimeError):
+  """Error raised when a freshly compiled executable does not exactly
+  match an executable in the compilation cache at the same key.
+  """
+
+  def __init__(
+      self,
+      message: str,
+      cache_key: str,
+      executable_on_disk: bytes,
+      executable_new: bytes,
+  ):
+    super().__init__(message)
+    self.cache_key = cache_key
+    self.executable_on_disk = executable_on_disk
+    self.executable_new = executable_new
+
+
+class VerificationCache(CacheInterface):
+  """A cache that wraps another cache and verifies its contents.
+
+  If jax_compilation_cache_check_contents is True, then the first time
+  we encounter a new key in the disk cache in this process, even if the
+  disk cache already contains such an entry, we return None from get(),
+  forcing a recompilation. Then, when put() is called with the compiled
+  executable, we verify that it matches what's on disk.
+  """
+
+  def __init__(self, base_cache: CacheInterface):
+    self._base_cache = base_cache
+    self._verified_keys: set[str] = set()
+    self.base_cache_hits: dict[str, int] = {}
+
+  @property
+  def _path(self):  # pyrefly: ignore[bad-override]
+    return self._base_cache._path
+
+  @_path.setter
+  def _path(self, value):
+    self._base_cache._path = value
+
+  def get(self, key: str) -> bytes | None:
+    cache_value = self._base_cache.get(key)
+    if cache_value is not None:
+      self.base_cache_hits[key] = self.base_cache_hits.get(key, 0) + 1
+
+    if key not in self._verified_keys:
+      # Force a recompile the first time we see a key.
+      return None
+
+    return cache_value
+
+  def put(self, key: str, value: bytes) -> None:
+    if key not in self._verified_keys:
+      on_disk = self._base_cache.get(key)
+      if on_disk is not None:
+        # The cache content is [timestamp] + [executable].
+        # We decompress both and compare skip the timestamp which will
+        # differ for fresh compilations.
+        decompressed_on_disk = decompress_executable(on_disk)
+        decompressed_new = decompress_executable(value)
+        executable_on_disk, _ = extract_executable_and_time(decompressed_on_disk)
+        executable_new, _ = extract_executable_and_time(decompressed_new)
+        if executable_on_disk != executable_new:
+          raise CacheVerificationError(
+              f"Persistent compilation cache inconsistency for key {key}. "
+              "Executable found in the disk cache does not match the "
+              "freshly compiled executable.",
+              key,
+              executable_on_disk,
+              executable_new,
+          )
+      self._verified_keys.add(key)
+
+    self._base_cache.put(key, value)
+
+  def clear(self):
+    self._verified_keys.clear()
 
 
 def set_cache_dir(path) -> None:
-  """
-  Sets the persistent compilation cache directory.
+  """Sets the persistent compilation cache directory.
 
   After calling this, jit-compiled functions are saved to `path`, so they
   do not need be recompiled if the process is restarted or otherwise run again.
   This also tells Jax where to look for compiled functions before compiling.
+
+  For more information, see the :ref:`persistent compilation cache guide <persistent-compilation-cache>`.
+
+  .. warning::
+     The compilation cache is considered trusted. Do not share a compilation
+     cache with users you do not trust. For example, if you put the compilation
+     cache in a directory to which others may write, those users can trigger
+     your JAX process to run arbitrary code. Sharing a compilation cache is
+     equivalent to allowing anyone who can write to the cache directory to run
+     code on your machine.
   """
   config.config.update("jax_compilation_cache_dir", path)
 
 
 def initialize_cache(path) -> None:
-  """
-  This API is deprecated; use set_cache_dir instead.
+  """This API is deprecated; use set_cache_dir instead.
 
   Set the path. To take effect, should be called prior to any calls to
   get_executable_and_time() and put_executable_and_time().
+
+  For more information, see the :ref:`persistent compilation cache guide <persistent-compilation-cache>`.
+
+  .. warning::
+     The compilation cache is considered trusted. Do not share a compilation
+     cache with users you do not trust. For example, if you put the compilation
+     cache in a directory to which others may write, those users can trigger
+     your JAX process to run arbitrary code. Sharing a compilation cache is
+     equivalent to allowing anyone who can write to the cache directory to run
+     code on your machine.
   """
-  warnings.warn("initialize_cache is deprecated; use set_cache_dir instead",
-                DeprecationWarning, stacklevel=2)
   config.config.update("jax_compilation_cache_dir", path)
 
 
@@ -106,12 +244,18 @@ def _initialize_cache() -> None:
   with _cache_initialized_mutex:
     if _cache_initialized:
       return
-    _cache_initialized = True
+
+    path: str | None = config.compilation_cache_dir.value
+    # If the path is not set, the cache will not be built.
+    if not path:
+      return
 
     # Nothing to do if the cache is disabled.
     if not _is_cache_enabled():
       logger.debug("_initialize_cache: cache is disabled!")
       return
+
+    _cache_initialized = True
 
     # Set the minimum cache size entry only if the flag
     # --jax_persistent_cache_min_entry_size_bytes has not been set.
@@ -121,10 +265,6 @@ def _initialize_cache() -> None:
 
     global _cache
     assert _cache is None, "The cache has already been initialized!"
-    path: str | None = config.compilation_cache_dir.value
-    # If the path is not set, the cache will not be enabled.
-    if not path:
-      return
 
     cache_and_path = get_file_cache(path)
     if cache_and_path is None:
@@ -133,49 +273,85 @@ def _initialize_cache() -> None:
       _cache, path = cache_and_path
       logger.debug("Initialized persistent compilation cache at %s", path)
 
+def is_persistent_cache_enabled() -> bool:
+  return (config.compilation_cache_dir.value is not None
+          and config.enable_compilation_cache.value)
 
-def _get_cache() -> CacheInterface | None:
+
+def _get_cache(backend) -> CacheInterface | None:
   # TODO(b/289098047): consider making this an API and changing the callers of
   # get_executable_and_time() and put_executable_and_time() to call get_cache()
   # and passing the result to them.
+  if backend.runtime_type in _UNSUPPORTED_RUNTIMES:
+    log_priority = (logging.WARNING if is_persistent_cache_enabled()
+                    else logging.DEBUG)
+    logger.log(log_priority, "_get_cache: Unsupported runtime: %s",
+               backend.runtime_type)
+    return None
   if _cache is None:
     _initialize_cache()  # initialization is done at most once; see above
   return _cache
 
 
-def compress_executable(executable):
-  if zstandard:
+def compress_executable(executable: bytes) -> bytes:
+  if zstd:
+    return zstd.compress(executable)
+  elif zstandard:
     compressor = zstandard.ZstdCompressor()
     return compressor.compress(executable)
   else:
     return zlib.compress(executable)
 
-def decompress_executable(executable):
-  if zstandard:
+def decompress_executable(executable: bytes) -> bytes:
+  if zstd:
+    return zstd.decompress(executable)
+  elif zstandard:
     decompressor = zstandard.ZstdDecompressor()
     return decompressor.decompress(executable)
   else:
     return zlib.decompress(executable)
 
+
+def is_executable_in_cache(backend, cache_key: str) -> bool:
+  """Checks if the executable is in the cache."""
+  cache = _get_cache(backend)
+  if cache is None:
+    return False
+
+  # TODO(patrios): add check cache key method to cache interface.
+  executable_and_time = cache.get(cache_key)
+  return executable_and_time is not None
+
+
 def get_executable_and_time(
-    cache_key: str, compile_options, backend
+    cache_key: str, compile_options, backend, executable_devices,
+    host_callbacks: Sequence[Any] = (),
 ) -> tuple[xla_client.LoadedExecutable | None, int | None]:
   """Returns the cached executable and its compilation time if present, or None
   otherwise.
   """
-  cache = _get_cache()
+  cache = _get_cache(backend)
   if cache is None:
     logger.debug("get_executable_and_time: cache is disabled/not initialized")
     return None, None
   executable_and_time = cache.get(cache_key)
-  if not executable_and_time:
+  if executable_and_time is None:
     return None, None
 
   executable_and_time = decompress_executable(executable_and_time)
   serialized_executable, compile_time = extract_executable_and_time(
       executable_and_time)
-  xla_executable_deserialized = backend.deserialize_executable(
-      serialized_executable, compile_options)
+  if host_callbacks:
+    xla_executable_deserialized = backend.deserialize_executable(
+        serialized_executable,
+        executable_devices,
+        compile_options,
+        host_callbacks,
+    )
+  else:
+    xla_executable_deserialized = backend.deserialize_executable(
+        serialized_executable, executable_devices, compile_options
+    )
   return xla_executable_deserialized, compile_time
 
 
@@ -189,12 +365,18 @@ def put_executable_and_time(
   """Adds the 'executable' and its compilation time to the cache, possibly
   evicting older entries.
   """
-  cache = _get_cache()
+  log_priority = (logging.WARNING
+                  if config.explain_cache_misses.value
+                  and is_persistent_cache_enabled()
+                  else logging.DEBUG)
+  cache = _get_cache(backend)
   if cache is None:
-    logger.debug("put_executable_and_time: cache is disabled/not initialized")
+    logger.log(log_priority,
+               "Not writing persistent cache entry with key %r"
+               " since cache is disabled/not initialized", cache_key)
     return
 
-  serialized_executable = backend.serialize_executable(executable)
+  serialized_executable = executable.serialize()
   executable_and_time = combine_executable_and_time(
       serialized_executable, compile_time)
   executable_and_time = compress_executable(executable_and_time)
@@ -202,27 +384,45 @@ def put_executable_and_time(
   min_entry_size = config.persistent_cache_min_entry_size_bytes.value
   entry_size = len(executable_and_time)
   if entry_size < min_entry_size:
-    logger.info(
-        "Not writing cache entry with key %s since its size (%d bytes) "
-        "is less than threshold (%d bytes)",
-        cache_key,
-        entry_size,
-        min_entry_size,
-    )
+    logger.log(log_priority,
+        "Not writing persistent cache entry with key %r since its size"
+        " (%d bytes) is less than threshold (%d bytes)", cache_key, entry_size,
+        min_entry_size)
   else:
-    logger.info(
-        "Writing %s to persistent compilation cache with key %s.",
-        module_name,
-        cache_key
-    )
+    logger.log(log_priority,
+               "Writing %s to persistent compilation cache with key %r",
+               module_name, cache_key)
     monitoring.record_event('/jax/compilation_cache/cache_misses')
+    if config.compilation_cache_expect_pgle.value:
+      # User asserted that the compilation cache would already contain PGLE-optimized
+      # executables. Because of the size/compile-time thresholds, it is expected that
+      # some compilation of small modules will still happen, but that should not lead
+      # to compilation cache writes.
+      warnings.warn(
+          f"PERSISTENT CACHE WRITE with key {cache_key}, this is unexpected because "
+          "JAX_COMPILATION_CACHE_EXPECT_PGLE is set. The execution that populated the "
+          "cache may lack coverage, "
+          "https://docs.jax.dev/en/latest/persistent_compilation_cache.html may "
+          "help debug why this has happened")
+
     cache.put(cache_key, executable_and_time)
 
 
-def get_cache_key(module: ir.Module, devices: np.ndarray, compile_options,
-                  backend) -> str:
-  return cache_key.get(module, devices, compile_options, backend,
-                       "zstandard" if zstandard is not None else "zlib")
+def get_cache_key(
+    module: ir.Module,
+    devices: np.ndarray,
+    compile_options,
+    backend,
+    ignore_custom_partitioning: bool = False,
+) -> str:
+  return cache_key.get(
+      module,
+      devices,
+      compile_options,
+      backend,
+      "zstandard" if zstandard is not None else "zlib",
+      ignore_custom_partitioning,
+  )
 
 
 def is_initialized() -> bool:
@@ -233,21 +433,24 @@ def is_initialized() -> bool:
   initialized status is not checked. The name is retained for backwards
   compatibility.
   """
-  warnings.warn("is_initialized is deprecated; do not use",
-                DeprecationWarning, stacklevel=2)
   return _is_cache_enabled()
 
 
 def reset_cache() -> None:
-  """Get back to pristine, uninitialized state."""
+  """Get back to pristine, uninitialized state.
+
+  For more information, see the :ref:`persistent compilation cache guide <persistent-compilation-cache>`.
+  """
   global _cache
   global _cache_initialized
+  global _cache_checked
   global _cache_used
   logger.info("Resetting cache at %s.",
                _cache._path if _cache is not None else "<empty>")
   _cache = None
   with _cache_initialized_mutex:
     _cache_initialized = False
+    _cache_checked = False
     _cache_used = False
 
 
@@ -262,11 +465,14 @@ def combine_executable_and_time(
   Content:  compilation time    serialized executable
             (big-endian int)
   """
-  return int(compile_time).to_bytes(4, byteorder='big') + serialized_executable
+  return (
+      int(compile_time).to_bytes(_TIME_BYTES, byteorder="big")
+      + serialized_executable
+  )
 
 
 def extract_executable_and_time(
-    exectuable_and_time: bytes
+    executable_and_time: bytes
 ) -> tuple[bytes, int]:
   """Given the cache entry in the format shown below, extract the serialized
   executable and the compilation time.
@@ -276,5 +482,5 @@ def extract_executable_and_time(
   Content:  compilation time    serialized executable
             (big-endian int)
   """
-  return exectuable_and_time[4:], int.from_bytes(
-      exectuable_and_time[:4], byteorder='big')
+  return executable_and_time[_TIME_BYTES:], int.from_bytes(
+      executable_and_time[:_TIME_BYTES], byteorder='big')

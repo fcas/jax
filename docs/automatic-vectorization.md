@@ -5,7 +5,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.16.1
+    jupytext_version: 1.16.4
 kernelspec:
   display_name: Python 3
   language: python
@@ -14,6 +14,8 @@ kernelspec:
 
 (automatic-vectorization)=
 # Automatic vectorization
+
+<!--* freshness: { reviewed: '2024-05-03' } *-->
 
 In the previous section we discussed JIT compilation via the {func}`jax.jit` function.
 This notebook discusses another of JAX's transforms: vectorization via {func}`jax.vmap`.
@@ -115,3 +117,16 @@ jitted_batch_convolve = jax.jit(auto_batch_convolve)
 
 jitted_batch_convolve(xs, ws)
 ```
+
+It is sometimes useful to compose `vmap` with itself. For instance, we can
+succinctly express the pairwise evaluation of a function using two nested
+applications of `vmap`:
+
+```{code-cell}
+def pairwise(f, xs):
+  return jax.vmap(lambda x: jax.vmap(lambda y: f(x, y))(xs))(xs)
+```
+
+Suppose `xs` is a matrix whose M rows are each N-dimensional points, and that
+`dist(x, y)` computes the distance between two N-dimensional vectors. Then
+`pairwise(dist, xs)` is the M-by-M matrix of pairwise distances among `xs`.

@@ -12,14 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-"""Tests for stack."""
-
 from absl.testing import absltest
 
 import jax
 import jax.numpy as jnp
-from jax._src.lax.stack import Stack
+from jax._src.tpu.linalg.stack import Stack
 from jax._src import test_util as jtu
 
 

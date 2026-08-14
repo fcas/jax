@@ -14,17 +14,15 @@
 
 import os
 import platform
-import time
-import warnings
 
 from absl import logging
 from absl.testing import absltest
-
+from jax import version
 from jax._src import compiler
 from jax._src import config
 from jax._src import test_util as jtu
 from jax._src import xla_bridge as xb
-from jax._src.interpreters import xla
+from jax._src.lib import _profiler
 from jax._src.lib import xla_client as xc
 
 config.parse_flags_with_absl()
@@ -37,18 +35,14 @@ class XlaBridgeTest(jtu.JaxTestCase):
   def test_set_device_assignment_no_partition(self):
     compile_options = compiler.get_compile_options(
         num_replicas=4, num_partitions=1, device_assignment=[0, 1, 2, 3])
-    expected_device_assignment = ("Computations: 1 Replicas: 4\nComputation 0: "
-                                  "0 1 2 3 \n")
-    self.assertEqual(compile_options.device_assignment.__repr__(),
-                     expected_device_assignment)
+    self.assertEqual(compile_options.device_assignment.replica_count(), 4)
+    self.assertEqual(compile_options.device_assignment.computation_count(), 1)
 
   def test_set_device_assignment_with_partition(self):
     compile_options = compiler.get_compile_options(
         num_replicas=2, num_partitions=2, device_assignment=[[0, 1], [2, 3]])
-    expected_device_assignment = ("Computations: 2 Replicas: 2\nComputation 0: "
-                                  "0 2 \nComputation 1: 1 3 \n")
-    self.assertEqual(compile_options.device_assignment.__repr__(),
-                     expected_device_assignment)
+    self.assertEqual(compile_options.device_assignment.replica_count(), 2)
+    self.assertEqual(compile_options.device_assignment.computation_count(), 2)
 
   def test_set_fdo_profile(self):
     compile_options = compiler.get_compile_options(
@@ -119,18 +113,45 @@ class XlaBridgeTest(jtu.JaxTestCase):
     # Map order does not matter.
     self.assertEqual(c1str, c2.SerializeAsString())
 
-  def test_parameter_replication_default(self):
-    c = xc.XlaBuilder("test")
-    _ = xla.parameter(c, 0, xc.Shape.array_shape(xc.PrimitiveType.F32, ()))
-    built_c = c.Build()
-    assert "replication" not in built_c.as_hlo_text()
+  def test_add_disabled_hlo_pass(self):
+    self.assertEqual(
+        compiler._add_disabled_hlo_pass("", "rematerialization"),
+        "rematerialization",
+    )
+    self.assertEqual(
+        compiler._add_disabled_hlo_pass(
+            "scalar-constant-sinker", "rematerialization"
+        ),
+        "scalar-constant-sinker,rematerialization",
+    )
+    # No duplicates, and entries are normalized (XLA matches names exactly,
+    # so a leading space would make a pass name unmatchable).
+    self.assertEqual(
+        compiler._add_disabled_hlo_pass(
+            "scalar-constant-sinker, rematerialization", "rematerialization"
+        ),
+        "scalar-constant-sinker,rematerialization",
+    )
 
-  def test_parameter_replication(self):
-    c = xc.XlaBuilder("test")
-    _ = xla.parameter(c, 0, xc.Shape.array_shape(xc.PrimitiveType.F32, ()), "",
-                     False)
-    built_c = c.Build()
-    assert "parameter_replication={false}" in built_c.as_hlo_text()
+  def test_disable_remat_pass(self):
+    # Note: compile_options must outlive debug_options, which is a view
+    # into it that does not keep it alive.
+    with config.enable_remat_opt_pass(False):
+      compile_options = compiler.get_compile_options(
+          num_replicas=1, num_partitions=1
+      )
+      debug_options = compile_options.executable_build_options.debug_options
+      disabled = debug_options.xla_disable_hlo_passes.split(",")
+      self.assertEqual(disabled.count("rematerialization"), 1)
+    with config.enable_remat_opt_pass(True):
+      compile_options = compiler.get_compile_options(
+          num_replicas=1, num_partitions=1
+      )
+      debug_options = compile_options.executable_build_options.debug_options
+      self.assertNotIn(
+          "rematerialization",
+          debug_options.xla_disable_hlo_passes.split(","),
+      )
 
   def test_local_devices(self):
     self.assertNotEmpty(xb.local_devices())
@@ -138,28 +159,6 @@ class XlaBridgeTest(jtu.JaxTestCase):
       xb.local_devices(100)
     with self.assertRaisesRegex(RuntimeError, "Unknown backend foo"):
       xb.local_devices(backend="foo")
-
-  def test_timer_tpu_warning(self):
-    with warnings.catch_warnings(record=True) as w:
-      warnings.simplefilter("always")
-
-      def _mock_tpu_client(library_path=None):
-        time_to_wait = 5
-        start = time.time()
-        while not w:
-          if time.time() - start > time_to_wait:
-            raise ValueError(
-                "This test should not hang for more than "
-                f"{time_to_wait} seconds.")
-          time.sleep(0.1)
-
-        self.assertLen(w, 1)
-        msg = str(w[-1].message)
-        self.assertIn("Did you run your code on all TPU hosts?", msg)
-
-      with mock.patch.object(xc, "make_tpu_client",
-                             side_effect=_mock_tpu_client):
-        xb.tpu_client_timer_callback(0.01)
 
   def test_register_plugin(self):
     with self.assertLogs(level="WARNING") as log_output:
@@ -173,13 +172,15 @@ class XlaBridgeTest(jtu.JaxTestCase):
               "name1:path1,name2:path2,name3"
           )
         with mock.patch.object(
-            xc.profiler, "register_plugin_profiler", autospec=True
+            _profiler, "register_plugin_profiler", autospec=True
         ):
           xb.register_pjrt_plugin_factories_from_env()
     registration = xb._backend_factories["name1"]
     with mock.patch.object(xc, "make_c_api_client", autospec=True) as mock_make:
       with mock.patch.object(
-          xc, "pjrt_plugin_initialized", autospec=True, return_vale=True
+          xc,
+          "pjrt_plugin_initialized",
+          autospec=True,
       ):
         with mock.patch.object(xc, "initialize_pjrt_plugin", autospec=True):
           registration.factory()
@@ -193,7 +194,12 @@ class XlaBridgeTest(jtu.JaxTestCase):
     self.assertIn("name2", xb._backend_factories)
     self.assertEqual(registration.priority, 400)
     self.assertTrue(registration.experimental)
-    mock_make.assert_called_once_with("name1", {}, None)
+
+    options = {}
+    if xb.get_backend().platform == 'tpu':
+      options["ml_framework_name"] = "JAX"
+      options["ml_framework_version"] = version.__version__
+    mock_make.assert_called_once_with("name1", options, None)
 
   def test_register_plugin_with_config(self):
     test_json_file_path = os.path.join(
@@ -206,13 +212,15 @@ class XlaBridgeTest(jtu.JaxTestCase):
     )
     with mock.patch.object(xc, "load_pjrt_plugin_dynamically", autospec=True):
       with mock.patch.object(
-          xc.profiler, "register_plugin_profiler", autospec=True
+          _profiler, "register_plugin_profiler", autospec=True
       ):
         xb.register_pjrt_plugin_factories_from_env()
     registration = xb._backend_factories["name1"]
     with mock.patch.object(xc, "make_c_api_client", autospec=True) as mock_make:
       with mock.patch.object(
-          xc, "pjrt_plugin_initialized", autospec=True, return_vale=True
+          xc,
+          "pjrt_plugin_initialized",
+          autospec=True,
       ):
         with mock.patch.object(xc, "initialize_pjrt_plugin", autospec=True):
           registration.factory()
@@ -220,16 +228,55 @@ class XlaBridgeTest(jtu.JaxTestCase):
     self.assertIn("name1", xb._backend_factories)
     self.assertEqual(registration.priority, 400)
     self.assertTrue(registration.experimental)
-    mock_make.assert_called_once_with(
-        "name1",
-        {
-            "int_option": 64,
-            "int_list_option": [32, 64],
-            "string_option": "string",
-            "float_option": 1.0,
-        },
-        None,
-    )
+
+    # The expectation is specified in example_pjrt_plugin_config.json.
+    options = {
+        "int_option": 64,
+        "int_list_option": [32, 64],
+        "string_option": "string",
+        "float_option": 1.0,
+        }
+    if xb.get_backend().platform == 'tpu':
+      options["ml_framework_name"] = "JAX"
+      options["ml_framework_version"] = version.__version__
+
+    mock_make.assert_called_once_with("name1", options, None)
+
+  def test_register_plugin_with_lazy_config(self):
+    options = {"bar": "baz"}
+
+    def getopts():
+      return options
+
+    def make_c_api_client(plugin_name, new_options, *args, **kwargs):
+      for k in options:
+        self.assertEqual(new_options[k], options[k])
+
+    with mock.patch.object(xc, "load_pjrt_plugin_dynamically", autospec=True):
+      with mock.patch.object(
+          _profiler, "register_plugin_profiler", autospec=True
+      ):
+        xb.register_plugin("foo", options=getopts, library_path="/dev/null")
+    with mock.patch.object(
+        xc, "make_c_api_client", autospec=True, wraps=make_c_api_client
+    ) as mock_make:
+      with mock.patch.object(xc, "pjrt_plugin_initialized", autospec=True):
+        xb._backend_factories["foo"].factory()
+    mock_make.assert_called_once()
+
+  def test_num_cpu_devices_update(self):
+    xb.devices()
+
+    current_val = config.config.jax_num_cpu_devices
+
+    config.update("jax_num_cpu_devices", current_val)
+
+    with self.assertRaisesRegex(
+        RuntimeError,
+        "jax_num_cpu_devices config should be updated before backends are"
+        " initialized",
+    ):
+      config.update("jax_num_cpu_devices", current_val + 2)
 
 
 class GetBackendTest(jtu.JaxTestCase):
@@ -246,8 +293,14 @@ class GetBackendTest(jtu.JaxTestCase):
     def process_index(self):
       return 0
 
+    def devices(self):
+      return []
+
     def local_devices(self):
       return []
+
+    def _get_all_devices(self):
+      return self.devices()
 
   def _register_factory(self, platform: str, priority, device_count=1,
                         assert_used_at_most_once=False, experimental=False):
@@ -334,7 +387,6 @@ class GetBackendTest(jtu.JaxTestCase):
       "Unable to initialize backend 'error': I'm not a real backend"
     ):
       xb.get_backend("error")
-
 
   def test_no_devices(self):
     self._register_factory("no_devices", -10, device_count=0)

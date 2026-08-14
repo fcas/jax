@@ -138,6 +138,7 @@ namespace; they are listed below.
     csingle
     cumprod
     cumsum
+    cumulative_prod
     cumulative_sum
     deg2rad
     degrees
@@ -171,7 +172,6 @@ namespace; they are listed below.
     fabs
     fill_diagonal
     finfo
-    fix
     flatnonzero
     flexible
     flip
@@ -273,6 +273,7 @@ namespace; they are listed below.
     mask_indices
     matmul
     matrix_transpose
+    matvec
     max
     maximum
     mean
@@ -336,6 +337,7 @@ namespace; they are listed below.
     promote_types
     ptp
     put
+    put_along_axis
     quantile
     r_
     rad2deg
@@ -356,7 +358,6 @@ namespace; they are listed below.
     roots
     rot90
     round
-    round_
     s_
     save
     savez
@@ -376,6 +377,7 @@ namespace; they are listed below.
     size
     sort
     sort_complex
+    spacing
     split
     sqrt
     square
@@ -391,6 +393,7 @@ namespace; they are listed below.
     tanh
     tensordot
     tile
+    top_k
     trace
     trapezoid
     transpose
@@ -425,6 +428,7 @@ namespace; they are listed below.
     var
     vdot
     vecdot
+    vecmat
     vectorize
     vsplit
     vstack
@@ -495,6 +499,7 @@ jax.numpy.linalg
   tensordot
   tensorinv
   tensorsolve
+  trace
   vector_norm
   vecdot
 
@@ -527,3 +532,37 @@ This is because in general, pickling and unpickling may take place in different 
 environments, and there is no general way to map the device IDs of one runtime
 to the device IDs of another. If :mod:`pickle` is used in traced/JIT-compiled code,
 it will result in a :class:`~jax.errors.ConcretizationTypeError`.
+
+.. _python-array-api:
+
+Python Array API standard
+-------------------------
+
+.. note::
+
+  Prior to JAX v0.4.32, you must ``import jax.experimental.array_api`` in order
+  to enable the array API for JAX arrays. After JAX v0.4.32, importing this
+  module is no longer required, and will raise a deprecation warning. After
+  JAX v0.5.0, this import will raise an error.
+
+Starting with JAX v0.4.32, :class:`jax.Array` and :mod:`jax.numpy` are compatible
+with the `Python Array API Standard`_. You can access the Array API namespace via
+:meth:`jax.Array.__array_namespace__`::
+
+    >>> def f(x):
+    ...   nx = x.__array_namespace__()
+    ...   return nx.sin(x) ** 2 + nx.cos(x) ** 2
+
+    >>> import jax.numpy as jnp
+    >>> x = jnp.arange(5)
+    >>> f(x).round()
+    Array([1., 1., 1., 1., 1.], dtype=float32)
+
+JAX departs from the standard in a few places, namely because JAX arrays are
+immutable, in-place updates are not supported. Some of these incompatibilities
+are being addressed via the `array-api-compat`_ module.
+
+For more information, refer to the `Python Array API Standard`_ documentation.
+
+.. _Python Array API Standard: https://data-apis.org/array-api
+.. _array-api-compat: https://github.com/data-apis/array-api-compat

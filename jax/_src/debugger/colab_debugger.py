@@ -23,18 +23,15 @@ import uuid
 from jax._src.debugger import colab_lib
 from jax._src.debugger import core as debugger_core
 from jax._src.debugger import cli_debugger
-
-# pylint: disable=g-import-not-at-top
-# pytype: disable=import-error
 if colab_lib.IS_COLAB_ENABLED:
-  from google.colab import output
+  from google.colab import output  # pyrefly: ignore[missing-import]
 try:
-  import pygments
+  import pygments  # pyrefly: ignore[missing-source-for-stubs]
+  import pygments.lexers  # pyrefly: ignore[missing-source-for-stubs]
+  import pygments.formatters  # pyrefly: ignore[missing-source-for-stubs]
   IS_PYGMENTS_ENABLED = True
 except ImportError:
   IS_PYGMENTS_ENABLED = False
-# pytype: enable=import-error
-# pylint: enable=g-import-not-at-top
 
 
 class CodeViewer(colab_lib.DynamicDOMElement):
@@ -141,13 +138,12 @@ class FramePreview(colab_lib.DynamicDOMElement):
         try:
           with open(filename) as fp:
             self._file_cache[filename] = fp.read()
-          source = self._file_cache[filename]
-          highlight = lineno
-          linenostart = 1
         except FileNotFoundError:
-          source = "\n".join(frame.source)
-          highlight = min(frame.offset + 1, len(frame.source) - 1)
-          linenostart = lineno - frame.offset
+          pass
+    if filename in self._file_cache:
+      source = self._file_cache[filename]
+      highlight = lineno
+      linenostart = 1
     else:
       source = "\n".join(frame.source)
       highlight = min(frame.offset + 1, len(frame.source) - 1)
@@ -228,14 +224,14 @@ class ColabDebugger(cli_debugger.CliDebugger):
                thread_id: int):
     super().__init__(frames, thread_id)
     self._debugger_view = DebuggerView(self.current_frame())
-    self.stdout = self.stdin = self._debugger_view  # type: ignore
+    self.stdout = self.stdin = self._debugger_view  # pyrefly: ignore[bad-assignment]
 
-  def do_up(self, arg):
+  def do_up(self, arg, /):
     super().do_up(arg)
     self._debugger_view.update_frame(self.current_frame())
     return False
 
-  def do_down(self, arg):
+  def do_down(self, arg, /):
     super().do_down(arg)
     self._debugger_view.update_frame(self.current_frame())
     return False

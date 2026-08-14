@@ -13,18 +13,31 @@
 # limitations under the License.
 
 # Note: import <name> as <name> is required for names to be exported.
-# See PEP 484 & https://github.com/google/jax/issues/7570
+# See PEP 484 & https://github.com/jax-ml/jax/issues/7570
 
 from jax._src.sharding import Sharding as Sharding
 from jax._src.sharding_impls import (
-    XLACompatibleSharding as XLACompatibleSharding,
     NamedSharding as NamedSharding,
     SingleDeviceSharding as SingleDeviceSharding,
-    PmapSharding as PmapSharding,
-    GSPMDSharding as GSPMDSharding,
-    PositionalSharding as PositionalSharding,
+    set_mesh as set_mesh,
+    get_mesh as get_mesh,
+    make_single_device_sharding as make_single_device_sharding,
 )
 from jax._src.partition_spec import (
     PartitionSpec as PartitionSpec,
+    UnreducedKind as UnreducedKind,
 )
-from jax._src.interpreters.pxla import Mesh as Mesh
+from jax._src.mesh import (
+    Mesh as Mesh,
+    AbstractDevice as AbstractDevice,
+    AbstractMesh as AbstractMesh,
+    AxisType as AxisType,
+    get_abstract_mesh as get_abstract_mesh,
+    use_abstract_mesh as use_abstract_mesh,
+)
+from jax._src.core import ManualAxisType as ManualAxisType
+from jax._src.pjit import (
+    reshard as reshard,
+    auto_axes as auto_axes,
+    explicit_axes as explicit_axes,
+)

@@ -17,30 +17,80 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import functools
 
-from jax._src import util
+from jax._src.util import safe_zip, use_cpp_class, cache
 from jax._src import xla_bridge as xb
 from jax._src.lib import xla_client as xc
+from jax._src.op_shardings import (
+    are_hlo_shardings_equal, get_num_ways_dim_sharded,
+    is_hlo_sharding_replicated, op_sharding_to_indices)
 
 Shape = tuple[int, ...]
 Device = xc.Device
 Index = tuple[slice, ...]
 XLADeviceAssignment = Sequence[Device]
 
+class IndivisibleError(ValueError):
+  pass
 
-@functools.lru_cache(maxsize=4096)
+@cache(max_size=4096, trace_context_in_key=False)
 def _addressable_devices_indices_map(
     sharding: Sharding, global_shape: Shape) -> Mapping[Device, Index | None]:
   global_map = sharding.devices_indices_map(global_shape)
   if sharding.is_fully_addressable:
     return global_map
-  if hasattr(sharding, '_internal_device_list'):
-    return {d: global_map[d]
-            for d in sharding._internal_device_list.addressable_device_list}
-  return {d: ind for d, ind in global_map.items()
-          if d.process_index == d.client.process_index()}
+  return {d: global_map[d]
+          for d in sharding._internal_device_list.addressable_device_list}
+
+@cache(max_size=4096, trace_context_in_key=False)
+def common_devices_indices_map(
+    s: Sharding, global_shape: Shape) -> Mapping[Device, Index]:
+  s.shard_shape(global_shape)  # raises a good error message
+  hlo_sharding = s._to_xla_hlo_sharding(len(global_shape))
+  if (xc.OpSharding.Type.UNREDUCED in hlo_sharding.subgroup_types() or
+      hlo_sharding.is_unreduced()):
+    raise NotImplementedError(
+        "device_indices_map doesn't work with unreduced. Please file a bug at"
+        ' https://github.com/jax-ml/jax/issues')
+  indices = op_sharding_to_indices(hlo_sharding, global_shape,
+                                   len(s._device_assignment))
+  return dict(safe_zip(s._device_assignment, indices))
 
 
-@util.use_cpp_class(xc.Sharding)
+@cache(max_size=4096, trace_context_in_key=False)
+def _common_shard_shape(self, global_shape: Shape) -> Shape:
+  hlo_sharding = self._to_xla_hlo_sharding(len(global_shape))
+  if is_hlo_sharding_replicated(hlo_sharding):
+    return global_shape
+  if hlo_sharding.is_unreduced():
+    return global_shape
+  partitions, _ = get_num_ways_dim_sharded(hlo_sharding)
+  assert len(partitions) == len(global_shape), (len(partitions), len(global_shape))
+  out = []
+  for dim, (s, p) in enumerate(safe_zip(global_shape, partitions)):
+    quotient, remainder = divmod(s, p)
+    if remainder != 0:
+      raise IndivisibleError(
+          f"{self} implies that array axis {dim} is partitioned "
+          f"{p} times, but the dimension size is {s} "
+          f"(full shape: {global_shape}, "
+          f"per-dimension tiling factors: {tuple(partitions)} should evenly "
+          "divide the shape)")
+    out.append(quotient)
+  return tuple(out)
+
+def common_is_equivalent_to(s1: Sharding, s2: Sharding, ndim: int,
+                            check_devices: bool = True) -> bool:
+  hlo_s_eq = are_hlo_shardings_equal(
+      s1._to_xla_hlo_sharding(ndim), s2._to_xla_hlo_sharding(ndim))
+  mem_eq = s1.memory_kind == s2.memory_kind
+  if check_devices:
+    return (hlo_s_eq and mem_eq and
+            s1._internal_device_list == s2._internal_device_list)
+  else:
+    return hlo_s_eq and mem_eq
+
+
+@use_cpp_class(xc.Sharding)
 class Sharding:
   """Describes how a :class:`jax.Array` is laid out across devices.
   """
@@ -52,35 +102,6 @@ class Sharding:
 
     In multi-controller JAX, the set of devices is global, i.e., includes
     non-addressable devices from other processes.
-    """
-    raise NotImplementedError('Subclasses should implement this method.')
-
-  def devices_indices_map(
-      self, global_shape: Shape) -> Mapping[Device, Index | None]:
-    """Returns a mapping from devices to the array slices each contains.
-
-    The mapping includes all global devices, i.e., including
-    non-addressable devices from other processes.
-    """
-    raise NotImplementedError('Subclasses should implement this method.')
-
-  def shard_shape(self, global_shape: Shape) -> Shape:
-    """Returns the shape of the data on each device.
-
-    The shard shape returned by this function is calculated from
-    ``global_shape`` and the properties of the sharding.
-    """
-    raise NotImplementedError('Subclasses should implement this method.')
-
-  def is_equivalent_to(self, other: Sharding, ndim: int) -> bool:
-    """Returns ``True`` if two shardings are equivalent.
-
-    Two shardings are equivalent if they place the same logical array shards on
-    the same devices.
-
-    For example, a :class:`NamedSharding` may be equivalent
-    to a :class:`PositionalSharding` if both place the same shards of the array
-    on the same devices.
     """
     raise NotImplementedError('Subclasses should implement this method.')
 
@@ -104,6 +125,11 @@ class Sharding:
     raise NotImplementedError('Subclasses should implement this method.')
 
   @property
+  def num_devices(self) -> int:
+    """Number of devices that the sharding contains."""
+    raise NotImplementedError('Subclasses should implement this method.')
+
+  @property
   def memory_kind(self) -> str | None:
     """Returns the memory kind of the sharding."""
     raise NotImplementedError('Subclasses should implement this method.')
@@ -112,8 +138,27 @@ class Sharding:
     """Returns a new Sharding instance with the specified memory kind."""
     raise NotImplementedError('Subclasses should implement this method')
 
+  @property
+  def _device_assignment(self) -> XLADeviceAssignment:
+    raise NotImplementedError('Subclasses should implement this method.')
+
+  @property
+  def _internal_device_list(self) -> xc.DeviceList:
+    raise NotImplementedError('Subclasses should implement this method.')
+
+  def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
+    raise NotImplementedError('Subclasses should implement this method.')
+
+  def _to_sdy_sharding(self, num_dimensions: int,
+                       modify_wrt_axis_types: bool = False):
+    raise NotImplementedError('Subclasses should implement this method.')
+
   #############################################################################
   # Default implementations below that all subclasses will inherit.
+
+  @property
+  def _is_concrete(self) -> bool:
+    return True
 
   @functools.cached_property
   def addressable_devices(self) -> set[Device]:
@@ -134,3 +179,37 @@ class Sharding:
     ``device_indices_map`` that applies to the addressable devices.
     """
     return _addressable_devices_indices_map(self, global_shape)
+
+  def devices_indices_map(self, global_shape: Shape) -> Mapping[Device, Index]:
+    """Returns a mapping from devices to the array slices each contains.
+
+    The mapping includes all global devices, i.e., including
+    non-addressable devices from other processes.
+    """
+    return common_devices_indices_map(self, global_shape)
+
+  @property
+  def has_addressable_devices(self) -> bool:
+    return len(self._internal_device_list.addressable_device_list) > 0
+
+  @functools.cached_property
+  def _addressable_device_assignment(self) -> XLADeviceAssignment:
+    if self.is_fully_addressable:
+      return self._device_assignment
+    return tuple(self._internal_device_list.addressable_device_list)
+
+  def shard_shape(self, global_shape: Shape) -> Shape:
+    """Returns the shape of the data on each device.
+
+    The shard shape returned by this function is calculated from
+    ``global_shape`` and the properties of the sharding.
+    """
+    return _common_shard_shape(self, global_shape)
+
+  def is_equivalent_to(self: Sharding, other: Sharding, ndim: int) -> bool:
+    """Returns ``True`` if two shardings are equivalent.
+
+    Two shardings are equivalent if they place the same logical array shards on
+    the same devices.
+    """
+    return common_is_equivalent_to(self, other, ndim)

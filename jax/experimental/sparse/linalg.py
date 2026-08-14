@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Union, Callable
+from collections.abc import Callable
 import functools
 
 import jax
@@ -24,14 +24,15 @@ import jax.numpy as jnp
 
 from jax.experimental import sparse
 from jax.interpreters import mlir
-from jax.interpreters import xla
 
 from jax._src import core
+from jax._src import dispatch
+from jax._src import ffi
 from jax._src.interpreters import ad
-from jax._src.lib import gpu_solver
 
 import numpy as np
-from scipy.sparse import csr_matrix, linalg
+import scipy.sparse
+import scipy.sparse.linalg
 
 
 def lobpcg_standard(
@@ -103,7 +104,7 @@ def lobpcg_standard(
     return _lobpcg_standard_matrix(A, X, m, tol, debug=False)
   return _lobpcg_standard_callable(A, X, m, tol, debug=False)
 
-@functools.partial(jax.jit, static_argnames=['m', 'debug'])
+@jax.jit(static_argnames=['m', 'debug'])
 def _lobpcg_standard_matrix(
     A: jax.Array,
     X: jax.Array,
@@ -114,7 +115,7 @@ def _lobpcg_standard_matrix(
   return _lobpcg_standard_callable(
       functools.partial(_mm, A), X, m, tol, debug)
 
-@functools.partial(jax.jit, static_argnames=['A', 'm', 'debug'])
+@jax.jit(static_argnames=['A', 'm', 'debug'])
 def _lobpcg_standard_callable(
     A: Callable[[jax.Array], jax.Array],
     X: jax.Array,
@@ -132,7 +133,7 @@ def _lobpcg_standard_callable(
   _check_inputs(A, X)
 
   if tol is None:
-    tol = jnp.finfo(dt).eps
+    tol = float(jnp.finfo(dt).eps)
 
   X = _orthonormalize(X)
   P = _extend_basis(X, X.shape[1])
@@ -235,9 +236,11 @@ def _lobpcg_standard_callable(
         lambda state, _: body(state), state, xs=None, length=m)
   else:
     state = jax.lax.while_loop(cond, body, state)
+    diagnostics = None
   i, X, _P, _R, _converged, theta = state
 
   if debug:
+    assert diagnostics is not None
     return theta[0, :], X, i, diagnostics
   return theta[0, :], X, i
 
@@ -264,7 +267,7 @@ def _check_inputs(A, X):
 
 
 def _mm(a, b, precision=jax.lax.Precision.HIGHEST):
-  return jax.lax.dot(a, b, (precision, precision))
+  return jax.lax.dot(a, b, precision=(precision, precision))
 
 def _generate_diagnostics(prev_XPR, X, P, R, theta, converged, adj_resid):
   k = X.shape[1]
@@ -533,22 +536,21 @@ def _spsolve_abstract_eval(data, indices, indptr, b, *, tol, reorder):
 
 
 def _spsolve_gpu_lowering(ctx, data, indices, indptr, b, *, tol, reorder):
-  data_aval, _, _, _, = ctx.avals_in
-  return gpu_solver.cuda_csrlsvqr(data_aval.dtype, data, indices,
-                                  indptr, b, tol, reorder)
-
+  return ffi.ffi_lowering("cusolver_csrlsvqr_ffi")(
+      ctx, data, indices, indptr, b, tol=np.float64(tol),
+      reorder=np.int32(reorder))
 
 def _spsolve_cpu_lowering(ctx, data, indices, indptr, b, tol, reorder):
   del tol, reorder
   args = [data, indices, indptr, b]
 
   def _callback(data, indices, indptr, b, **kwargs):
-    A = csr_matrix((data, indices, indptr), shape=(b.size, b.size))
-    return (linalg.spsolve(A, b).astype(b.dtype),)
+    A = scipy.sparse.csr_matrix((data, indices, indptr), shape=(b.size, b.size))
+    return (scipy.sparse.linalg.spsolve(A, b).astype(b.dtype),)
 
   result, _, _ = mlir.emit_python_callback(
       ctx, _callback, None, args, ctx.avals_in, ctx.avals_out,
-      has_side_effect=False)
+      has_side_effect=False, returns_token=False)
   return result
 
 
@@ -590,7 +592,7 @@ def _spsolve_transpose(ct, data, indices, indptr, b, **kwds):
 
 
 spsolve_p = core.Primitive('spsolve')
-spsolve_p.def_impl(functools.partial(xla.apply_primitive, spsolve_p))
+spsolve_p.def_impl(functools.partial(dispatch.apply_primitive, spsolve_p))
 spsolve_p.def_abstract_eval(_spsolve_abstract_eval)
 ad.defjvp(spsolve_p, _spsolve_jvp_lhs, None, None, _spsolve_jvp_rhs)
 ad.primitive_transposes[spsolve_p] = _spsolve_transpose
@@ -602,7 +604,9 @@ def spsolve(data, indices, indptr, b, tol=1e-6, reorder=1):
   """A sparse direct solver using QR factorization.
 
   Accepts a sparse matrix in CSR format `data, indices, indptr` arrays.
-  Currently only the CUDA GPU backend is implemented.
+  Currently only the CUDA GPU backend is implemented, the CPU backend will fall
+  back to `scipy.sparse.linalg.spsolve`. Neither the CPU nor the GPU
+  implementation support batching with `vmap`.
 
   Args:
     data : An array containing the non-zero entries of the CSR matrix.

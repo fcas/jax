@@ -21,15 +21,15 @@ import operator
 import google_benchmark
 import jax
 from jax import lax
-from jax._src.api_util import shaped_abstractify  # technically not an api fn
+from jax._src import api
+from jax._src import array
+from jax._src import core
+from jax._src import op_shardings
 from jax._src.ad_checkpoint import checkpoint  # new jax.remat implementation
 from jax._src.lib import xla_client as xc
-from jax.interpreters import xla
-from jax._src import array
-from jax._src import op_shardings
 from jax._src.pjit import pjit_check_aval_sharding
-from jax.experimental import pjit as pjit_lib
 from jax.experimental import multihost_utils
+from jax.experimental import pjit as pjit_lib
 import jax.numpy as jnp
 import numpy as np
 
@@ -73,9 +73,10 @@ class AnEnum(enum.IntEnum):
 @google_benchmark.register
 def eager_unary_dispatch(state):
   a = jax.device_put(1)
-  lax.neg(a)
+  x = lax.neg(a)
   while state:
-    lax.neg(a)
+    x = lax.neg(a)
+  x.block_until_ready()
 
 
 @google_benchmark.register
@@ -99,9 +100,10 @@ def eager_binary_dispatch(state):
 def eager_binary(state):
   a = jax.device_put(1)
   b = jax.device_put(2)
-  lax.add(a, b).block_until_ready()
+  x = lax.add(a, b).block_until_ready()
   while state:
-    lax.add(a, b).block_until_ready()
+    x = lax.add(a, b).block_until_ready()
+  x.block_until_ready()
 
 
 @google_benchmark.register
@@ -132,10 +134,11 @@ def jit_simple_dispatch(state):
   a = jax.device_put(1)
   b = jax.device_put(2)
   f = jax.jit(operator.add)
-  f(a, b)
+  x = f(a, b)
 
   while state:
-    f(a, b)
+    x = f(a, b)
+  x.block_until_ready()
 
 
 @google_benchmark.register
@@ -153,10 +156,11 @@ def jit_simple_dispatch_array(state):
   a = jax.device_put(1)
   b = jax.device_put(2)
   f = jax.jit(operator.add)
-  f(a, b)
+  x = f(a, b)
 
   while state:
-    f(a, b)
+    x = f(a, b)
+  x.block_until_ready()
 
 
 @google_benchmark.register
@@ -206,7 +210,7 @@ def jit_big_matmul(state):
 @google_benchmark.option.args([2000])
 def jit_simple_many_args_dispatch(state):
   args = [jax.device_put(i) for i in range(state.range(0))]
-  f = jax.jit(lambda xs: functools.reduce(operator.add, xs))
+  f = jax.jit(sum)
   x = f(args)
   x.block_until_ready()
 
@@ -226,7 +230,7 @@ def jit_simple_many_args_dispatch(state):
 @google_benchmark.option.args([2000])
 def jit_simple_many_args(state):
   args = [jax.device_put(i) for i in range(state.range(0))]
-  f = jax.jit(lambda xs: functools.reduce(operator.add, xs))
+  f = jax.jit(sum)
   f(args).block_until_ready()
 
   while state:
@@ -270,10 +274,11 @@ def jit_dispatch_without_transfer(state):
   imgs = jax.device_put(imgs)
 
   f = jax.jit(lambda x: x+1)
-  f(imgs)
+  x = f(imgs)
 
   while state:
-    f(imgs)
+    x = f(imgs)
+  x.block_until_ready()
 
 
 @google_benchmark.register
@@ -281,7 +286,7 @@ def jit_dispatch_with_transfer(state):
   imgs = np.ones((128, 224, 224), np.float32)
 
   f = jax.jit(lambda x: x+1)
-  f(imgs).block_until_ready()
+  x = f(imgs).block_until_ready()
 
   while state:
     x = f(imgs)
@@ -309,6 +314,8 @@ def pmap_trivial_dispatch_8_devices(state):
 
   while state:
     a, b = f(a, b)
+  a.block_until_ready()
+  b.block_until_ready()
 
 
 @google_benchmark.register
@@ -345,6 +352,8 @@ def pmap_simple_dispatch_8_devices(state):
 
   while state:
     a, b = f(a, b)
+  a.block_until_ready()
+  b.block_until_ready()
 
 
 @google_benchmark.register
@@ -372,6 +381,7 @@ def pmap_simple_dispatch_8_devices_100_args(state):
 
   while state:
     args = f(*args)
+  args[0].block_until_ready()
 
 
 @google_benchmark.register
@@ -396,6 +406,7 @@ def _run_sda_index_bench(state, num_devices):
   while state:
     for i in range(num_devices):
       _ = x[i]
+  x.block_until_ready()
 
 
 @google_benchmark.register
@@ -420,16 +431,16 @@ def sda_index_8(state):
 @google_benchmark.option.unit(google_benchmark.kMillisecond)
 def bench_shaped_abstractify(state):
   device, *_ = jax.devices()
-  args = [jax.device_put_replicated(1, [device])] * 1000
+  args = [api.device_put_replicated(1, [device])] * 1000
   while state:
-    _ = [shaped_abstractify(x) for x in args]
+    _ = [core.shaped_abstractify(x) for x in args]
 
 
-def _run_benchmark_for_xla_abstractify(arg, state):
+def _run_benchmark_for_core_typeof(arg, state):
   while state:
-    xla.abstractify(arg)
+    core.typeof(arg)
 
-def bench_xla_abstractify():
+def bench_core_typeof():
   _abstractify_args = [
       (3, 'scalar_int'),
       (3.5, 'scalar_float'),
@@ -443,15 +454,15 @@ def bench_xla_abstractify():
   for a, name in _abstractify_args:
     benchmarks.extend([
         google_benchmark.register(
-            partial(_run_benchmark_for_xla_abstractify, a),
-            name=f'bench_xla_abstractify_{name}'),
+            partial(_run_benchmark_for_core_typeof, a),
+            name=f'bench_core_typeof_{name}'),
     ])
-bench_xla_abstractify()
+bench_core_typeof()
 
 
 @google_benchmark.register
 @google_benchmark.option.unit(google_benchmark.kMicrosecond)
-def bench_are_op_shardings_equal(state):
+def bench_are_hlo_shardings_equal(state):
   op1 = xc.OpSharding()
   op1.type = xc.OpSharding.Type.OTHER
   op1.tile_assignment_dimensions = [4, 192, 16]
@@ -462,8 +473,11 @@ def bench_are_op_shardings_equal(state):
   op2.tile_assignment_dimensions = [4, 192, 16]
   op2.tile_assignment_devices = list(range(12288))
 
+  hs1 = xc.HloSharding.from_proto(op1)
+  hs2 = xc.HloSharding.from_proto(op2)
+
   while state:
-    op_shardings.are_op_shardings_equal(op1, op2)
+    op_shardings.are_hlo_shardings_equal(hs1, hs2)
 
 
 @google_benchmark.register
@@ -476,7 +490,7 @@ def bench_pjit_check_aval_sharding(state):
   aval = jax.core.ShapedArray((8, 2), np.int32)
 
   while state:
-    pjit_check_aval_sharding([s] * 100, [aval] * 100, None, 'benchmark', False)
+    pjit_check_aval_sharding([s] * 100, [aval] * 100, [''] * 100, 'benchmark', False)
 
 
 @google_benchmark.register
@@ -566,7 +580,7 @@ def bench_repeated_static_slicing(state):
   while state:
     jax.block_until_ready([x[i:i + 2] for i in range(0, 1000, 2)])
 
-def pjit_simple_benchmark(state, num_devices, num_args, cpp_jit, use_aot=False):
+def pjit_simple_benchmark(state, num_devices, num_args, use_aot=False):
   spec = jax.sharding.PartitionSpec('x')
   mesh = create_mesh((num_devices,), ('x',), state)
   if mesh is None:
@@ -593,6 +607,7 @@ def pjit_simple_benchmark(state, num_devices, num_args, cpp_jit, use_aot=False):
 
   while state:
     x = f(x)
+  x[0].block_until_ready()
 
 
 @google_benchmark.register
@@ -601,8 +616,7 @@ def pjit_simple_benchmark(state, num_devices, num_args, cpp_jit, use_aot=False):
 @google_benchmark.option.args([10])
 @google_benchmark.option.args([100])
 def pjit_simple_1_device(state):
-  pjit_simple_benchmark(
-      state, num_devices=1, num_args=state.range(0), cpp_jit=state.range(1))
+  pjit_simple_benchmark(state, num_devices=1, num_args=state.range(0))
 
 @google_benchmark.register
 @google_benchmark.option.arg_names(['num_args'])
@@ -610,8 +624,7 @@ def pjit_simple_1_device(state):
 @google_benchmark.option.args([10])
 @google_benchmark.option.args([100])
 def pjit_simple_4_device(state):
-  pjit_simple_benchmark(
-      state, num_devices=4, num_args=state.range(0), cpp_jit=state.range(1))
+  pjit_simple_benchmark(state, num_devices=4, num_args=state.range(0))
 
 @google_benchmark.register
 @google_benchmark.option.arg_names(['num_args'])
@@ -619,8 +632,7 @@ def pjit_simple_4_device(state):
 @google_benchmark.option.args([10])
 @google_benchmark.option.args([100])
 def pjit_simple_4000_device(state):
-  pjit_simple_benchmark(
-      state, num_devices=4000, num_args=state.range(0), cpp_jit=state.range(1))
+  pjit_simple_benchmark(state, num_devices=4000, num_args=state.range(0))
 
 
 @google_benchmark.register
@@ -633,7 +645,6 @@ def pjit_aot_1_device(state):
       state,
       num_devices=1,
       num_args=state.range(0),
-      cpp_jit=state.range(1),
       use_aot=True)
 
 
@@ -647,7 +658,6 @@ def pjit_aot_4_device(state):
       state,
       num_devices=4,
       num_args=state.range(0),
-      cpp_jit=state.range(1),
       use_aot=True)
 
 
@@ -661,7 +671,6 @@ def pjit_aot_4000_device(state):
       state,
       num_devices=4000,
       num_args=state.range(0),
-      cpp_jit=state.range(1),
       use_aot=True)
 
 
@@ -677,11 +686,32 @@ def host_local_array_to_global_array(state):
     multihost_utils.host_local_array_to_global_array(
         (input_data, input_data), global_mesh, (in_pspec, in_pspec))
 
+
 @google_benchmark.register
-def device_put(state):
-  x = np.array(1, np.int32)
+@google_benchmark.option.arg_names(['num_args'])
+@google_benchmark.option.args([1])
+@google_benchmark.option.args([10])
+@google_benchmark.option.args([100])
+@google_benchmark.option.args([1000])
+def device_put_from_numpy_array(state):
+  x = [np.array(1, np.int32)] * state.range(0)
   while state:
-    _ = jax.device_put(x).block_until_ready()
+    _ = jax.block_until_ready(jax.device_put(x))
+
+
+@google_benchmark.register
+@google_benchmark.option.arg_names(['num_args'])
+@google_benchmark.option.args([1])
+@google_benchmark.option.args([10])
+@google_benchmark.option.args([100])
+@google_benchmark.option.args([1000])
+@required_devices(2)
+def device_put_from_jax_array(state):
+  x = [np.array(1, np.int32)] * state.range(0)
+  x = jax.block_until_ready(jax.device_put(x, device=jax.devices()[0]))
+  d = jax.devices()[1]
+  while state:
+    _ = jax.block_until_ready(jax.device_put(x, device=d))
 
 
 @google_benchmark.register
@@ -700,7 +730,7 @@ def device_put_sharded(state):
   dev = jax.devices()
 
   while state:
-    _ = jax.device_put_sharded(arr_inp, dev).block_until_ready()
+    _ = api.device_put_sharded(arr_inp, dev).block_until_ready()
 
 
 @google_benchmark.register
@@ -819,7 +849,7 @@ def serial_dot_products(state):
       out = out + y * x[0]
     return out
 
-  x = jax.random.normal(jax.random.PRNGKey(0), (2, 2))
+  x = jax.random.normal(jax.random.key(0), (2, 2))
   f(x).block_until_ready()  # compile
   while state:
     f(x).block_until_ready()
@@ -832,7 +862,7 @@ def safe_map(state):
   args = tuple(list(range(state.range(0))) for _ in range(state.range(1)))
   def f(*args): return tuple(args)
   while state:
-    jax.util.safe_map(f, *args)
+    jax._src.util.safe_map(f, *args)
 
 @google_benchmark.register
 @google_benchmark.option.arg_names(['arg_lengths', 'num_args'])
@@ -840,19 +870,49 @@ def safe_map(state):
 def safe_zip(state):
   args = tuple(list(range(state.range(0))) for _ in range(state.range(1)))
   while state:
-    jax.util.safe_zip(*args)
+    jax._src.util.safe_zip(*args)
 
 
 @google_benchmark.register
 def bench_make_array_from_callback_fully_replicated_sharding(state):
-  mesh = jax.sharding.Mesh(
-      np.array(jax.devices()[:8]).reshape((4, 2)), ('x', 'y'))
-  shape = (8, 2)
-  np_arr = np.arange(16).reshape(shape)
-  s = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+  mesh = create_mesh((4, 2), ('x', 'y'), state)
+  if mesh is None:
+    return
+  input_shape = (8, 2)
+  np_arr = np.arange(math.prod(input_shape)).reshape(input_shape)
 
+  s = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
   while state:
-    jax.make_array_from_callback(shape, s, np_arr.__getitem__)
+    jax.make_array_from_callback(input_shape, s, np_arr.__getitem__)
+
+
+@google_benchmark.register
+@google_benchmark.option.unit(google_benchmark.kMillisecond)
+def bench_make_array_from_callback_partially_replicated_sharding(state):
+  mesh = create_mesh((4, 2), ('x', 'y'), state)
+  if mesh is None:
+    return
+  input_shape = (8, 2)
+  np_arr = np.arange(math.prod(input_shape)).reshape(input_shape)
+
+  s = jax.NamedSharding(mesh, jax.sharding.PartitionSpec(None, 'y'))
+  while state:
+    jax.make_array_from_callback(input_shape, s, np_arr.__getitem__)
+
+
+@google_benchmark.register
+@google_benchmark.option.unit(google_benchmark.kMillisecond)
+def bench_make_array_from_callback_fully_sharded_sharding(state):
+  mesh = create_mesh((4, 2), ('x', 'y'), state)
+  if mesh is None:
+    return
+  input_shape = (8, 2)
+  np_arr = np.arange(math.prod(input_shape)).reshape(input_shape)
+
+  s = jax.NamedSharding(mesh, jax.sharding.PartitionSpec('x', 'y'))
+  while state:
+    jax.make_array_from_callback(input_shape, s, np_arr.__getitem__)
+
 
 @google_benchmark.register
 @google_benchmark.option.unit(google_benchmark.kMillisecond)
@@ -884,6 +944,24 @@ def benchmark_lorentz63_cache_hits(state):
   x = jnp.ones((8, 3))
   while state:
     jax.make_jaxpr(lambda x: training_step(x, 100, unroll=True))(x)
+
+
+@google_benchmark.register
+def jit_add_chain(state):
+  SIZE = 100
+
+  @jax.jit
+  def g(x, y):
+    return lax.add(x, y)
+
+  x = jax.random.normal(jax.random.key(0), (2, 2))
+  while state:
+    @jax.jit
+    def f(x):
+      for i in range(SIZE):
+        x = g(x, x)
+      return x
+    f(x).block_until_ready()
 
 
 if __name__ == "__main__":

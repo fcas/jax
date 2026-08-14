@@ -89,8 +89,8 @@ from typing import Any
 import jax
 import numpy as np
 from jax._src import core
+from jax._src import dispatch
 from jax.interpreters import mlir
-from jax.interpreters import xla
 from jax._src.custom_derivatives import custom_vjp
 from jax._src.typing import Array, Shape
 from jax._src.lax import lax
@@ -98,7 +98,7 @@ import jax.numpy as jnp
 try:
   from jax._src.lib import gpu_rnn
 except ImportError:
-  gpu_rnn = None  # type: ignore[assignment]
+  gpu_rnn = None
 
 PRNGKeyArray = Any
 sigmoid = jax.nn.sigmoid
@@ -175,6 +175,31 @@ def init_lstm_weight(rng: PRNGKeyArray, input_size: int, hidden_size: int,
   return jax.random.uniform(
       rng, shape=(param_count,), dtype=jnp.float32, minval=-k, maxval=k)
 
+def swap_lstm_gates(weights, input_size, hidden_size, num_layers, bidirectional):
+  """Swaps the weights for the input and output gates for an LSTM model."""
+  weights = jnp.asarray(weights)  # Ensure weights are JAX arrays
+  flat_shapes = _get_params_shapes_in_lstm(input_size, hidden_size, num_layers, bidirectional)
+  num_directions = 2 if bidirectional else 1
+
+  w_offsets = 0
+  for l in range(num_layers):
+    for direction in range(num_directions):
+      # Iterate through all weight and bias gate names to swap gates in both weights and biases
+      for gate_name in ["W_ih", "W_hh", "b_ih", "b_hh"]:
+        shape = flat_shapes.pop(0)  # Get the current shape and remove it from the list
+        num_elems = math.prod(shape)
+        matrix = weights[w_offsets:w_offsets + num_elems].reshape(shape)
+
+        # Swap between the input and output gates (third and fourth gates)
+        gates = jnp.split(matrix, 4, axis=0)
+        swapped_matrix = jnp.concatenate([gates[0], gates[1], gates[3], gates[2]], axis=0)
+
+        # Update the weights with swapped matrix
+        weights = weights.at[w_offsets:w_offsets + num_elems].set(swapped_matrix.flatten())
+        w_offsets += num_elems
+
+  return weights
+
 
 def unpack_lstm_weights(
     weights: Array, input_size: int, hidden_size: int, num_layers: int,
@@ -228,18 +253,18 @@ def _lstm_cudnn_allow_tf32(precision: lax.PrecisionLike) -> bool:
   #
   # but we prefer to still invoke it here for consistency
   precision = lax.canonicalize_precision(precision)
-  if precision is None:
+  if precision is None or not (isinstance(precision, tuple) and len(precision) == 2):
     return True
   # cuDNN allows only one precision specifier per RNN op
-  precision, _ = precision
-  if precision == lax.Precision.HIGHEST:
-    return False
-  elif precision == lax.Precision.HIGH:
-    return True
-  elif precision == lax.Precision.DEFAULT: # bfloat16
-    raise NotImplementedError("bfloat16 support not implemented for LSTM")
-  else:
-    raise ValueError(f"Unexpected precision specifier value {precision}")
+  match precision:
+    case (lax.Precision.HIGHEST, _):
+      return False
+    case (lax.Precision.HIGH, _):
+      return True
+    case (lax.Precision.DEFAULT, _): # bfloat16
+      raise NotImplementedError("bfloat16 support not implemented for LSTM")
+    case _:
+      raise ValueError(f"Unexpected precision specifier value {precision}")
 
 
 @partial(custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10))
@@ -276,7 +301,7 @@ def lstm(x: Array, h_0: Array, c_0: Array, weights: Array, seq_lengths: Array,
   return y, h_n, c_n
 
 
-@partial(jax.jit, static_argnums=(8, 9, 10, 11, 12))
+@jax.jit(static_argnums=(8, 9, 10, 11, 12))
 def lstm_ref(x: Array, h_0: Array, c_0: Array, W_ih: dict[int, Array],
              W_hh: dict[int, Array], b_ih: dict[int, Array],
              b_hh: dict[int, Array], seq_lengths: Array, input_size: int,
@@ -342,6 +367,7 @@ def lstm_ref(x: Array, h_0: Array, c_0: Array, W_ih: dict[int, Array],
   # bidirectional
   final_h = []
   final_c = []
+  seq_first_y_fwd: Array | None = None
   for l in range(num_layers * 2):
     cell = partial(
         lstm_cell, W_ih=W_ih[l], W_hh=W_hh[l], b_ih=b_ih[l], b_hh=b_hh[l])
@@ -359,7 +385,8 @@ def lstm_ref(x: Array, h_0: Array, c_0: Array, W_ih: dict[int, Array],
       # align reversed sequence with original sequence
       seq_first_y_bwd = _flip_sequence(seq_first_y_bwd, seq_lengths)
       # Inputs to next layer are concat'ed from fwd and bwd.
-      seq_first_y = jnp.concatenate([seq_first_y_fwd, seq_first_y_bwd], axis=-1)  # pytype: disable=name-error
+      assert seq_first_y_fwd is not None
+      seq_first_y = jnp.concatenate([seq_first_y_fwd, seq_first_y_bwd], axis=-1)
     final_h.append(h_t)
     final_c.append(c_t)
   h_n = jnp.stack(final_h)
@@ -421,23 +448,22 @@ def rnn_abstract_eval(x_aval, h_0_aval, c_0_aval, w_aval, seq_lengths_aval,
   output_shape = (batch_size, max_seq_length, num_directions * hidden_size)
   output_aval = core.ShapedArray(output_shape, x_aval.dtype)
   _, reserve_space_size = (
-      gpu_rnn.compute_rnn_workspace_reserve_space_sizes(  # pytype: disable=attribute-error
+      # pyrefly: ignore[missing-attribute]
+      gpu_rnn.compute_rnn_workspace_reserve_space_sizes(
           input_size, hidden_size, num_layers, batch_size, max_seq_length,
           dropout, bidirectional, cudnn_allow_tf32))
   reserve_space_aval = core.ShapedArray((reserve_space_size,), jnp.float32)
   return output_aval, h_0_aval, c_0_aval, reserve_space_aval
 
 
-def _gpu_lowering_strip_tf32(fn, *args, cudnn_allow_tf32, **kw):
-  del cudnn_allow_tf32
-  return fn(*args, **kw)
-
 rnn_fwd_p = core.Primitive('rnn_fwd')
 rnn_fwd_p.multiple_results = True
-rnn_fwd_p.def_impl(partial(xla.apply_primitive, rnn_fwd_p))
+rnn_fwd_p.def_impl(partial(dispatch.apply_primitive, rnn_fwd_p))
 rnn_fwd_p.def_abstract_eval(rnn_abstract_eval)
 if gpu_rnn:
   mlir.register_lowering(rnn_fwd_p, gpu_rnn.cudnn_rnn_lowering, platform='cuda')
+  if hasattr(gpu_rnn, "miopen_rnn_lowering"):
+    mlir.register_lowering(rnn_fwd_p, gpu_rnn.miopen_rnn_lowering, platform='rocm')
 
 
 def lstm_bwd(input_size: int, hidden_size: int, num_layers: int, dropout: float,
@@ -466,7 +492,7 @@ def lstm_bwd(input_size: int, hidden_size: int, num_layers: int, dropout: float,
   return (dx, dh_0, dc_0, dw, jnp.zeros_like(seq_lengths))
 
 
-def rnn_bwd_abstract_eval(dy_aval, dhn_aval, dcn_aval, x_aval, h0_aval, c0_aval,  # type: ignore
+def rnn_bwd_abstract_eval(dy_aval, dhn_aval, dcn_aval, x_aval, h0_aval, c0_aval,
                           w_aval, y_aval, reserve_space_aval,
                           seq_lengths_aval, input_size: int, hidden_size: int,
                           num_layers: int, dropout: float, bidirectional: bool,
@@ -476,10 +502,13 @@ def rnn_bwd_abstract_eval(dy_aval, dhn_aval, dcn_aval, x_aval, h0_aval, c0_aval,
 
 rnn_bwd_p = core.Primitive('rnn_bwd')
 rnn_bwd_p.multiple_results = True
-rnn_bwd_p.def_impl(partial(xla.apply_primitive, rnn_bwd_p))
+rnn_bwd_p.def_impl(partial(dispatch.apply_primitive, rnn_bwd_p))
 rnn_bwd_p.def_abstract_eval(rnn_bwd_abstract_eval)
 if gpu_rnn:
   mlir.register_lowering(
       rnn_bwd_p, gpu_rnn.cudnn_rnn_bwd_lowering, platform='cuda')
+  if hasattr(gpu_rnn, "miopen_rnn_bwd_lowering"):
+    mlir.register_lowering(
+        rnn_bwd_p, gpu_rnn.miopen_rnn_bwd_lowering, platform='rocm')
 
 lstm.defvjp(lstm_fwd, lstm_bwd)

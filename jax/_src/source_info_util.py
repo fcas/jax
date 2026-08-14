@@ -14,20 +14,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Generator, Iterator
 import contextlib
 import dataclasses
 import functools
 import itertools
 import os.path
 import re
-import sys
 import sysconfig
 import threading
 import types
-from typing import NamedTuple
+from typing import Any, NamedTuple, cast
 
-import jax.version
 from jax._src.lib import xla_client
 
 from jax._src import traceback_util
@@ -48,11 +46,11 @@ class Frame(NamedTuple):
 _exclude_paths: list[str] = [
     # Attach the separator to make sure that .../jax does not end up matching
     # .../jax_triton and other packages that might have a jax prefix.
-    os.path.dirname(jax.version.__file__) + os.sep,
+    os.path.dirname(os.path.dirname(__file__)) + os.sep,
     # Also exclude stdlib as user frames. In a non-standard Python runtime,
-    # the following two may be different.
+    # the following may be different.
     sysconfig.get_path('stdlib'),
-    os.path.dirname(sysconfig.__file__)
+    os.path.dirname(contextlib.__file__),
 ]
 
 @functools.cache
@@ -86,32 +84,25 @@ def register_inclusion(path: str):
 class Scope(NamedTuple):
   name: str
 
-  def wrap(self, stack: tuple[str, ...]) -> tuple[str, ...]:
-    return (self.name, *stack)
+  def wrap(self, stack: list[str]):
+    stack.append(self.name)
 
 class Transform(NamedTuple):
   name: str
 
-  def wrap(self, stack: tuple[str, ...]) -> tuple[str, ...]:
+  def wrap(self, stack: list[str]):
     if stack:
-      return (f'{self.name}({stack[0]})', *stack[1:])
+      stack[-1] = f'{self.name}({stack[-1]})'
     else:
-      return ()
+      stack.append(f'{self.name}()')
 
-@dataclasses.dataclass(frozen=True)
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class NameStack:
   stack: tuple[Scope | Transform, ...] = ()
 
-  def extend(self, name: tuple[str, ...] | str) -> NameStack:
-    if not isinstance(name, tuple):
-      name = (name,)
-    scopes = tuple(map(Scope, name))
-    return NameStack(self.stack + scopes)
-
-  def wrap_name(self, name: str) -> str:
-    if not self.stack:
-      return name
-    return f'{self}/{name}'
+  def extend(self, name: str) -> NameStack:
+    return NameStack((*self.stack, Scope(name)))
 
   def transform(self, transform_name: str) -> NameStack:
     return NameStack((*self.stack, Transform(transform_name)))
@@ -129,10 +120,10 @@ class NameStack:
     return NameStack(other.stack + self.stack)
 
   def __str__(self) -> str:
-    scope: tuple[str, ...] = ()
+    scope: list[str] = []
     for elem in self.stack[::-1]:
-      scope = elem.wrap(scope)
-    return '/'.join(scope)
+      elem.wrap(scope)
+    return '/'.join(reversed(scope))
 
 
 def new_name_stack(name: str = '') -> NameStack:
@@ -142,9 +133,16 @@ def new_name_stack(name: str = '') -> NameStack:
   return name_stack
 
 
-class SourceInfo(NamedTuple):
+class SourceInfo:
   traceback: Traceback | None
   name_stack: NameStack
+
+  # It's slightly faster to use a class with __slots__ than a NamedTuple.
+  __slots__ = ['traceback', 'name_stack']
+
+  def __init__(self, traceback: Traceback | None, name_stack: NameStack):
+    self.traceback = traceback
+    self.name_stack = name_stack
 
   def replace(self, *, traceback: Traceback | None = None,
       name_stack: NameStack | None = None) -> SourceInfo:
@@ -162,23 +160,17 @@ def is_user_filename(filename: str) -> bool:
   return (_include_path_regex().search(filename) is not None
           or _exclude_path_regex().search(filename) is None)
 
-if sys.version_info >= (3, 11):
-  def raw_frame_to_frame(code: types.CodeType, lasti: int) -> Frame:
-    loc = xla_client.Traceback.code_addr2location(code, lasti)
-    start_line, start_column, end_line, end_column = loc
-    return Frame(file_name=code.co_filename,
-                function_name=code.co_qualname,
-                start_line=start_line, start_column=start_column,
-                end_line=end_line, end_column=end_column)
-else:
-  def raw_frame_to_frame(code: types.CodeType, lasti: int) -> Frame:
-    # pre-3.11 co_qualname does not exist, use co_name
-    return Frame(file_name=code.co_filename,
-                function_name=code.co_name,
-                start_line=xla_client.Traceback.code_addr2line(code, lasti),
-                start_column=0, end_line=0, end_column=0)
 
-def user_frames(source_info: SourceInfo) -> Iterator[Frame]:
+def raw_frame_to_frame(code: types.CodeType, lasti: int) -> Frame:
+  loc = xla_client.Traceback.code_addr2location(code, lasti)
+  start_line, start_column, end_line, end_column = loc
+  return Frame(file_name=code.co_filename,
+              function_name=code.co_qualname,
+              start_line=start_line, start_column=start_column,
+              end_line=end_line, end_column=end_column)
+
+
+def user_frames(traceback: Traceback | None) -> Iterator[Frame]:
   """Iterator over the user's frames, filtering jax-internal frames."""
   # Guess the user's frame is the innermost frame not in the jax source tree or
   # Python stdlib. We don't use traceback_util.path_starts_with because that
@@ -186,14 +178,13 @@ def user_frames(source_info: SourceInfo) -> Iterator[Frame]:
   # e.g. adding source provenance annotations to XLA lowerings, so we don't
   # want to incur the cost. We consider files that end with _test.py as user
   # frames, to allow testing this mechanism from tests.
-  traceback = source_info.traceback
   code, lasti = traceback.raw_frames() if traceback else ([], [])
-  return (raw_frame_to_frame(code[i], lasti[i]) for i in range(len(code))  # type: ignore
+  return (raw_frame_to_frame(code[i], lasti[i]) for i in range(len(code))
           if is_user_filename(code[i].co_filename))
 
 @functools.lru_cache(maxsize=64)
-def user_frame(source_info: SourceInfo) -> Frame | None:
-  return next(user_frames(source_info), None)
+def user_frame(traceback: Traceback | None) -> Frame | None:
+  return next(user_frames(traceback), None)
 
 def _summarize_frame(frame: Frame) -> str:
   if frame.start_column != 0:
@@ -203,7 +194,7 @@ def _summarize_frame(frame: Frame) -> str:
     return f"{frame.file_name}:{frame.start_line} ({frame.function_name})"
 
 def summarize(source_info: SourceInfo, num_frames=1) -> str:
-  frames = itertools.islice(user_frames(source_info), num_frames)
+  frames = itertools.islice(user_frames(source_info.traceback), num_frames)
   frame_strs = [_summarize_frame(frame) if frame else "unknown"
                 for frame in frames]
   return '\n'.join(reversed(frame_strs))
@@ -236,68 +227,124 @@ def has_user_context(e):
     e = e.__cause__
   return False
 
-@contextlib.contextmanager
-def user_context(c: Traceback | None, *, name_stack: NameStack | None = None):
-  prev = _source_info_context.context
-  _source_info_context.context = _source_info_context.context.replace(
-      traceback=c, name_stack=name_stack)
-  filtered_tb = None
-  try:
-    yield
-  except Exception as e:
-    if c is None or has_user_context(e):
-      raise
-    filtered_tb = traceback_util.filter_traceback(c.as_python_traceback())
+class UserContextManager:
+  __slots__ = ['traceback', 'name_stack', 'prev']
+
+  def __init__(self, traceback: Traceback | None, *,
+               name_stack: NameStack | None = None):
+    self.traceback = traceback
+    self.name_stack = name_stack
+
+  def __enter__(self):
+    self.prev = _source_info_context.context
+    _source_info_context.context = _source_info_context.context.replace(
+        traceback=self.traceback, name_stack=self.name_stack)
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    _source_info_context.context = self.prev
+    if exc_type is None or exc_value is None:
+      return
+
+    if self.traceback is None or has_user_context(exc_value):
+      return
+
+    filtered_tb = traceback_util.filter_traceback(self.traceback.as_python_traceback())
     if filtered_tb:
-      msg = traceback_util.format_exception_only(e)
+      msg = traceback_util.format_exception_only(exc_value)
       msg = f'{msg}\n\n{_message}'
       exp = JaxStackTraceBeforeTransformation(msg).with_traceback(filtered_tb)
-      exp.__context__ = e.__context__
-      exp.__cause__ = e.__cause__
-      exp.__suppress_context__ = e.__suppress_context__
-      e.__context__ = None
-      e.__cause__ = exp
-    raise
-  finally:
-    _source_info_context.context = prev
-    del filtered_tb
+      exp.__context__ = exc_value.__context__
+      exp.__cause__ = exc_value.__cause__
+      exp.__suppress_context__ = exc_value.__suppress_context__
+      exc_value.__context__ = None
+      exc_value.__cause__ = exp
+
+user_context = UserContextManager
+
 
 def current_name_stack() -> NameStack:
   return _source_info_context.context.name_stack
 
-@contextlib.contextmanager
-def extend_name_stack(name: str) -> Iterator[NameStack]:
-  prev_context = _source_info_context.context
-  curr_name_stack = prev_context.name_stack
-  new_context = prev_context.replace(name_stack=curr_name_stack.extend(name))
-  _source_info_context.context = new_context
-  try:
-    yield _source_info_context.context.name_stack
-  finally:
-    _source_info_context.context = prev_context
 
-@contextlib.contextmanager
-def set_name_stack(name_stack: NameStack) -> Iterator[None]:
-  prev_context = _source_info_context.context
-  new_context = prev_context.replace(name_stack=name_stack)
-  _source_info_context.context = new_context
-  try:
-    yield
-  finally:
-    _source_info_context.context = prev_context
+class ExtendNameStackContextManager:
+  __slots__ = ['name', 'prev']
 
+  def __init__(self, name: str):
+    self.name = name
+
+  def __enter__(self):
+    self.prev = prev = _source_info_context.context
+    name_stack = prev.name_stack.extend(self.name)
+    _source_info_context.context = prev.replace(name_stack=name_stack)
+    return name_stack
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    _source_info_context.context = self.prev
+
+  def __call__[F: Callable[..., Any]](self, func: F) -> F:
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+      with ExtendNameStackContextManager(self.name):
+        return func(*args, **kwargs)
+    return cast(F, wrapper)
+
+extend_name_stack = ExtendNameStackContextManager
+
+
+class SetNameStackContextManager:
+  __slots__ = ['name_stack', 'prev']
+
+  def __init__(self, name_stack: NameStack):
+    self.name_stack = name_stack
+
+  def __enter__(self):
+    self.prev = prev = _source_info_context.context
+    _source_info_context.context = prev.replace(name_stack=self.name_stack)
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    _source_info_context.context = self.prev
+
+  def __call__[F: Callable[..., Any]](self, func: F) -> F:
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+      with SetNameStackContextManager(self.name_stack):
+        return func(*args, **kwargs)
+    return cast(F, wrapper)
+
+
+set_name_stack = SetNameStackContextManager
+
+
+# TODO(mattjj,phawkins): figure out why the commented-out reset_name_stack
+# implementation doesn't work. Luckily this context manager isn't called much so
+# the performance shouldn't matter. See blame commit message for repro.
+# reset_name_stack = lambda: SetNameStackContextManager(NameStack())
 @contextlib.contextmanager
-def reset_name_stack() -> Iterator[None]:
+def reset_name_stack() -> Generator[None]:
   with set_name_stack(NameStack()):
     yield
 
-@contextlib.contextmanager
-def transform_name_stack(name: str) -> Iterator[NameStack]:
-  prev_context = _source_info_context.context
-  curr_name_stack = prev_context.name_stack
-  new_context = prev_context.replace(name_stack=curr_name_stack.transform(name))
-  _source_info_context.context = new_context
-  try:
-    yield _source_info_context.context.name_stack
-  finally:
-    _source_info_context.context = prev_context
+
+class TransformNameStackContextManager:
+  __slots__ = ['name', 'prev']
+
+  def __init__(self, name: str):
+    self.name = name
+
+  def __enter__(self):
+    self.prev = prev = _source_info_context.context
+    name_stack = prev.name_stack.transform(self.name)
+    _source_info_context.context = prev.replace(name_stack=name_stack)
+    return name_stack
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    _source_info_context.context = self.prev
+
+  def __call__[F: Callable[..., Any]](self, func: F) -> F:
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+      with TransformNameStackContextManager(self.name):
+        return func(*args, **kwargs)
+    return cast(F, wrapper)
+
+transform_name_stack = TransformNameStackContextManager

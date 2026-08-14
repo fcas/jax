@@ -14,53 +14,82 @@
 
 from __future__ import annotations
 
-from functools import partial
 import math
 import operator
 from typing import cast, NamedTuple
 
 import numpy as np
 
-from jax import jit
-from jax import lax
-
+from jax._src import api
 from jax._src import core
 from jax._src import dtypes
-from jax._src.lax import lax as lax_internal
+from jax._src.lax import lax
+from jax._src.lax import slicing as lax_slicing
+from jax._src.lax import utils as lax_utils
+from jax._src.numpy.array_creation import empty, full, full_like, ones, zeros
 from jax._src.numpy.lax_numpy import (
-    append, arange, array, asarray, concatenate, diff,
-    empty, full_like, lexsort, moveaxis, nonzero, ones, ravel,
-    sort, where, zeros)
+    append, arange, concatenate, diff,
+    moveaxis, nonzero, ravel, sort, where)
 from jax._src.numpy.reductions import any, cumsum
+from jax._src.numpy.sorting import lexsort
 from jax._src.numpy.ufuncs import isnan
-from jax._src.numpy.util import check_arraylike
-from jax._src.util import canonicalize_axis
+from jax._src.numpy.util import ensure_arraylike, promote_dtypes
+from jax._src.util import canonicalize_axis, set_module
 from jax._src.typing import Array, ArrayLike
 
 
-_lax_const = lax_internal._const
+export = set_module('jax.numpy')
 
 
-@partial(jit, static_argnames=('invert',))
-def _in1d(ar1: ArrayLike, ar2: ArrayLike, invert: bool) -> Array:
-  check_arraylike("in1d", ar1, ar2)
-  ar1_flat = ravel(ar1)
-  ar2_flat = ravel(ar2)
-  # Note: an algorithm based on searchsorted has better scaling, but in practice
-  # is very slow on accelerators because it relies on lax control flow. If XLA
-  # ever supports binary search natively, we should switch to this:
-  #   ar2_flat = jnp.sort(ar2_flat)
-  #   ind = jnp.searchsorted(ar2_flat, ar1_flat)
-  #   if invert:
-  #     return ar1_flat != ar2_flat[ind]
-  #   else:
-  #     return ar1_flat == ar2_flat[ind]
-  if invert:
-    return (ar1_flat[:, None] != ar2_flat[None, :]).all(-1)
+@api.jit(static_argnames=('assume_unique', 'invert', 'method'))
+def _in1d(ar1: ArrayLike, ar2: ArrayLike, invert: bool,
+          method='auto', assume_unique=False) -> Array:
+  ar1, ar2 = ensure_arraylike("in1d", ar1, ar2)
+  arr1, arr2 = promote_dtypes(ar1, ar2)
+  arr1, arr2 = arr1.ravel(), arr2.ravel()
+  if arr1.size == 0 or arr2.size == 0:
+    return (ones if invert else zeros)(arr1.shape, dtype=bool)
+  if method in ['auto', 'compare_all']:
+    if invert:
+      return (arr1[:, None] != arr2[None, :]).all(-1)
+    else:
+      return (arr1[:, None] == arr2[None, :]).any(-1)
+  elif method == 'binary_search':
+    from jax._src.numpy.lax_numpy import searchsorted
+
+    arr2 = lax.sort(arr2)
+    ind = searchsorted(arr2, arr1)
+    if invert:
+      return arr1 != arr2[ind]
+    else:
+      return arr1 == arr2[ind]
+  elif method == 'sort':
+    if assume_unique:
+      ind_out: slice | Array = slice(None)
+    else:
+      arr1, ind_out = unique(arr1, size=len(arr1), return_inverse=True, fill_value=arr2.max())
+    aux, ind = lax.sort_key_val(concatenate([arr1, arr2]), arange(arr1.size + arr2.size))
+    if invert:
+      return ones(arr1.shape, bool).at[ind[:-1]].set(aux[1:] != aux[:-1], mode='drop')[ind_out]
+    else:
+      return zeros(arr1.shape, bool).at[ind[:-1]].set(aux[1:] == aux[:-1], mode='drop')[ind_out]
   else:
-    return (ar1_flat[:, None] == ar2_flat[None, :]).any(-1)
+    raise ValueError(f"{method=} is not implemented; options are "
+                     "'compare_all', 'binary_search', 'sort', and 'auto'")
 
 
+def _concat_unique(arr1: Array, arr2: Array) -> tuple[Array, Array]:
+  """Utility to concatenate the unique values from two arrays."""
+  arr1, arr2 = ravel(arr1), ravel(arr2)
+  arr1, num_unique1 = _unique(arr1, axis=0, size=arr1.size, return_true_size=True)
+  arr2, num_unique2 = _unique(arr2, axis=0, size=arr2.size, return_true_size=True)
+  arr = zeros(arr1.size + arr2.size, dtype=dtypes.result_type(arr1, arr2))
+  arr = lax_slicing.dynamic_update_slice(arr, arr1, (0,))
+  arr = lax_slicing.dynamic_update_slice(arr, arr2, (num_unique1,))
+  return arr, num_unique1 + num_unique2
+
+
+@export
 def setdiff1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False,
               *, size: int | None = None, fill_value: ArrayLike | None = None) -> Array:
   """Compute the set difference of two 1D arrays.
@@ -68,10 +97,9 @@ def setdiff1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False,
   JAX implementation of :func:`numpy.setdiff1d`.
 
   Because the size of the output of ``setdiff1d`` is data-dependent, the function
-  semantics are not typically compatible with :func:`~jax.jit` and other JAX
-  transformations. The JAX version adds the optional ``size`` argument which
-  must be specified statically for ``jnp.setdiff1d`` to be used in such contexts.
-  transformations.
+  is not typically compatible with :func:`~jax.jit` and other JAX transformations.
+  The JAX version adds the optional ``size`` argument which must be specified statically
+  for ``jnp.setdiff1d`` to be used in such contexts.
 
   Args:
     ar1: first array of elements to be differenced.
@@ -108,7 +136,7 @@ def setdiff1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False,
     Traceback (most recent call last):
        ...
     ConcretizationTypeError: Abstract tracer value encountered where concrete value is expected: traced array with shape int32[4].
-    The error occurred while tracing the function setdiff1d at /Users/vanderplas/github/google/jax/jax/_src/numpy/setops.py:64 for jit. This concrete value was not available in Python because it depends on the value of the argument ar1.
+    The error occurred while tracing the function setdiff1d at /Users/vanderplas/github/jax-ml/jax/jax/_src/numpy/setops.py:64 for jit. This concrete value was not available in Python because it depends on the value of the argument ar1.
 
     In order to ensure statically-known output shapes, you can pass a static ``size``
     argument:
@@ -127,18 +155,21 @@ def setdiff1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False,
     >>> jit_setdiff1d(ar1, ar2, size=4, fill_value=0)
     Array([1, 2, 0, 0], dtype=int32)
   """
-  check_arraylike("setdiff1d", ar1, ar2)
+  arr1, arr2 = ensure_arraylike("setdiff1d", ar1, ar2)
+  arr1 = arr1.ravel()
+  arr2 = arr2.ravel()
+
   if size is None:
-    ar1 = core.concrete_or_error(None, ar1, "The error arose in setdiff1d()")
+    core.concrete_or_error(None, ar1, "The error arose in setdiff1d()")
   else:
     size = core.concrete_or_error(operator.index, size, "The error arose in setdiff1d()")
-  arr1 = asarray(ar1)
-  fill_value = asarray(0 if fill_value is None else fill_value, dtype=arr1.dtype)
+  fill_value = full_like(arr1, fill_value=(0 if fill_value is None else fill_value),
+                         shape=())
   if arr1.size == 0:
     return full_like(arr1, fill_value, shape=size or 0)
   if not assume_unique:
     arr1 = cast(Array, unique(arr1, size=size and arr1.size))
-  mask = _in1d(arr1, ar2, invert=True)
+  mask = _in1d(arr1, arr2, invert=True, assume_unique=assume_unique)
   if size is None:
     return arr1[mask]
   else:
@@ -149,6 +180,7 @@ def setdiff1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False,
     return where(arange(size) < mask.sum(), arr1[where(mask, size=size)], fill_value)
 
 
+@export
 def union1d(ar1: ArrayLike, ar2: ArrayLike,
             *, size: int | None = None, fill_value: ArrayLike | None = None) -> Array:
   """Compute the set union of two 1D arrays.
@@ -156,10 +188,9 @@ def union1d(ar1: ArrayLike, ar2: ArrayLike,
   JAX implementation of :func:`numpy.union1d`.
 
   Because the size of the output of ``union1d`` is data-dependent, the function
-  semantics are not typically compatible with :func:`~jax.jit` and other JAX
-  transformations. The JAX version adds the optional ``size`` argument which
-  must be specified statically for ``jnp.union1d`` to be used in such contexts.
-  transformations.
+  is not typically compatible with :func:`~jax.jit` and other JAX transformations.
+  The JAX version adds the optional ``size`` argument which must be specified
+  statically for ``jnp.union1d`` to be used in such contexts.
 
   Args:
     ar1: first array of elements to be unioned.
@@ -192,7 +223,7 @@ def union1d(ar1: ArrayLike, ar2: ArrayLike,
     Traceback (most recent call last):
        ...
     ConcretizationTypeError: Abstract tracer value encountered where concrete value is expected: traced array with shape int32[4].
-    The error occurred while tracing the function union1d at /Users/vanderplas/github/google/jax/jax/_src/numpy/setops.py:101 for jit. This concrete value was not available in Python because it depends on the value of the argument ar1.
+    The error occurred while tracing the function union1d at /Users/vanderplas/github/jax-ml/jax/jax/_src/numpy/setops.py:101 for jit. This concrete value was not available in Python because it depends on the value of the argument ar1.
 
     In order to ensure statically-known output shapes, you can pass a static ``size``
     argument:
@@ -211,7 +242,7 @@ def union1d(ar1: ArrayLike, ar2: ArrayLike,
     >>> jit_union1d(ar1, ar2, size=8, fill_value=0)
     Array([1, 2, 3, 4, 5, 6, 0, 0], dtype=int32)
   """
-  check_arraylike("union1d", ar1, ar2)
+  ar1, ar2 = ensure_arraylike("union1d", ar1, ar2)
   if size is None:
     ar1 = core.concrete_or_error(None, ar1, "The error arose in union1d()")
     ar2 = core.concrete_or_error(None, ar2, "The error arose in union1d()")
@@ -222,7 +253,40 @@ def union1d(ar1: ArrayLike, ar2: ArrayLike,
   return cast(Array, out)
 
 
-def setxor1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False) -> Array:
+@api.jit(static_argnames=['assume_unique', 'size'])
+def _setxor1d_size(arr1: Array, arr2: Array, fill_value: ArrayLike | None, *,
+                   assume_unique: bool, size: int, ) -> Array:
+  # Ensured by caller
+  assert arr1.ndim == arr2.ndim == 1
+  assert arr1.dtype == arr2.dtype
+
+  if assume_unique:
+    arr = concatenate([arr1, arr2])
+    aux = sort(concatenate([arr1, arr2]))
+    flag = concatenate((bool(aux.size), aux[1:] != aux[:-1], True), axis=None)
+  else:
+    arr, num_unique = _concat_unique(arr1, arr2)
+    mask = arange(arr.size + 1) < num_unique + 1
+    _, aux = lax.sort([~mask[1:], arr], is_stable=True, num_keys=2)
+    flag = mask & concatenate((bool(aux.size), aux[1:] != aux[:-1], False),
+                              axis=None).at[num_unique].set(True)
+  aux_mask = flag[1:] & flag[:-1]
+  num_results = aux_mask.sum()
+  if aux.size:
+    indices = nonzero(aux_mask, size=size, fill_value=len(aux))[0]
+    vals = aux.at[indices].get(mode='fill', fill_value=0)
+  else:
+    vals = zeros(size, aux.dtype)
+  if fill_value is None:
+    vals = where(arange(len(vals)) < num_results, vals, vals.max())
+    return where(arange(len(vals)) < num_results, vals, vals.min())
+  else:
+    return where(arange(len(vals)) < num_results, vals, fill_value)
+
+
+@export
+def setxor1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False, *,
+             size: int | None = None, fill_value: ArrayLike | None = None) -> Array:
   """Compute the set-wise xor of elements in two arrays.
 
   JAX implementation of :func:`numpy.setxor1d`.
@@ -236,6 +300,12 @@ def setxor1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False) -> Arr
     assume_unique: if True, assume the input arrays contain unique values. This allows
       a more efficient implementation, but if ``assume_unique`` is True and the input
       arrays contain duplicates, the behavior is undefined. default: False.
+    size: if specified, return only the first ``size`` sorted elements. If there are fewer
+      elements than ``size`` indicates, the return value will be padded with ``fill_value``,
+      and returned indices will be padded with an out-of-bound index.
+    fill_value: when ``size`` is specified and there are fewer than the indicated number of
+      elements, fill the remaining entries ``fill_value``. Defaults to the smallest value
+      in the xor result.
 
   Returns:
     An array of values that are found in exactly one of the input arrays.
@@ -251,51 +321,123 @@ def setxor1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False) -> Arr
     >>> jnp.setxor1d(ar1, ar2)
     Array([1, 2, 5, 6], dtype=int32)
   """
-  check_arraylike("setxor1d", ar1, ar2)
-  ar1 = core.concrete_or_error(None, ar1, "The error arose in setxor1d()")
-  ar2 = core.concrete_or_error(None, ar2, "The error arose in setxor1d()")
+  ar1, ar2 = ensure_arraylike("setxor1d", ar1, ar2)
+  arr1, arr2 = promote_dtypes(ravel(ar1), ravel(ar2))
+  del ar1, ar2
 
-  ar1 = ravel(ar1)
-  ar2 = ravel(ar2)
+  if size is not None:
+    return _setxor1d_size(arr1, arr2, fill_value=fill_value,
+                          assume_unique=assume_unique, size=size)
 
   if not assume_unique:
-    ar1 = unique(ar1)
-    ar2 = unique(ar2)
-
-  aux = concatenate((ar1, ar2))
+    arr1 = unique(arr1)
+    arr2 = unique(arr2)
+  aux = concatenate((arr1, arr2))
   if aux.size == 0:
     return aux
-
   aux = sort(aux)
-  flag = concatenate((array([True]), aux[1:] != aux[:-1], array([True])))
+  flag = concatenate((True, aux[1:] != aux[:-1], True), axis=None)
   return aux[flag[1:] & flag[:-1]]
 
 
-@partial(jit, static_argnames=['return_indices'])
-def _intersect1d_sorted_mask(ar1: ArrayLike, ar2: ArrayLike, return_indices: bool = False) -> tuple[Array, ...]:
-  # JIT-compatible helper function for intersect1d
-  ar = concatenate((ar1, ar2))
+@api.jit(static_argnames=['return_indices'])
+def _intersect1d_sorted_mask(arr1: Array, arr2: Array,
+                             return_indices: bool) -> tuple[Array, Array, Array | None]:
+  """JIT-compatible helper function for intersect1d"""
+  assert arr1.ndim == arr2.ndim == 1
+  arr = concatenate((arr1, arr2))
   if return_indices:
-    iota = lax.broadcasted_iota(np.int64, np.shape(ar), dimension=0)
-    aux, indices = lax.sort_key_val(ar, iota)
+    idx_dtype = lax_utils.int_dtype_for_dim(arr.shape[0], signed=True)
+    iota = lax.broadcasted_iota(idx_dtype, np.shape(arr), dimension=0)
+    aux, indices = lax.sort_key_val(arr, iota)
   else:
-    aux = sort(ar)
-
+    aux = sort(arr)
+    indices = None
   mask = aux[1:] == aux[:-1]
-  if return_indices:
-    return aux, mask, indices
+  return aux, mask, indices
+
+
+@api.jit(static_argnames=['fill_value', 'assume_unique', 'size', 'return_indices'])
+def _intersect1d_size(arr1: Array, arr2: Array, fill_value: ArrayLike | None, assume_unique: bool,
+                      size: int, return_indices: bool) -> Array | tuple[Array, Array, Array]:
+  """Jit-compatible helper function for intersect1d with size specified."""
+  # Ensured by caller
+  assert arr1.ndim == arr2.ndim == 1
+  assert arr1.dtype == arr2.dtype
+
+  # First step: we concatenate the unique values of arr1 and arr2.
+  # The resulting values are:
+  #   num_unique1/num_unique2: number of unique values in arr1/arr2
+  #   aux[:num_unique1 + num_unique2] contains the sorted concatenated
+  #     unique values drawn from arr1 and arr2.
+  #   aux_sorted_indices: indices mapping aux to concatenation of arr1 and arr2
+  #   ind1[:num_unique1], ind2[:num_unique2]: indices of sorted unique
+  #     values in arr1/arr2
+  #   mask: boolean mask of relevant values in aux & aux_sorted_indices
+  if assume_unique:
+    ind1, num_unique1 = arange(arr1.size), full((), arr1.size)
+    ind2, num_unique2 = arange(arr2.size), full((), arr2.size)
+    arr = concatenate([arr1, arr2])
+    aux, aux_sort_indices = lax.sort([arr, arange(arr.size)], is_stable=True, num_keys=1)
+    mask = ones(arr.size, dtype=bool)
   else:
-    return aux, mask
+    arr1, ind1, num_unique1 = _unique(arr1, 0, size=arr1.size, return_index=True, return_true_size=True, fill_value=0)
+    arr2, ind2, num_unique2 = _unique(arr2, 0, size=arr2.size, return_index=True, return_true_size=True, fill_value=0)
+    arr = zeros(arr1.size + arr2.size, dtype=dtypes.result_type(arr1, arr2))
+    arr = lax_slicing.dynamic_update_slice(arr, arr1, (0,))
+    arr = lax_slicing.dynamic_update_slice(arr, arr2, (num_unique1,))
+    mask = arange(arr.size) < num_unique1 + num_unique2
+    _, aux, aux_sort_indices = lax.sort([~mask, arr, arange(arr.size)], is_stable=True, num_keys=2)
+
+  # Second step: extract the intersection values from aux
+  # Since we've sorted the unique entries in arr1 and arr2, any place where
+  # adjacent entries are equal is a value of the intersection.
+  # relevant results here:
+  #   num_results: number of values in the intersection of arr1 and arr2
+  #   vals: array where vals[:num_results] contains the intersection of arr1 and arr2,
+  #         and vals[num_results:] contains the appropriate fill_value.
+  aux_mask = (aux[1:] == aux[:-1]) & mask[1:]
+  num_results = aux_mask.sum()
+  if aux.size:
+    val_indices = nonzero(aux_mask, size=size, fill_value=aux.size)[0]
+    vals = aux.at[val_indices].get(mode='fill', fill_value=0)
+  else:
+    val_indices = arange(0)
+    vals = zeros(size, aux.dtype)
+  if fill_value is None:
+    vals = where(arange(len(vals)) < num_results, vals, vals.max())
+    vals = where(arange(len(vals)) < num_results, vals, vals.min())
+  else:
+    vals = where(arange(len(vals)) < num_results, vals, fill_value)
+
+  # Third step: extract the indices of the intersection values.
+  # This requires essentially unwinding aux_sort_indices and ind1/ind2 to find
+  # the appropriate list of indices from the original arrays.
+  if return_indices:
+    arr1_indices = aux_sort_indices.at[val_indices].get(mode='fill', fill_value=arr1.size)
+    arr1_indices = where(arange(len(arr1_indices)) < num_results, arr1_indices, arr1.size)
+    arr2_indices = aux_sort_indices.at[val_indices + 1].get(mode='fill', fill_value=arr2.size) - num_unique1
+    arr2_indices = where(arange(len(arr2_indices)) < num_results, arr2_indices, arr2.size)
+    if not assume_unique:
+      arr1_indices = ind1.at[arr1_indices].get(mode='fill', fill_value=ind1.size)
+      arr2_indices = ind2.at[arr2_indices].get(mode='fill', fill_value=ind2.size)
+    return vals, arr1_indices, arr2_indices
+  else:
+    return vals
 
 
+@export
 def intersect1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False,
-                return_indices: bool = False) -> Array | tuple[Array, Array, Array]:
+                return_indices: bool = False, *, size: int | None = None,
+                fill_value: ArrayLike | None = None) -> Array | tuple[Array, Array, Array]:
   """Compute the set intersection of two 1D arrays.
 
   JAX implementation of :func:`numpy.intersect1d`.
 
-  Because the size of the output of ``intersect1d`` is data-dependent, the function is not
-  compatible with JIT or other JAX transformations.
+  Because the size of the output of ``intersect1d`` is data-dependent, the function
+  is not typically compatible with :func:`~jax.jit` and other JAX transformations.
+  The JAX version adds the optional ``size`` argument which must be specified
+  statically for ``jnp.intersect1d`` to be used in such contexts.
 
   Args:
     ar1: first array of values to intersect.
@@ -305,6 +447,12 @@ def intersect1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False,
       arrays contain duplicates, the behavior is undefined. default: False.
     return_indices: If True, return arrays of indices specifying where the intersected
       values first appear in the input arrays.
+    size: if specified, return only the first ``size`` sorted elements. If there are fewer
+      elements than ``size`` indicates, the return value will be padded with ``fill_value``,
+      and returned indices will be padded with an out-of-bound index.
+    fill_value: when ``size`` is specified and there are fewer than the indicated number of
+      elements, fill the remaining entries ``fill_value``. Defaults to the smallest value
+      in the intersection.
 
   Returns:
     An array ``intersection``, or if ``return_indices=True``, a tuple of arrays
@@ -352,42 +500,45 @@ def intersect1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False,
      >>> jnp.all(intersection == ar2[ar2_indices])
      Array(True, dtype=bool)
   """
-  check_arraylike("intersect1d", ar1, ar2)
-  ar1 = core.concrete_or_error(None, ar1, "The error arose in intersect1d()")
-  ar2 = core.concrete_or_error(None, ar2, "The error arose in intersect1d()")
+  ar1, ar2 = ensure_arraylike("intersect1d", ar1, ar2)
+  arr1, arr2 = promote_dtypes(ar1, ar2)
+  del ar1, ar2
+  arr1 = ravel(arr1)
+  arr2 = ravel(arr2)
 
+  if size is not None:
+    return _intersect1d_size(arr1, arr2, return_indices=return_indices,
+                             size=size, fill_value=fill_value, assume_unique=assume_unique)
+
+  ind1 = ind2 = arange(0)
   if not assume_unique:
     if return_indices:
-      ar1, ind1 = unique(ar1, return_index=True)
-      ar2, ind2 = unique(ar2, return_index=True)
+      arr1, ind1 = unique(arr1, return_index=True)
+      arr2, ind2 = unique(arr2, return_index=True)
     else:
-      ar1 = unique(ar1)
-      ar2 = unique(ar2)
-  else:
-    ar1 = ravel(ar1)
-    ar2 = ravel(ar2)
+      arr1 = unique(arr1)
+      arr2 = unique(arr2)
 
-  if return_indices:
-    aux, mask, aux_sort_indices = _intersect1d_sorted_mask(ar1, ar2, return_indices)
-  else:
-    aux, mask = _intersect1d_sorted_mask(ar1, ar2, return_indices)
+  aux, mask, aux_sort_indices = _intersect1d_sorted_mask(arr1, arr2, return_indices)
 
   int1d = aux[:-1][mask]
 
   if return_indices:
-    ar1_indices = aux_sort_indices[:-1][mask]
-    ar2_indices = aux_sort_indices[1:][mask] - np.size(ar1)
+    assert aux_sort_indices is not None
+    arr1_indices = aux_sort_indices[:-1][mask]
+    arr2_indices = aux_sort_indices[1:][mask] - np.size(arr1)
     if not assume_unique:
-      ar1_indices = ind1[ar1_indices]
-      ar2_indices = ind2[ar2_indices]
-
-    return int1d, ar1_indices, ar2_indices
+      arr1_indices = ind1[arr1_indices]
+      arr2_indices = ind2[arr2_indices]
+    return int1d, arr1_indices, arr2_indices
   else:
     return int1d
 
 
+@export
 def isin(element: ArrayLike, test_elements: ArrayLike,
-         assume_unique: bool = False, invert: bool = False) -> Array:
+         assume_unique: bool = False, invert: bool = False, *,
+         method='auto') -> Array:
   """Determine whether elements in ``element`` appear in ``test_elements``.
 
   JAX implementation of :func:`numpy.isin`.
@@ -397,7 +548,11 @@ def isin(element: ArrayLike, test_elements: ArrayLike,
     test_elements: N-dimensional array of test values to check for the presence of
       each element.
     invert: If True, return ``~isin(element, test_elements)``. Default is False.
-    assume_unique: unused by JAX
+    assume_unique: if true, input arrays are assumed to be unique, which can
+      lead to more efficient computation. If the input arrays are not unique
+      and assume_unique is set to True, the results are undefined.
+    method: string specifying the method used to compute the result. Supported
+      options are 'compare_all', 'binary_search', 'sort', and 'auto' (default).
 
   Returns:
     A boolean array of shape ``element.shape`` that specifies whether each element
@@ -409,9 +564,9 @@ def isin(element: ArrayLike, test_elements: ArrayLike,
     >>> jnp.isin(elements, test_elements)
     Array([ True, False,  True, False], dtype=bool)
   """
-  del assume_unique  # unused
-  check_arraylike("isin", element, test_elements)
-  result = _in1d(element, test_elements, invert=invert)
+  element, test_elements = ensure_arraylike("isin", element, test_elements)
+  result = _in1d(element, test_elements, invert=invert,
+                 method=method, assume_unique=assume_unique)
   return result.reshape(np.shape(element))
 
 
@@ -421,14 +576,14 @@ UNIQUE_SIZE_HINT = (
   "To make jnp.unique() compatible with JIT and other transforms, you can specify "
   "a concrete value for the size argument, which will determine the output size.")
 
-@partial(jit, static_argnames=['axis', 'equal_nan'])
+@api.jit(static_argnames=['axis', 'equal_nan'])
 def _unique_sorted_mask(ar: Array, axis: int, equal_nan: bool) -> tuple[Array, Array, Array]:
   aux = moveaxis(ar, axis, 0)
   if np.issubdtype(aux.dtype, np.complexfloating):
     # Work around issue in sorting of complex numbers with Nan only in the
     # imaginary component. This can be removed if sorting in this situation
     # is fixed to match numpy.
-    aux = where(isnan(aux), _lax_const(aux, np.nan), aux)
+    aux = where(isnan(aux), lax._const(aux, np.nan), aux)
   size, *out_shape = aux.shape
   if math.prod(out_shape) == 0:
     size = 1
@@ -469,7 +624,7 @@ def _unique(ar: Array, axis: int, return_index: bool = False, return_inverse: bo
     ind = nonzero(mask, size=size)[0]
   result = aux[ind] if aux.size else aux
   if size is not None and fill_value is not None:
-    fill_value = asarray(fill_value, dtype=result.dtype)
+    fill_value = lax.asarray(fill_value).astype(result.dtype)
     if result.shape[0]:
       valid = lax.expand_dims(arange(size) < mask.sum(), tuple(range(1, result.ndim)))
       result = where(valid, result, fill_value)
@@ -486,12 +641,10 @@ def _unique(ar: Array, axis: int, return_index: bool = False, return_inverse: bo
   if return_inverse:
     if aux.size:
       imask = cumsum(mask) - 1
-      inv_idx = zeros(mask.shape, dtype=dtypes.canonicalize_dtype(dtypes.int_))
+      inv_idx = zeros(mask.shape, dtype=int)
       inv_idx = inv_idx.at[perm].set(imask)
     else:
       inv_idx = zeros(ar.shape[axis], dtype=int)
-    if ar.ndim > 1:
-      inv_idx = lax.expand_dims(inv_idx, [i for i in range(ar.ndim) if i != axis],)
     ret += (inv_idx,)
   if return_counts:
     if aux.size:
@@ -502,7 +655,7 @@ def _unique(ar: Array, axis: int, return_index: bool = False, return_inverse: bo
         idx = idx.at[1:].set(where(idx[1:], idx[1:], mask.size))
       ret += (diff(idx),)
     elif ar.shape[axis]:
-      ret += (array([ar.shape[axis]], dtype=dtypes.canonicalize_dtype(dtypes.int_)),)
+      ret += (full((1,), ar.shape[axis], dtype=int),)
     else:
       ret += (empty(0, dtype=int),)
   if return_true_size:
@@ -511,24 +664,26 @@ def _unique(ar: Array, axis: int, return_index: bool = False, return_inverse: bo
   return ret[0] if len(ret) == 1 else ret
 
 
+@export
 def unique(ar: ArrayLike, return_index: bool = False, return_inverse: bool = False,
            return_counts: bool = False, axis: int | None = None,
-           *, equal_nan: bool = True, size: int | None = None, fill_value: ArrayLike | None = None):
+           *, equal_nan: bool = True, size: int | None = None, fill_value: ArrayLike | None = None,
+           sorted: bool = True):
   """Return the unique values from an array.
 
-  JAX implementation of :func:`jax.numpy.unique`.
+  JAX implementation of :func:`numpy.unique`.
 
   Because the size of the output of ``unique`` is data-dependent, the function
-  semantics are not typically compatible with :func:`~jax.jit` and other JAX
-  transformations. The JAX version adds the optional ``size`` argument which
-  must be specified statically for ``jnp.unique`` to be used in such contexts.
+  is not typically compatible with :func:`~jax.jit` and other JAX transformations.
+  The JAX version adds the optional ``size`` argument which must be specified
+  statically for ``jnp.unique`` to be used in such contexts.
 
   Args:
     ar: N-dimensional array from which unique values will be extracted.
     return_index: if True, also return the indices in ``ar`` where each value occurs
     return_inverse: if True, also return the indices that can be used to reconstruct
       ``ar`` from the unique values.
-    return_counts: if True, also return the number of occurances of each unique value.
+    return_counts: if True, also return the number of occurrences of each unique value.
     axis: if specified, compute unique values along the specified axis. If None (default),
       then flatten ``ar`` before computing the unique values.
     equal_nan: if True, consider NaN values equivalent when determining uniqueness.
@@ -536,6 +691,7 @@ def unique(ar: ArrayLike, return_index: bool = False, return_inverse: bool = Fal
       unique elements than ``size`` indicates, the return value will be padded with ``fill_value``.
     fill_value: when ``size`` is specified and there are fewer than the indicated number of
       elements, fill the remaining entries ``fill_value``. Defaults to the minimum unique value.
+    sorted: unused by JAX.
 
   Returns:
     An array or tuple of arrays, depending on the values of ``return_index``, ``return_inverse``,
@@ -546,16 +702,16 @@ def unique(ar: ArrayLike, return_index: bool = False, return_inverse: bool = Fal
         specified, shape is ``(*ar.shape[:axis], n_unique, *ar.shape[axis + 1:])``.
     - ``unique_index``:
         *(returned only if return_index is True)* An array of shape ``(n_unique,)``. Contains
-        the indices of the first occurance of each unique value in ``ar``. For 1D inputs,
-        ``ar[unique_index]`` is equivlent to ``unique_values``.
+        the indices of the first occurrence of each unique value in ``ar``. For 1D inputs,
+        ``ar[unique_index]`` is equivalent to ``unique_values``.
     - ``unique_inverse``:
         *(returned only if return_inverse is True)* An array of shape ``(ar.size,)`` if ``axis``
-        is None, or of shape ``(1, 1, ..., ar.shape[axis], 1, ... 1)`` if ``axis`` is specified.
+        is None, or of shape ``(ar.shape[axis],)`` if ``axis`` is specified.
         Contains the indices within ``unique_values`` of each value in ``ar``. For 1D inputs,
         ``unique_values[unique_inverse]`` is equivalent to ``ar``.
     - ``unique_counts``:
         *(returned only if return_counts is True)* An array of shape ``(n_unique,)``.
-        Contains the number of occurances of each unique value in ``ar``.
+        Contains the number of occurrences of each unique value in ``ar``.
 
   See also:
     - :func:`jax.numpy.unique_counts`: shortcut to ``unique(arr, return_counts=True)``.
@@ -619,7 +775,7 @@ def unique(ar: ArrayLike, return_index: bool = False, return_inverse: bool = Fal
     **Returning indices**
 
     If you set ``return_index=True``, then ``unique`` returns the indices of the
-    first occurance of each unique value:
+    first occurrence of each unique value:
 
     >>> x = jnp.array([3, 4, 1, 3, 1])
     >>> values, indices = jnp.unique(x, return_index=True)
@@ -652,15 +808,15 @@ def unique(ar: ArrayLike, return_index: bool = False, return_inverse: bool = Fal
     Array(True, dtype=bool)
 
     In multiple dimensions, the input can be reconstructed using
-    :func:`jax.numpy.take_along_axis`:
+    :func:`jax.numpy.take`:
 
     >>> values, inverse = jnp.unique(M, axis=0, return_inverse=True)
-    >>> jnp.all(jnp.take_along_axis(values, inverse, axis=0) == M)
+    >>> jnp.all(jnp.take(values, inverse, axis=0) == M)
     Array(True, dtype=bool)
 
     **Returning counts**
 
-    If you set ``return_counts=True``, then ``unique`` returns the number of occurances
+    If you set ``return_counts=True``, then ``unique`` returns the number of occurrences
     within the input for every unique value:
 
     >>> x = jnp.array([3, 4, 1, 3, 1])
@@ -671,7 +827,7 @@ def unique(ar: ArrayLike, return_index: bool = False, return_inverse: bool = Fal
     [2 2 1]
 
     For multi-dimensional arrays, this also returns a 1D array of counts
-    indicating number of occurances along the specified axis:
+    indicating number of occurrences along the specified axis:
 
     >>> values, counts = jnp.unique(M, axis=0, return_counts=True)
     >>> print(values)
@@ -680,14 +836,17 @@ def unique(ar: ArrayLike, return_index: bool = False, return_inverse: bool = Fal
     >>> print(counts)
     [2 1]
   """
-  check_arraylike("unique", ar)
+  # TODO: Investigate if it's possible that we could save some work in
+  # _unique_sorted_mask when sorting is not requested, but that would require
+  # refactoring the implementation a bit.
+  del sorted  # unused
+  arr = ensure_arraylike("unique", ar)
   if size is None:
-    ar = core.concrete_or_error(None, ar,
+    arr = core.concrete_or_error(None, arr,
         "The error arose for the first argument of jnp.unique(). " + UNIQUE_SIZE_HINT)
   else:
     size = core.concrete_or_error(operator.index, size,
          "The error arose for the size argument of jnp.unique(). " + UNIQUE_SIZE_HINT)
-  arr = asarray(ar)
   arr_shape = arr.shape
   if axis is None:
     axis_int: int = 0
@@ -722,6 +881,7 @@ class _UniqueInverseResult(NamedTuple):
     inverse_indices: Array
 
 
+@export
 def unique_all(x: ArrayLike, /, *, size: int | None = None,
                fill_value: ArrayLike | None = None) -> _UniqueAllResult:
   """Return unique values from x, along with indices, inverse indices, and counts.
@@ -731,9 +891,9 @@ def unique_all(x: ArrayLike, /, *, size: int | None = None,
   and `equal_nan` set to True.
 
   Because the size of the output of ``unique_all`` is data-dependent, the function
-  semantics are not typically compatible with :func:`~jax.jit` and other JAX
-  transformations. The JAX version adds the optional ``size`` argument which
-  must be specified statically for ``jnp.unique`` to be used in such contexts.
+  is not typically compatible with :func:`~jax.jit` and other JAX transformations.
+  The JAX version adds the optional ``size`` argument which must be specified
+  statically for ``jnp.unique`` to be used in such contexts.
 
   Args:
     x: N-dimensional array from which unique values will be extracted.
@@ -748,13 +908,13 @@ def unique_all(x: ArrayLike, /, *, size: int | None = None,
     - ``values``:
         an array of shape ``(n_unique,)`` containing the unique values from ``x``.
     - ``indices``:
-        An array of shape ``(n_unique,)``. Contains the indices of the first occurance of
-        each unique value in ``x``. For 1D inputs, ``x[indices]`` is equivlent to ``values``.
+        An array of shape ``(n_unique,)``. Contains the indices of the first occurrence of
+        each unique value in ``x``. For 1D inputs, ``x[indices]`` is equivalent to ``values``.
     - ``inverse_indices``:
         An array of shape ``x.shape``. Contains the indices within ``values`` of each value
         in ``x``. For 1D inputs, ``values[inverse_indices]`` is equivalent to ``x``.
     - ``counts``:
-        An array of shape ``(n_unique,)``. Contains the number of occurances of each unique
+        An array of shape ``(n_unique,)``. Contains the number of occurrences of each unique
         value in ``x``.
 
   See also:
@@ -770,7 +930,7 @@ def unique_all(x: ArrayLike, /, *, size: int | None = None,
     >>> result = jnp.unique_all(x)
 
     The result is a :class:`~typing.NamedTuple` with four named attributes.
-    The ``values`` attribue contains the unique values from the array:
+    The ``values`` attribute contains the unique values from the array:
 
     >>> result.values
     Array([1, 3, 4], dtype=int32)
@@ -797,13 +957,14 @@ def unique_all(x: ArrayLike, /, *, size: int | None = None,
 
     For examples of the ``size`` and ``fill_value`` arguments, see :func:`jax.numpy.unique`.
   """
-  check_arraylike("unique_all", x)
+  x = ensure_arraylike("unique_all", x)
   values, indices, inverse_indices, counts = unique(
     x, return_index=True, return_inverse=True, return_counts=True, equal_nan=False,
     size=size, fill_value=fill_value)
   return _UniqueAllResult(values=values, indices=indices, inverse_indices=inverse_indices, counts=counts)
 
 
+@export
 def unique_counts(x: ArrayLike, /, *, size: int | None = None,
                   fill_value: ArrayLike | None = None) -> _UniqueCountsResult:
   """Return unique values from x, along with counts.
@@ -812,9 +973,9 @@ def unique_counts(x: ArrayLike, /, *, size: int | None = None,
   :func:`jax.numpy.unique` with `return_counts` and `equal_nan` set to True.
 
   Because the size of the output of ``unique_counts`` is data-dependent, the function
-  semantics are not typically compatible with :func:`~jax.jit` and other JAX
-  transformations. The JAX version adds the optional ``size`` argument which
-  must be specified statically for ``jnp.unique`` to be used in such contexts.
+  is not typically compatible with :func:`~jax.jit` and other JAX transformations.
+  The JAX version adds the optional ``size`` argument which must be specified
+  statically for ``jnp.unique`` to be used in such contexts.
 
   Args:
     x: N-dimensional array from which unique values will be extracted.
@@ -829,7 +990,7 @@ def unique_counts(x: ArrayLike, /, *, size: int | None = None,
     - ``values``:
         an array of shape ``(n_unique,)`` containing the unique values from ``x``.
     - ``counts``:
-        An array of shape ``(n_unique,)``. Contains the number of occurances of each unique
+        An array of shape ``(n_unique,)``. Contains the number of occurrences of each unique
         value in ``x``.
 
   See also:
@@ -846,7 +1007,7 @@ def unique_counts(x: ArrayLike, /, *, size: int | None = None,
     >>> result = jnp.unique_counts(x)
 
     The result is a :class:`~typing.NamedTuple` with two named attributes.
-    The ``values`` attribue contains the unique values from the array:
+    The ``values`` attribute contains the unique values from the array:
 
     >>> result.values
     Array([1, 3, 4], dtype=int32)
@@ -858,12 +1019,13 @@ def unique_counts(x: ArrayLike, /, *, size: int | None = None,
 
     For examples of the ``size`` and ``fill_value`` arguments, see :func:`jax.numpy.unique`.
   """
-  check_arraylike("unique_counts", x)
+  x = ensure_arraylike("unique_counts", x)
   values, counts = unique(x, return_counts=True, equal_nan=False,
                           size=size, fill_value=fill_value)
   return _UniqueCountsResult(values=values, counts=counts)
 
 
+@export
 def unique_inverse(x: ArrayLike, /, *, size: int | None = None,
                    fill_value: ArrayLike | None = None) -> _UniqueInverseResult:
   """Return unique values from x, along with indices, inverse indices, and counts.
@@ -872,9 +1034,9 @@ def unique_inverse(x: ArrayLike, /, *, size: int | None = None,
   :func:`jax.numpy.unique` with `return_inverse` and `equal_nan` set to True.
 
   Because the size of the output of ``unique_inverse`` is data-dependent, the function
-  semantics are not typically compatible with :func:`~jax.jit` and other JAX
-  transformations. The JAX version adds the optional ``size`` argument which
-  must be specified statically for ``jnp.unique`` to be used in such contexts.
+  is not typically compatible with :func:`~jax.jit` and other JAX transformations.
+  The JAX version adds the optional ``size`` argument which must be specified
+  statically for ``jnp.unique`` to be used in such contexts.
 
   Args:
     x: N-dimensional array from which unique values will be extracted.
@@ -906,7 +1068,7 @@ def unique_inverse(x: ArrayLike, /, *, size: int | None = None,
     >>> result = jnp.unique_inverse(x)
 
     The result is a :class:`~typing.NamedTuple` with two named attributes.
-    The ``values`` attribue contains the unique values from the array:
+    The ``values`` attribute contains the unique values from the array:
 
     >>> result.values
     Array([1, 3, 4], dtype=int32)
@@ -923,12 +1085,13 @@ def unique_inverse(x: ArrayLike, /, *, size: int | None = None,
 
     For examples of the ``size`` and ``fill_value`` arguments, see :func:`jax.numpy.unique`.
   """
-  check_arraylike("unique_inverse", x)
+  x = ensure_arraylike("unique_inverse", x)
   values, inverse_indices = unique(x, return_inverse=True, equal_nan=False,
                                    size=size, fill_value=fill_value)
   return _UniqueInverseResult(values=values, inverse_indices=inverse_indices)
 
 
+@export
 def unique_values(x: ArrayLike, /, *, size: int | None = None,
                   fill_value: ArrayLike | None = None) -> Array:
   """Return unique values from x, along with indices, inverse indices, and counts.
@@ -937,9 +1100,9 @@ def unique_values(x: ArrayLike, /, *, size: int | None = None,
   :func:`jax.numpy.unique` with `equal_nan` set to True.
 
   Because the size of the output of ``unique_values`` is data-dependent, the function
-  semantics are not typically compatible with :func:`~jax.jit` and other JAX
-  transformations. The JAX version adds the optional ``size`` argument which
-  must be specified statically for ``jnp.unique`` to be used in such contexts.
+  is not typically compatible with :func:`~jax.jit` and other JAX transformations.
+  The JAX version adds the optional ``size`` argument which must be specified statically
+  for ``jnp.unique`` to be used in such contexts.
 
   Args:
     x: N-dimensional array from which unique values will be extracted.
@@ -966,5 +1129,5 @@ def unique_values(x: ArrayLike, /, *, size: int | None = None,
 
     For examples of the ``size`` and ``fill_value`` arguments, see :func:`jax.numpy.unique`.
   """
-  check_arraylike("unique_values", x)
+  x = ensure_arraylike("unique_values", x)
   return cast(Array, unique(x, equal_nan=False, size=size, fill_value=fill_value))

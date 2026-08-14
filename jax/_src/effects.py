@@ -47,7 +47,7 @@ dispatching a computation and on which we can block until is ready. We store
 for each thread the `RuntimeToken` returned by the last dispatched computation.
 
 For more details, see the design note:
-https://jax.readthedocs.io/en/latest/jep/10657-sequencing-effects.html.
+https://docs.jax.dev/en/latest/jep/10657-sequencing-effects.html.
 """
 
 from __future__ import annotations
@@ -62,34 +62,42 @@ class Effect:
 Effects = Set[Effect]
 
 class JaxprInputEffect(Effect):
-  """A side-effect associated with the input of a jaxpr.
+  """A side-effect associated with an input of a `JaxprEqn` or a `Jaxpr`.
 
-  Note that the `input_index` includes constvars.
+  This is used as a base class for effects associated with inputs, e.g.,
+  reading/writing from mutable inputs.
+
+  In a `JaxprEqn` or a `Jaxpr`, `input` is the `core.Var` for the input the
+  effect is associated with. An abstract eval rule has no variables in scope,
+  so there `input` is instead an int, the position of the corresponding
+  primitive input. The tracing machinery resolves positions into variables
+  when it forms an equation (see `core.resolve_input_effects`).
   """
 
-  def __init__(self, input_index: Any):
-    self.input_index = input_index
+  def __init__(self, input: Any):
+    self.input = input
 
-  def replace(self, *, input_index: Any | None = None):
-    if input_index is None:
-      input_index = self.input_index
-    return self.__class__(input_index)
+  def replace(self, input: Any):
+    return self.__class__(input)
 
   def __eq__(self, other):
     if not isinstance(other, JaxprInputEffect):
       return NotImplemented
-    return self.input_index == other.input_index
+    return self.input == other.input
 
   def __hash__(self):
-    return hash((self.__class__, self.input_index))
+    return hash((self.__class__, self.input))
 
   def __repr__(self):
-    return f"{self.__class__.__name__}({self.input_index})"
+    return f"{self.__class__.__name__}({self.input})"
 
 class EffectTypeSet:
 
   def __init__(self):
     self._effect_types: set[type[Effect]] = set()
+
+  def __repr__(self):
+    return f"EffectTypeSet({self._effect_types})"
 
   def add_type(self, effect_type: type[Effect]):
     self._effect_types.add(effect_type)
@@ -118,3 +126,5 @@ lowerable_effects: EffectTypeSet = EffectTypeSet()
 control_flow_allowed_effects: EffectTypeSet = EffectTypeSet()
 custom_derivatives_allowed_effects: EffectTypeSet = EffectTypeSet()
 remat_allowed_effects: EffectTypeSet = EffectTypeSet()
+
+partial_eval_kept_effects: EffectTypeSet = EffectTypeSet()

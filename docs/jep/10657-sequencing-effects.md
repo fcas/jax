@@ -34,11 +34,11 @@ g()
 we expect `"hello"` to be printed before `"world"`. This might seem obvious
 but consider the following JAX code:
 ```python
-@partial(jax.jit, device=<device 0>)
+@jax.jit(device=<device 0>)
 def f():
   return 2
 
-@partial(jax.jit, device=<device 1>)
+@jax.jit(device=<device 1>)
 def g():
   return 3
 f()
@@ -47,7 +47,7 @@ g()
 In many cases, JAX will execute `f` and `g` *in parallel*, dispatching
 the computations onto different threads -- `g` might actually be executed
 before `f`. Parallel execution is a nice performance optimization, especially if copying
-to and from a device is expensive (see the [asynchronous dispatch note](https://jax.readthedocs.io/en/latest/async_dispatch.html) for more details).
+to and from a device is expensive (see the [asynchronous dispatch note](https://docs.jax.dev/en/latest/async_dispatch.html) for more details).
 In practice, however, we often don't need to
 think about asynchronous dispatch because we're writing pure functions and only
 care about the inputs and outputs of functions -- we'll naturally block on future
@@ -57,12 +57,12 @@ However, now imagine that we have a `jax.print` function that works inside of
 JIT-ted JAX functions (`host_callback.id_print` is an example of this). Let's
 return to the previous example except with prints in the mix.
 ```python
-@partial(jax.jit, device=<device 0>)
+@jax.jit(device=<device 0>)
 def f():
   jax.print("hello")
   return 2
 
-@partial(jax.jit, device=<device 1>)
+@jax.jit(device=<device 1>)
 def g():
   jax.print("world")
   return 3
@@ -262,11 +262,11 @@ executed on the same device. We'll have to revise this entire design if that cha
 
 However, consider the two device use-case:
 ```python
-@partial(jax.jit, device=<device 0>)
+@jax.jit(device=<device 0>)
 def f():
   jax.print("hello")
 
-@partial(jax.jit, device=<device 1>)
+@jax.jit(device=<device 1>)
 def g():
   jax.print("world")
 
@@ -276,12 +276,12 @@ g()
 Here we don't want to explicitly sequence `f()` and `g()` but want to wait for both of them to finish.
 We'll need one output token for `f()` and one for `g()` and we'll block on both of those tokens:
 ```python
-@partial(jax.jit, device=<device 0>)
+@jax.jit(device=<device 0>)
 def f():
   jax.print("hello")
   return new_runtime_token()
 
-@partial(jax.jit, device=<device 1>)
+@jax.jit(device=<device 1>)
 def g():
   jax.print("world")
   return new_runtime_token()

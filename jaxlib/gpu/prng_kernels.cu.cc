@@ -15,8 +15,7 @@ limitations under the License.
 
 #include "jaxlib/gpu/prng_kernels.h"
 
-#include <array>
-#include <cstddef>
+#include <algorithm>
 #include <cstdint>
 
 #include "jaxlib/gpu/vendor.h"
@@ -105,33 +104,16 @@ __global__ void ThreeFry2x32Kernel(const std::uint32_t* key0,
 
 }  // namespace
 
-void LaunchThreeFry2x32Kernel(gpuStream_t stream, void** buffers,
-                              ThreeFry2x32Descriptor descriptor) {
-  std::array<const std::uint32_t*, 2> keys;
-  keys[0] = reinterpret_cast<const std::uint32_t*>(buffers[0]);
-  keys[1] = reinterpret_cast<const std::uint32_t*>(buffers[1]);
-  std::array<const std::uint32_t*, 2> data;
-  data[0] = reinterpret_cast<const std::uint32_t*>(buffers[2]);
-  data[1] = reinterpret_cast<const std::uint32_t*>(buffers[3]);
-  std::int64_t n = descriptor.n;
-  int output_idx = 4;
-  std::int64_t* n_ptr = nullptr;
-  if (n < 0) {
-    // n is an operand in device memory.
-    n_ptr = reinterpret_cast<std::int64_t*>(buffers[4]);
-    output_idx = 5;
-  }
-
-  std::array<std::uint32_t*, 2> out;
-  out[0] = reinterpret_cast<std::uint32_t*>(buffers[output_idx]);
-  out[1] = reinterpret_cast<std::uint32_t*>(buffers[output_idx + 1]);
+void LaunchThreeFry2x32KernelFfi(gpuStream_t stream, std::int64_t n,
+                                 std::uint32_t* keys0, std::uint32_t* keys1,
+                                 std::uint32_t* data0, std::uint32_t* data1,
+                                 std::uint32_t* out0, std::uint32_t* out1) {
   const int block_dim = 128;
   const std::int64_t grid_dim =
-      n < 0 ? 32
-            : std::min<std::int64_t>(1024, (n + block_dim - 1) / block_dim);
+      std::min<std::int64_t>(1024, (n + block_dim - 1) / block_dim);
   ThreeFry2x32Kernel<<<grid_dim, block_dim, /*dynamic_shared_mem_bytes=*/0,
-                       stream>>>(keys[0], keys[1], data[0], data[1], out[0],
-                                 out[1], n, n_ptr);
+                       stream>>>(keys0, keys1, data0, data1, out0, out1, n,
+                                 nullptr);
 }
 
 }  // namespace JAX_GPU_NAMESPACE

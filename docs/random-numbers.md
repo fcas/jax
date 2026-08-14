@@ -5,7 +5,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.16.1
+    jupytext_version: 1.16.4
 kernelspec:
   display_name: Python 3
   language: python
@@ -14,6 +14,12 @@ kernelspec:
 
 (pseudorandom-numbers)=
 # Pseudorandom numbers
+
+<!--* freshness: { reviewed: '2024-05-03' } *-->
+
+> _If all scientific papers whose results are in doubt because of bad
+> `rand()`s were to disappear from library shelves, there would be a
+> gap on each shelf about as big as your fist._ - Numerical Recipes
 
 In this section we focus on {mod}`jax.random` and pseudo random number generation (PRNG); that is, the process of algorithmically generating sequences of numbers whose properties approximate the properties of sequences of random numbers sampled from an appropriate distribution.
 
@@ -32,6 +38,19 @@ In NumPy, pseudo random number generation is based on a global `state`, which ca
 import numpy as np
 np.random.seed(0)
 ```
+
+Repeated calls to NumPy's stateful pseudorandom number generators (PRNGs) mutate the global state and give a stream of pseudorandom numbers:
+
+```{code-cell}
+:id: rr9FeP41fynt
+:outputId: df0ceb15-96ec-4a78-e327-c77f7ea3a745
+
+print(np.random.random())
+print(np.random.random())
+print(np.random.random())
+```
+
+Underneath the hood, NumPy uses the [Mersenne Twister](https://en.wikipedia.org/wiki/Mersenne_Twister) PRNG to power its pseudorandom functions.  The PRNG has a period of $2^{19937}-1$ and at any point can be described by 624 32-bit unsigned ints and a position indicating how much of this  "entropy" has been used up.
 
 You can inspect the content of the state using the following command.
 
@@ -107,7 +126,7 @@ Further, when executing in multi-device environments, execution efficiency would
 
 ### Explicit random state
 
-To avoid this issue, JAX avoids implicit global random state, and instead tracks state explicitly via a random `key`:
+To avoid these issues, JAX avoids implicit global random state, and instead tracks state explicitly via a random `key`:
 
 ```{code-cell}
 from jax import random
@@ -131,10 +150,11 @@ print(random.normal(key))
 print(random.normal(key))
 ```
 
-Re-using the same key, even with different {mod}`~jax.random` APIs, can result in correlated outputs, which is generally undesirable. 
+Reusing the same key, even with different {mod}`~jax.random` APIs, can result in correlated outputs, which is generally undesirable. 
 
-**The rule of thumb is: never reuse keys (unless you want identical outputs).**
+**The rule of thumb is: never reuse keys (unless you want identical outputs). Reusing the same state will cause __sadness__ and __monotony__, depriving the end user of __lifegiving chaos__.**
 
+JAX uses a modern [Threefry counter-based PRNG](https://github.com/jax-ml/jax/blob/main/docs/jep/263-prng.md) that's splittable.  That is, its design allows us to fork the PRNG state into new PRNGs for use with parallel stochastic generation.
 In order to generate different and independent samples, you must {func}`~jax.random.split` the key explicitly before passing it to a random function:
 
 ```{code-cell}

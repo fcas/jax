@@ -14,19 +14,25 @@
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import Any, cast
+from collections.abc import Callable
 
 import numpy as np
 
-import jax.numpy as jnp
-from jax import jit, lax, random, vmap
+from jax._src import api
+from jax._src import dtypes
+from jax._src import lax
+from jax._src import numpy as jnp
+from jax._src import random
 from jax._src.numpy.util import check_arraylike, promote_dtypes_inexact
+from jax._src.scipy import linalg, special
 from jax._src.tree_util import register_pytree_node_class
-from jax.scipy import linalg, special
+from jax._src.typing import Array
 
+BwMethod = None | str | Array | Callable[[Any], Array]
 
 @register_pytree_node_class
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, init=False, slots=True)
 class gaussian_kde:
   """Gaussian Kernel Density Estimator
 
@@ -45,10 +51,10 @@ class gaussian_kde:
   covariance: Any
   inv_cov: Any
 
-  def __init__(self, dataset, bw_method=None, weights=None):
+  def __init__(self, dataset, bw_method: BwMethod = None, weights=None):
     check_arraylike("gaussian_kde", dataset)
     dataset = jnp.atleast_2d(dataset)
-    if jnp.issubdtype(lax.dtype(dataset), jnp.complexfloating):
+    if dtypes.issubdtype(lax.dtype(dataset), np.complexfloating):
       raise NotImplementedError("gaussian_kde does not support complex data")
     if not dataset.size > 1:
       raise ValueError("`dataset` input should have multiple elements.")
@@ -77,7 +83,7 @@ class gaussian_kde:
     elif bw_method == "silverman":
       factor = jnp.power(neff * (d + 2) / 4.0, -1. / (d + 4))
     elif jnp.isscalar(bw_method) and not isinstance(bw_method, str):
-      factor = bw_method
+      factor = cast(Array, bw_method)
     elif callable(bw_method):
       factor = bw_method(self)
     else:
@@ -86,7 +92,7 @@ class gaussian_kde:
       )
 
     data_covariance = jnp.atleast_2d(
-        jnp.cov(dataset, rowvar=1, bias=False, aweights=weights))
+        jnp.cov(dataset, rowvar=True, bias=False, aweights=weights))
     data_inv_cov = jnp.linalg.inv(data_covariance)
     covariance = data_covariance * factor**2
     inv_cov = data_inv_cov / factor**2
@@ -149,11 +155,12 @@ class gaussian_kde:
     return _gaussian_kernel_convolve(chol, norm, self.dataset, self.weights,
                                      mean)
 
+  @api.jit
   def integrate_box_1d(self, low, high):
     """Integrate the distribution over the given limits."""
     if self.d != 1:
       raise ValueError("integrate_box_1d() only handles 1D pdfs")
-    if jnp.ndim(low) != 0 or jnp.ndim(high) != 0:
+    if np.ndim(low) != 0 or np.ndim(high) != 0:
       raise ValueError(
           "the limits of integration in integrate_box_1d must be scalars")
     sigma = jnp.squeeze(jnp.sqrt(self.covariance))
@@ -171,11 +178,12 @@ class gaussian_kde:
     norm = 1.0 / norm
 
     sm, lg = (self, other) if self.n < other.n else (other, self)
-    result = vmap(partial(_gaussian_kernel_convolve, chol, norm, lg.dataset,
-                          lg.weights),
-                  in_axes=1)(sm.dataset)
+    result = api.vmap(partial(_gaussian_kernel_convolve, chol, norm, lg.dataset,
+                              lg.weights),
+                      in_axes=1)(sm.dataset)
     return jnp.sum(result * sm.weights)
 
+  @api.jit(static_argnames=("shape",))
   def resample(self, key, shape=()):
     r"""Randomly sample a dataset from the estimated pdf
 
@@ -222,7 +230,7 @@ class gaussian_kde:
         "dynamically changing the bandwidth method is not supported")
 
   def _reshape_points(self, points):
-    if jnp.issubdtype(lax.dtype(points), jnp.complexfloating):
+    if dtypes.issubdtype(lax.dtype(points), np.complexfloating):
       raise NotImplementedError(
           "gaussian_kde does not support complex coordinates")
     points = jnp.atleast_2d(points)
@@ -244,7 +252,7 @@ def _gaussian_kernel_convolve(chol, norm, target, weights, mean):
   return norm * jnp.sum(jnp.exp(-arg) * weights)
 
 
-@partial(jit, static_argnums=0)
+@api.jit(static_argnums=0)
 def _gaussian_kernel_eval(in_log, points, values, xi, precision):
   points, values, xi, precision = promote_dtypes_inexact(
       points, values, xi, precision)
@@ -269,9 +277,9 @@ def _gaussian_kernel_eval(in_log, points, values, xi, precision):
       return y_train * jnp.exp(arg)
 
   reduce = special.logsumexp if in_log else jnp.sum
-  reduced_kernel = lambda x: reduce(vmap(kernel, in_axes=(None, 0, 0))
+  reduced_kernel = lambda x: reduce(api.vmap(kernel, in_axes=(None, 0, 0))
                                     (x, points, values),
                                     axis=0)
-  mapped_kernel = vmap(reduced_kernel)
+  mapped_kernel = api.vmap(reduced_kernel)
 
   return mapped_kernel(xi)

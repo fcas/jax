@@ -20,16 +20,12 @@ import functools
 import sys
 import uuid
 
-from typing import Any, Union
+from typing import Any
 
 IS_COLAB_ENABLED = "google.colab" in sys.modules
 if IS_COLAB_ENABLED:
-  # pylint: disable=g-import-not-at-top
-  # pytype: disable=import-error
-  from google.colab import output
-  from IPython import display
-  # pytype: enable=import-error
-  # pylint: enable=g-import-not-at-top
+  from google.colab import output  # pyrefly: ignore[missing-import]
+  from IPython import display  # pyrefly: ignore[missing-import]
 
 
 class DOMElement(metaclass=abc.ABCMeta):
@@ -39,7 +35,7 @@ class DOMElement(metaclass=abc.ABCMeta):
     pass
 
 
-Element = Union[DOMElement, str]
+Element = DOMElement | str
 
 
 class DynamicDOMElement(DOMElement):
@@ -61,7 +57,7 @@ class DynamicDOMElement(DOMElement):
   def clear(self):
     pass
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class DynamicDiv(DynamicDOMElement):
   """A `div` that can be edited."""
   _uuid: str = dataclasses.field(init=False)
@@ -82,6 +78,8 @@ class DynamicDiv(DynamicDOMElement):
       raise ValueError("Can't call `render` twice.")
     self._root_elem.render()
     self._rendered = True
+    if isinstance(self.elem, str):
+      raise TypeError("Cannot render when self.elem is a string.")
     self.append(self.elem)
 
   def append(self, child: DOMElement):
@@ -101,7 +99,7 @@ class DynamicDiv(DynamicDOMElement):
     self._rendered = False
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class StaticDOMElement(DOMElement):
   """An immutable DOM element."""
   _uuid: str = dataclasses.field(init=False)

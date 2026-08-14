@@ -27,20 +27,19 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax import tree_util
+from jax.experimental.sparse import _lowerings
 from jax.experimental.sparse._base import JAXSparse
 from jax.experimental.sparse import bcoo
 from jax.experimental.sparse.util import (
-    nfold_vmap, _count_stored_elements,
-    _csr_to_coo, _dot_general_validated_shape,
-    CuSparseEfficiencyWarning, SparseInfo, Shape)
-from jax.util import split_list, safe_zip
+    nfold_vmap, _count_stored_elements, _csr_to_coo,
+    SparseEfficiencyWarning, CuSparseEfficiencyWarning, SparseInfo, Shape)
+from jax._src.util import split_list, safe_zip
 
 from jax._src import api_util
 from jax._src import config
 from jax._src import core
 from jax._src import dispatch
 from jax._src.lax.lax import DotDimensionNumbers, _dot_general_batch_dim_nums
-from jax._src.lib import gpu_sparse
 from jax._src.lib.mlir.dialects import hlo
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
@@ -145,7 +144,7 @@ def _bcsr_to_bcoo(indices: jax.Array, indptr: jax.Array, *,
 
 
 def _bcoo_to_bcsr(indices: Array, *, shape: Sequence[int],
-                  index_dtype: DTypeLike = jnp.int32) -> tuple[Array, Array]:
+                  index_dtype: DTypeLike) -> tuple[Array, Array]:
   """Given BCOO (indices), return BCSR (indices, indptr).
 
   Note: this assumes that ``indices`` are lexicographically sorted within each batch.
@@ -238,7 +237,9 @@ def _bcsr_fromdense_impl(mat, *, nse, n_batch, n_dense, index_dtype):
     raise ValueError("bcsr_fromdense: must have 2 sparse dimensions.")
   bcoo_mat = bcoo.bcoo_fromdense(mat, nse=nse, index_dtype=index_dtype,
                                  n_dense=n_dense, n_batch=n_batch)
-  indices, indptr = _bcoo_to_bcsr(bcoo_mat.indices, shape=mat.shape)
+  indices, indptr = _bcoo_to_bcsr(
+      bcoo_mat.indices, shape=mat.shape, index_dtype=index_dtype
+  )
   return bcoo_mat.data, indices, indptr
 
 
@@ -272,11 +273,11 @@ def _bcsr_fromdense_jvp(primals, tangents, *, nse, n_batch, n_dense, index_dtype
   data, indices, indptr = primals_out
 
   if type(Mdot) is ad.Zero:
-    data_dot = ad.Zero.from_value(data)
+    data_dot = ad.p2tz(data)
   else:
     data_dot = bcsr_extract(indices, indptr, Mdot)
 
-  tangents_out = (data_dot, ad.Zero.from_value(indices), ad.Zero.from_value(indptr))
+  tangents_out = (data_dot, ad.p2tz(indices), ad.p2tz(indptr))
 
   return primals_out, tangents_out
 
@@ -463,7 +464,8 @@ bcsr_dot_general_p = core.Primitive('bcsr_dot_general')
 def bcsr_dot_general(lhs: BCSR | Array, rhs: Array, *,
                      dimension_numbers: DotDimensionNumbers,
                      precision: None = None,
-                     preferred_element_type: None = None) -> Array:
+                     preferred_element_type: None = None,
+                     out_sharding=None) -> Array:
   """A general contraction operation.
 
   Args:
@@ -480,7 +482,7 @@ def bcsr_dot_general(lhs: BCSR | Array, rhs: Array, *,
     are sparse, the result will be sparse, of type BCSR. If either input is
     dense, the result will be dense, of type ndarray.
   """
-  del precision  # unused
+  del precision, out_sharding  # unused
   if isinstance(rhs, (np.ndarray, jax.Array)):
     if isinstance(lhs, (np.ndarray, jax.Array)):
       return lax.dot_general(lhs, rhs, dimension_numbers=dimension_numbers,
@@ -587,12 +589,12 @@ def _bcsr_dot_general_batch_rule(batched_args, batch_dims, *,
                                  lhs_spinfo):
   *lhs_args, rhs = batched_args
   *lhs_dims, rhs_bdim = batch_dims
-  *new_lhs_args, new_lhs_spinfo = _bcsr_batch_dims_to_front(
+  new_data, new_indices, new_indptr, new_lhs_spinfo = _bcsr_batch_dims_to_front(
     lhs_args, lhs_dims, lhs_spinfo,
     batch_size=None if rhs_bdim is None else rhs.shape[rhs_bdim])
   new_dimension_numbers, result_batch_dim = _dot_general_batch_dim_nums(
       (len(lhs_spinfo.shape), rhs.ndim), (0, rhs_bdim), dimension_numbers)
-  batched_out = _bcsr_dot_general(*new_lhs_args, rhs, lhs_spinfo=new_lhs_spinfo,
+  batched_out = _bcsr_dot_general(new_data, new_indices, new_indptr, rhs, lhs_spinfo=new_lhs_spinfo,
                                   dimension_numbers=new_dimension_numbers,
                                   preferred_element_type=preferred_element_type)
   return batched_out, result_batch_dim
@@ -620,9 +622,9 @@ _bcsr_correct_out_of_bound_indices_lowered = mlir.lower_fun(
     _bcsr_correct_out_of_bound_indices, multiple_results=True)
 
 def _bcsr_dot_general_gpu_lowering(
-    csr_matvec_lowering, csr_matmat_lowering,
+    # csr_matvec_lowering, csr_matmat_lowering,
     ctx, lhs_data, lhs_indices, lhs_indptr, rhs, *, dimension_numbers,
-    preferred_element_type, lhs_spinfo: SparseInfo):
+    preferred_element_type, lhs_spinfo: SparseInfo, target_name_prefix):
 
   if not config.bcoo_cusparse_lowering.value:
     return _bcsr_dot_general_default_lowering(
@@ -671,25 +673,115 @@ def _bcsr_dot_general_gpu_lowering(
 
   # Account for a bug in cusparse: it references indices and data beyond
   # the extent of indptr.
-  (lhs_data,), (lhs_indices,) = _bcsr_correct_out_of_bound_indices_lowered(
-      ctx, lhs_data, lhs_indices, lhs_indptr, rhs, shape=lhs_spinfo.shape)
+  lhs_data, lhs_indices = _bcsr_correct_out_of_bound_indices_lowered(
+    ctx, lhs_data, lhs_indices, lhs_indptr, rhs, shape=lhs_spinfo.shape)
 
+  sub_ctx = ctx
   if rhs_aval.ndim == 1:
-    dot_general_fn = csr_matvec_lowering
-    x_dtype = 'x_dtype'
+    dot_general_fn = _lowerings._csr_spmv_gpu_lowering
   elif rhs_aval.ndim == 2:
-    dot_general_fn = csr_matmat_lowering
-    x_dtype = 'B_dtype'
+    dot_general_fn = _lowerings._csr_spmm_gpu_lowering
     if rhs_contract[0] == 1:
       rhs = hlo.transpose(rhs, permutation=mlir.dense_int_array([1, 0]))
+      *avals_in, rhs_aval = sub_ctx.avals_in
+      rhs_aval = core.ShapedArray(
+          shape=(rhs_aval.shape[1], rhs_aval.shape[0]), dtype=rhs_aval.dtype)
+      sub_ctx = sub_ctx.replace(avals_in=[*avals_in, rhs_aval])
   else:
     raise ValueError(f"rhs has to be 1d or 2d; get {rhs_aval.ndim}d.")
 
-  return [dot_general_fn(lhs_data, lhs_indices, lhs_indptr, rhs,
-                         shape=lhs_spinfo.shape, transpose=False,
-                         data_dtype=lhs_data_aval.dtype,
-                         index_dtype=lhs_indices_aval.dtype,
-                         **{x_dtype: rhs_aval.dtype})]
+  return dot_general_fn(sub_ctx, lhs_data, lhs_indices, lhs_indptr, rhs,
+                        shape=lhs_spinfo.shape, transpose=False,
+                        target_name_prefix=target_name_prefix)
+
+
+def _bcsr_dot_general_cpu_lowering(
+    # csr_matvec_lowering, csr_matmat_lowering,
+    ctx,
+    lhs_data,
+    lhs_indices,
+    lhs_indptr,
+    rhs,
+    *,
+    dimension_numbers,
+    preferred_element_type,
+    lhs_spinfo: SparseInfo,
+):
+
+  (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
+  lhs_data_aval, lhs_indices_aval, lhs_indptr_aval, rhs_aval = ctx.avals_in
+  props = _validate_bcsr(
+      lhs_data_aval, lhs_indices_aval, lhs_indptr_aval, lhs_spinfo.shape
+  )
+
+  use_default_lowering = False
+  dtype = lhs_data_aval.dtype
+  if lhs_batch or rhs_batch:
+    # TODO(willfroom): Add support for batched matrices.
+    use_default_lowering = True
+  elif lhs_data_aval.dtype != rhs_aval.dtype:
+    use_default_lowering = True
+  elif (
+      preferred_element_type is not None
+      and preferred_element_type != lhs_data_aval.dtype
+  ):
+    use_default_lowering = True
+  elif len(lhs_spinfo.shape) != 2 or rhs_aval.ndim not in [1, 2]:
+    # only matmat / matvec supported
+    use_default_lowering = True
+  elif props.n_batch or props.n_dense:
+    # batch and dense dimensions in BCSR not supported
+    use_default_lowering = True
+  elif list(lhs_contract) != [1] or list(rhs_contract) != [0]:
+    # TODO(willfroom): Add support for non-canonical dots.
+    use_default_lowering = True
+  elif lhs_indices_aval.dtype != lhs_indptr_aval.dtype:
+    warnings.warn(
+        "bcsr_dot_general cpu lowering not available, "
+        f" {lhs_indices_aval.dtype=} and {lhs_indptr_aval.dtype=} do not match."
+        " Falling back to default implementation.",
+        SparseEfficiencyWarning,
+    )
+    use_default_lowering = True
+  elif lhs_indices_aval.dtype not in [np.int32, np.int64]:
+    use_default_lowering = True
+    warnings.warn(
+        "bcsr_dot_general cpu lowering not available for"
+        f" {lhs_indices_aval.dtype=}. Falling back to default implementation.",
+        SparseEfficiencyWarning,
+    )
+  elif dtype not in [
+      np.int32,
+      np.int64,
+      np.float32,
+      np.float64,
+      np.complex64,
+      np.complex128,
+  ]:
+    # This would be supported if not for the dtype.
+    warnings.warn(
+        "bcsr_dot_general cpu lowering not available "
+        f"for {dtype=}. Falling back to default implementation.",
+        SparseEfficiencyWarning,
+    )
+    use_default_lowering = True
+
+  if use_default_lowering:
+    return _bcsr_dot_general_default_lowering(
+        ctx,
+        lhs_data,
+        lhs_indices,
+        lhs_indptr,
+        rhs,
+        dimension_numbers=dimension_numbers,
+        preferred_element_type=preferred_element_type,
+        lhs_spinfo=lhs_spinfo,
+    )
+
+  return _lowerings._csr_spmm_cpu_lowering(
+      ctx, lhs_data, lhs_indptr, lhs_indices, rhs
+  )
+
 
 _bcsr_dot_general_default_lowering = mlir.lower_fun(
     _bcsr_dot_general_impl, multiple_results=False)
@@ -697,24 +789,25 @@ mlir.register_lowering(
     bcsr_dot_general_p, _bcsr_dot_general_default_lowering)
 dispatch.simple_impl(bcsr_dot_general_p)
 
-if gpu_sparse.cuda_is_supported:
-  mlir.register_lowering(bcsr_dot_general_p,
-                          partial(_bcsr_dot_general_gpu_lowering,
-                                  gpu_sparse.cuda_csr_matvec,
-                                  gpu_sparse.cuda_csr_matmat),
-                          platform='cuda')
-if gpu_sparse.rocm_is_supported:
-  mlir.register_lowering(bcsr_dot_general_p,
-                          partial(_bcsr_dot_general_gpu_lowering,
-                                  gpu_sparse.rocm_csr_matvec,
-                                  gpu_sparse.rocm_csr_matmat),
-                          platform='rocm')
+mlir.register_lowering(bcsr_dot_general_p,
+                        partial(_bcsr_dot_general_gpu_lowering,
+                                target_name_prefix='cu'),
+                        platform='cuda')
+mlir.register_lowering(bcsr_dot_general_p,
+                        partial(_bcsr_dot_general_gpu_lowering,
+                                target_name_prefix='hip'),
+                        platform='rocm')
 
+
+mlir.register_lowering(
+    bcsr_dot_general_p, _bcsr_dot_general_cpu_lowering, platform="cpu"
+)
 
 #----------------------------------------------------------------------
 # BCOO functions that maybe should be primitives?
 
-def bcsr_broadcast_in_dim(mat: BCSR, *, shape: Shape, broadcast_dimensions: Sequence[int]) -> BCSR:
+def bcsr_broadcast_in_dim(mat: BCSR, *, shape: Shape, broadcast_dimensions: Sequence[int],
+                          sharding=None) -> BCSR:
   result_bcoo = bcoo.bcoo_broadcast_in_dim(
     mat.to_bcoo(), shape=shape, broadcast_dimensions=broadcast_dimensions)
   return BCSR.from_bcoo(result_bcoo)
@@ -744,16 +837,37 @@ class BCSR(JAXSparse):
   indices: jax.Array
   indptr: jax.Array
   shape: Shape
-  nse = property(lambda self: self.indices.shape[-1])
-  dtype = property(lambda self: self.data.dtype)
-  n_batch = property(lambda self: self.indices.ndim - 1)
-  n_sparse = property(lambda _: 2)
-  n_dense = property(lambda self: self.data.ndim - self.indices.ndim)
   indices_sorted: bool
   unique_indices: bool
-  _bufs = property(lambda self: (self.data, self.indices, self.indptr))
-  _info = property(lambda self: SparseInfo(self.shape, self.indices_sorted,
-                                           self.unique_indices))
+
+  @property
+  def _bufs(self) -> tuple[jax.Array, jax.Array, jax.Array]:
+    return (self.data, self.indices, self.indptr)
+
+  @property
+  def _info(self) -> SparseInfo:
+    return  SparseInfo(self.shape, self.indices_sorted,
+                       self.unique_indices)
+
+  @property
+  def nse(self) -> int:
+    return self.indices.shape[-1]
+
+  @property
+  def dtype(self) -> np.dtype:
+    return self.data.dtype
+
+  @property
+  def n_batch(self) -> int:
+    return self.indices.ndim - 1
+
+  @property
+  def n_sparse(self) -> int:
+    return 2
+
+  @property
+  def n_dense(self) -> int:
+    return self.data.ndim - self.indices.ndim
 
   @property
   def _sparse_shape(self):
@@ -775,7 +889,7 @@ class BCSR(JAXSparse):
       n_dense = self.n_dense
       dtype = self.dtype
       shape = list(self.shape)
-    except Exception:  # pylint: disable=broad-except
+    except Exception:
       repr_ = f"{name}(<invalid>)"
     else:
       extra = f", {nse=}"
@@ -866,7 +980,9 @@ class BCSR(JAXSparse):
       raise NotImplementedError(f"BSCR.from_bcoo requires n_sparse=2; got {arr.n_sparse=}")
     if not arr.indices_sorted:
       arr = arr.sort_indices()
-    indices, indptr = _bcoo_to_bcsr(arr.indices, shape=arr.shape)
+    indices, indptr = _bcoo_to_bcsr(
+        arr.indices, shape=arr.shape, index_dtype=arr.indices.dtype
+    )
     return cls((arr.data, indices, indptr), shape=arr.shape)
 
   @classmethod

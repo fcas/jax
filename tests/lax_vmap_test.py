@@ -17,7 +17,7 @@ from __future__ import annotations
 from functools import partial
 import itertools
 import math
-from typing import Union, cast
+from typing import cast
 import unittest
 
 from absl.testing import absltest
@@ -32,7 +32,6 @@ from jax import lax
 from jax._src import test_util as jtu
 from jax._src.internal_test_util import lax_test_util
 from jax._src.lax import windowed_reductions as lax_windowed_reductions
-from jax._src.lib import xla_client
 from jax._src.util import safe_map, safe_zip
 
 jax.config.parse_flags_with_absl()
@@ -73,8 +72,8 @@ class LaxVmapTest(jtu.JaxTestCase):
      for lhs_shape in [(b * batch_group_count, i * feature_group_count, 6, 7)]
      for rhs_shape in [(j * batch_group_count * feature_group_count, i, 1, 2)]],
     [dict(lhs_bdim=lhs_bdim, rhs_bdim=rhs_bdim)
-        for lhs_bdim in itertools.chain([cast(Union[int, None], None)], range(5))
-        for rhs_bdim in itertools.chain([cast(Union[int, None], None)], range(5))
+        for lhs_bdim in itertools.chain([cast(int | None, None)], range(5))
+        for rhs_bdim in itertools.chain([cast(int | None, None)], range(5))
         if (lhs_bdim, rhs_bdim) != (None, None)
     ],
     [dict(dimension_numbers=dim_nums, perms=perms)
@@ -179,7 +178,7 @@ class LaxVmapTest(jtu.JaxTestCase):
     rng = jtu.rand_default(self.rng())
     op = partial(lax.dot, precision=lax.Precision.HIGHEST)
     self._CheckBatching(op, 5, bdims, (lhs_shape, rhs_shape), (dtype, dtype),
-                        rng, rtol={np.float16: 5e-2, np.float64: 5e-14})
+                        rng, rtol={np.float16: 5e-2, np.float64: 5e-14, jnp.bfloat16: 5e-2})
 
   @jtu.sample_product(
     [dict(bdims=bdims, lhs_shape=lhs_shape, rhs_shape=rhs_shape,
@@ -227,7 +226,7 @@ class LaxVmapTest(jtu.JaxTestCase):
     # Checks that batching didn't introduce any transposes or broadcasts.
     jaxpr = jax.make_jaxpr(dot)(np.zeros(lhs_shape, dtype),
                                 np.zeros(rhs_shape, dtype))
-    for eqn in jtu.iter_eqns(jaxpr.jaxpr):
+    for eqn in jtu.iter_eqns(jaxpr):
       self.assertFalse(eqn.primitive in ["transpose", "broadcast"])
 
   @jtu.sample_product(
@@ -345,6 +344,40 @@ class LaxVmapTest(jtu.JaxTestCase):
     op = lambda x: lax.slice(x, starts, limits, strides)
     self._CheckBatching(op, 5, bdims, (shape,), (dtype,), rng)
 
+  @jtu.sample_product(
+    [dict(base_shape=base_shape, axis=axis, bdims=bdims)
+      for base_shape in [(4,), (3, 4), (2, 3, 4)]
+      for axis in range(len(base_shape))
+      for bdims in lax_test_util.all_bdims(base_shape)
+    ],
+    num_pieces=range(3),
+    dtype=lax_test_util.default_dtypes,
+  )
+  def testSplit(self, base_shape, dtype, num_pieces, axis, bdims):
+    sizes = jtu.rand_int(self.rng(), 5)((num_pieces + 1,), np.int64)
+    shape = list(base_shape)
+    shape[axis] = np.sum(sizes)
+    rng = jtu.rand_default(self.rng())
+    op = lambda x: lax.split(x, sizes, axis)
+    self._CheckBatching(op, 5, bdims, (shape,), (dtype,), rng,
+                        multiple_results=True)
+
+  def testStack(self):
+    shape = (2, 3)
+    dtype = np.float32
+    rng = jtu.rand_default(self.rng())
+    op = lambda x, y: lax.stack([x, y], axis=0)
+    for bdims in lax_test_util.all_bdims(shape, shape):
+      self._CheckBatching(op, 5, bdims, (shape, shape), (dtype, dtype), rng)
+
+  def testUnstack(self):
+    shape = (2, 3)
+    dtype = np.float32
+    rng = jtu.rand_default(self.rng())
+    op = lambda x: lax.unstack(x, axis=0)
+    for bdims in lax_test_util.all_bdims(shape):
+      self._CheckBatching(op, 5, bdims, (shape,), (dtype,), rng,
+                          multiple_results=True)
   @jtu.sample_product(
     [dict(shape=shape, perm=perm, bdims=bdims)
       for shape, perm in [
@@ -546,7 +579,7 @@ class LaxVmapTest(jtu.JaxTestCase):
     ndims = len(shape)
     axes = range(ndims - fft_ndims, ndims)
     fft_lengths = tuple(shape[axis] for axis in axes)
-    op = lambda x: lax.fft(x, xla_client.FftType.FFT, fft_lengths)
+    op = lambda x: lax.fft(x, lax.FftType.FFT, fft_lengths)
     self._CheckBatching(op, 5, bdims, [shape], [np.complex64], rng,
                         rtol=1e-5)
 
@@ -566,6 +599,18 @@ class LaxVmapTest(jtu.JaxTestCase):
           ((10, 5), np.array([[0, 2], [1, 0]]), lax.GatherDimensionNumbers(
             offset_dims=(1,), collapsed_slice_dims=(0,), start_index_map=(0, 1)),
             (1, 3)),
+          ((2, 5), np.array([[[0], [2]], [[1], [1]]]),
+           lax.GatherDimensionNumbers(
+               offset_dims=(), collapsed_slice_dims=(1,),
+               start_index_map=(1,), operand_batching_dims=(0,),
+               start_indices_batching_dims=(0,)),
+           (1, 1)),
+          ((2, 3, 10), np.array([[[0], [1]], [[2], [3]], [[4], [5]]]),
+           lax.GatherDimensionNumbers(
+               offset_dims=(2,), collapsed_slice_dims=(),
+               start_index_map=(2,), operand_batching_dims=(0, 1),
+               start_indices_batching_dims=(1, 0)),
+           (1, 1, 3))
       ]
       for bdims in lax_test_util.all_bdims(shape, idxs.shape)],
     dtype=lax_test_util.all_dtypes
@@ -590,6 +635,16 @@ class LaxVmapTest(jtu.JaxTestCase):
           ((10, 5,), np.array([[0], [2], [1]]), (3, 3), lax.ScatterDimensionNumbers(
             update_window_dims=(1,), inserted_window_dims=(0,),
             scatter_dims_to_operand_dims=(0,))),
+          ((2, 5), np.array([[[0], [2]], [[1], [1]]]), (2, 2),
+           lax.ScatterDimensionNumbers(
+               update_window_dims=(), inserted_window_dims=(1,),
+               scatter_dims_to_operand_dims=(1,), operand_batching_dims=(0,),
+               scatter_indices_batching_dims=(0,))),
+          ((2, 3, 10), np.array([[[0], [1]], [[2], [3]], [[4], [5]]]),
+           (3, 2, 3), lax.ScatterDimensionNumbers(
+               update_window_dims=(2,), inserted_window_dims=(),
+               scatter_dims_to_operand_dims=(2,), operand_batching_dims=(0, 1),
+               scatter_indices_batching_dims=(1, 0)))
       ]
       for bdims in lax_test_util.all_bdims(arg_shape, idxs.shape, update_shape)],
     dtype=lax_test_util.float_dtypes
@@ -613,6 +668,16 @@ class LaxVmapTest(jtu.JaxTestCase):
           ((10, 5,), np.array([[0], [2], [1]]), (3, 3), lax.ScatterDimensionNumbers(
             update_window_dims=(1,), inserted_window_dims=(0,),
             scatter_dims_to_operand_dims=(0,))),
+          ((2, 5), np.array([[[0], [2]], [[1], [1]]]), (2, 2),
+           lax.ScatterDimensionNumbers(
+               update_window_dims=(), inserted_window_dims=(1,),
+               scatter_dims_to_operand_dims=(1,), operand_batching_dims=(0,),
+               scatter_indices_batching_dims=(0,))),
+          ((2, 3, 10), np.array([[[0], [1]], [[2], [3]], [[4], [5]]]),
+           (3, 2, 3), lax.ScatterDimensionNumbers(
+               update_window_dims=(2,), inserted_window_dims=(),
+               scatter_dims_to_operand_dims=(2,), operand_batching_dims=(0, 1),
+               scatter_indices_batching_dims=(1, 0)))
       ]
       for bdims in lax_test_util.all_bdims(arg_shape, idxs.shape)],
     dtype=lax_test_util.float_dtypes,
@@ -639,26 +704,46 @@ class LaxVmapTest(jtu.JaxTestCase):
       lax.broadcast_shapes(err_shape1)
     # ... while non-integers should error earlier, in the canonicalize_shape machinery.
     with self.assertRaisesRegex(TypeError, "Shapes must be 1D sequences.*"):
-      lax.broadcast_shapes(err_shape2)  # pytype: disable=wrong-arg-types
+      lax.broadcast_shapes(err_shape2)
 
   @jtu.sample_product(
     [dict(shape=shape, bdims=bdims)
       for shape in [(4,), (3, 5, 3)]
       for bdims in lax_test_util.all_bdims(shape)],
     k=[1, 3],
+    axis=[0, -1],
     dtype=lax_test_util.default_dtypes,
   )
   # The top_k indices for integer arrays with identical entries won't match between
   # vmap'd version and manual reference, so only test unique integer arrays for int_dtypes.
   # Note also that we chose 3 * 5 * 3 * 5 such that it fits in the range of
   # values a bfloat16 can represent exactly to avoid ties.
-  def testTopK(self, shape, dtype, k, bdims):
+  def testTopK(self, shape, dtype, k, bdims, axis):
     rng = jtu.rand_int(self.rng(), high=math.prod(shape))
     # _CheckBatching doesn't work with tuple outputs, so test outputs separately.
-    op1 = lambda x: lax.top_k(x, k=k)[0]
+    op1 = lambda x: lax.top_k(x, k=k, axis=axis)[0]
     self._CheckBatching(op1, 5, bdims, (shape,), (dtype,), rng)
-    op2 = lambda x: lax.top_k(x, k=k)[1]
+    op2 = lambda x: lax.top_k(x, k=k, axis=axis)[1]
     self._CheckBatching(op2, 5, bdims, (shape,), (dtype,), rng)
+
+  @jtu.sample_product(
+    [dict(shape=shape, bdims=bdims)
+      for shape in [(8,), (3, 4, 5)]
+      for bdims in lax_test_util.all_bdims(shape)],
+    dtype=lax_test_util.default_dtypes,
+  )
+  def test_optimization_barrier_vmap(self, shape, dtype, bdims):
+    rng = jtu.rand_small(self.rng())
+    self._CheckBatching(lax.optimization_barrier, 5, bdims, (shape,), (dtype,),
+                        rng)
+
+  def test_optimization_barrier_vmap_out_axes(self):
+    x = jnp.arange(8)
+    y = x.reshape(1, 8)
+    out = jax.vmap(lax.optimization_barrier, in_axes=((0, 1),),
+                   out_axes=(0, 1))((x, y))
+    self.assertArraysEqual(out[0], x)
+    self.assertArraysEqual(out[1], y)
 
   @jtu.sample_product(
     [dict(shape=shape, bdims=bdims, dimension=dimension, arity=arity)
@@ -690,11 +775,9 @@ class LaxVmapTest(jtu.JaxTestCase):
   # TODO Collapse
   # TODO Scatter
 
-  # TODO(b/183233858): variadic reduce-window is not implemented on XLA:GPU
-  @jtu.skip_on_devices("gpu")
   def test_variadic_reduce_window(self):
-    # https://github.com/google/jax/discussions/9818 and
-    # https://github.com/google/jax/issues/9837
+    # https://github.com/jax-ml/jax/discussions/9818 and
+    # https://github.com/jax-ml/jax/issues/9837
     def normpool(x):
       norms = jnp.linalg.norm(x, axis=-1)
       idxs = jnp.arange(x.shape[0])
@@ -721,6 +804,46 @@ class LaxVmapTest(jtu.JaxTestCase):
     output = jax.vmap(normpool)(inpt[None, ...])  # doesn't crash
     expected = jnp.array([[[2.0, 2.0, 0.0], [3.0, 0.0, 1.0]]])
     self.assertAllClose(output, expected, check_dtypes=False)
+
+  @jtu.sample_product(
+      [
+          dict(arg_shape=arg_shape, reps=reps)
+          for arg_shape, reps in [
+              [(3,), (2,)],
+              [(2, 3), (1, 2)],
+              [(2, 3), (2, 1)],
+              [(2, 1, 3), (1, 2, 3)],
+          ]
+      ],
+      in_axes=[0, 1, -1],
+      out_axes=[0, 1, -1],
+  )
+  def testTileBatching(self, arg_shape, reps, in_axes, out_axes):
+    rng = jtu.rand_default(self.rng())
+    dtype = np.float32
+    args_maker = lambda: [rng(arg_shape, dtype)]
+    op = lambda x: lax.tile(x, reps)
+    args = args_maker()
+
+    # Construct batched arguments based on in_axes
+    if in_axes == 0:
+      batched_args = [jnp.stack([arg, arg], axis=0) for arg in args]
+    elif in_axes == 1:
+      batched_args = [jnp.stack([arg, arg], axis=1) for arg in args]
+    else: # in_axes == -1
+      batched_args = [jnp.stack([arg, arg], axis=-1) for arg in args]
+
+    # Compute expected output
+    out = op(*args)
+    if out_axes == 0:
+      expected = jnp.stack([out, out], axis=0)
+    elif out_axes == 1:
+      expected = jnp.stack([out, out], axis=1)
+    else: # out_axes == -1
+      expected = jnp.stack([out, out], axis=-1)
+
+    actual = jax.vmap(op, in_axes=in_axes, out_axes=out_axes)(*batched_args)
+    self.assertAllClose(expected, actual)
 
 
 if __name__ == '__main__':

@@ -13,7 +13,12 @@
 # limitations under the License.
 
 # Note: import <name> as <name> is required for names to be exported.
-# See PEP 484 & https://github.com/google/jax/issues/7570
+# See PEP 484 & https://github.com/jax-ml/jax/issues/7570
+
+from jax._src.core import (
+    InconclusiveDimensionOperation as InconclusiveDimensionOperation,
+    JaxprTypeError as JaxprTypeError,
+)
 
 from jax._src.errors import (
   JAXTypeError as JAXTypeError,
@@ -26,4 +31,8 @@ from jax._src.errors import (
   UnexpectedTracerError as UnexpectedTracerError,
   KeyReuseError as KeyReuseError,
 )
-from jax._src.traceback_util import SimplifiedTraceback as SimplifiedTraceback
+
+from jax._src.lib import _jax
+JaxRuntimeError = _jax.JaxRuntimeError
+JaxRuntimeError.__module__ = "jax.errors"
+del _jax

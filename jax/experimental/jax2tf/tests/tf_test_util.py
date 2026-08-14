@@ -14,12 +14,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-import contextlib
-import dataclasses
+from collections.abc import Callable, Sequence
 import re
 import os
-from typing import Any, Callable, Optional
+from typing import Any
 
 from absl.testing import absltest
 from absl import logging
@@ -31,13 +29,13 @@ from jax._src import test_util as jtu
 from jax import tree_util
 
 from jax.experimental import jax2tf
-from jax.experimental import export
+from jax import export
 from jax._src import config
 from jax._src import xla_bridge
+from jax._src.lib import xla_client as xc
 import numpy as np
-import tensorflow as tf  # type: ignore[import]
-from tensorflow.compiler.xla import xla_data_pb2  # type: ignore[import]
-from tensorflow.compiler.tf2xla.python import xla as tfxla  # type: ignore[import]
+import tensorflow as tf
+from tensorflow.compiler.tf2xla.python import xla as tfxla
 
 DType = Any
 
@@ -69,16 +67,6 @@ def _run_tf_function(func_tf: Callable, *tf_args, mode: str):
   else:
     assert False, (
         f"Expected 'eager', 'graph', or 'compiled' for mode: got '{mode}'")
-
-
-## Helper functions for matching OpMetadata in TF graphs
-@dataclasses.dataclass(order=True, frozen=True)
-class OpMetadataGraph:
-  tf_type: str  # The standard Tf.Operation.type
-  op_type: str  # The rest are OpMetadata fields from _Xla... attributes
-  op_name: str
-  source_file: str
-  source_line: str
 
 
 def SaveAndLoadModel(model: tf.Module,
@@ -180,23 +168,23 @@ class JaxToTfTestCase(jtu.JaxTestCase):
     # We run the tests using the maximum version supported, even though
     # the default serialization version may be held back for a while to
     # ensure compatibility
-    version = config.jax_serialization_version.value
+    version = config.jax_export_calling_convention_version.value
     if self.use_max_serialization_version:
       # Use the largest supported by both export and tfxla.call_module
-      version = min(export.maximum_supported_serialization_version,
+      version = min(export.maximum_supported_calling_convention_version,
                     tfxla.call_module_maximum_supported_version())
       self.assertGreaterEqual(version,
-                              export.minimum_supported_serialization_version)
-      self.enter_context(config.jax_serialization_version(version))
+                              export.minimum_supported_calling_convention_version)
+      self.enter_context(config.jax_export_calling_convention_version(version))
+      self.enter_context(jtu.ignore_warning(
+          category=DeprecationWarning, message='`with mesh:` context manager'))
     logging.info(
       "Using JAX serialization version %s (export.max_version %s, tf.XlaCallModule max version %s)",
       version,
-      export.maximum_supported_serialization_version,
+      export.maximum_supported_calling_convention_version,
       tfxla.call_module_maximum_supported_version())
 
-    with contextlib.ExitStack() as stack:
-      stack.enter_context(tf.device(self.tf_default_device))
-      self.addCleanup(stack.pop_all().close)
+    self.enter_context(tf.device(self.tf_default_device))
 
   def assertDtypesMatch(self, x, y, *, canonicalize_dtypes=True):
     """Compares dtypes across JAX and TF dtypes. Overrides super method."""
@@ -215,7 +203,6 @@ class JaxToTfTestCase(jtu.JaxTestCase):
   def ConvertAndCompare(self,
                         func_jax: Callable,
                         *args,
-                        enable_xla: bool = True,
                         limitations: Sequence = ()):
     """Compares jax_func(*args) with convert(jax_func)(*args).
 
@@ -228,8 +215,6 @@ class JaxToTfTestCase(jtu.JaxTestCase):
     Args:
       func_jax: the function to invoke (``func_jax(*args)``)
       args: the arguments.
-      enable_xla: if True, allows the use of XLA ops in jax2tf.convert
-        (default: True).
       limitations: the set of limitations for this harness (not yet filtered
         by mode).
     """
@@ -238,7 +223,7 @@ class JaxToTfTestCase(jtu.JaxTestCase):
     result_jax = func_jax(*args)  # JAX
     result_tf = None
 
-    func_tf = jax2tf.convert(func_jax, enable_xla=enable_xla)
+    func_tf = jax2tf.convert(func_jax)
 
     unexpected_successes: list[str] = []
     # Run the "compiled" mode first, it is most important
@@ -248,7 +233,7 @@ class JaxToTfTestCase(jtu.JaxTestCase):
       def log_message(extra):
         return f"[{self._testMethodName}] {mode=}: {extra}"
 
-      jax2tf_limits = tuple(filter(lambda l: l.filter(mode=mode), limitations))
+      jax2tf_limits = tuple(filter(lambda l: l.filter(), limitations))
 
       skip_tf_run = [l for l in jax2tf_limits if l.skip_tf_run]
       if skip_tf_run:
@@ -293,7 +278,7 @@ class JaxToTfTestCase(jtu.JaxTestCase):
         logging.info(log_message(f"Using tol={max_tol} due to {max_tol_lim}"))
 
       # Convert results to np.arrays
-      result_tf = tf.nest.map_structure(lambda t: t.numpy(), result_tf)  # type: ignore
+      result_tf = tf.nest.map_structure(lambda t: t.numpy(), result_tf)
 
       custom_assert_lim = [l for l in jax2tf_limits if l.custom_assert]
       assert len(custom_assert_lim) <= 1, f"Expecting at most one applicable limitation with custom_assert, found {custom_assert_lim}"
@@ -325,7 +310,7 @@ class JaxToTfTestCase(jtu.JaxTestCase):
         # We log the HLO dialect for easier comparison with TF
         logging.info("[%s] JAX NON_OPT HLO\n%s",
                      self._testMethodName,
-                     jax_lowered.compiler_ir(dialect="hlo").as_hlo_text())  # type: ignore
+                     jax_lowered.compiler_ir(dialect="hlo").as_hlo_text())
 
         tf_args_signature = _make_tf_input_signature(*args)
         # If we give the signature, we cannot pass scalars
@@ -344,7 +329,9 @@ class JaxToTfTestCase(jtu.JaxTestCase):
                      tf_hlo)
 
         backend = xla_bridge.get_backend()
-        modules = backend.compile(str(jax_lowered.compiler_ir())).hlo_modules()
+        device_list = xc.DeviceList(tuple(backend.local_devices()))
+        modules = backend.compile_and_load(
+            str(jax_lowered.compiler_ir()), device_list).hlo_modules()
         jax_opt_hlo = modules[0].to_string()
         logging.info("[%s] JAX OPT HLO\n%s", self._testMethodName,
                      jax_opt_hlo)
@@ -411,68 +398,7 @@ class JaxToTfTestCase(jtu.JaxTestCase):
     # graph. We count the number of characters in the textual representation
     # of the constant.
     f_tf_graph = tf.function(tf_fun, autograph=False).get_concrete_function(*args).graph.as_graph_def()
-    if config.jax2tf_default_native_serialization.value:
-      # This way of finding constants may be brittle, if the constant representation
-      # contains >. It seems tobe hex-encoded, so this may be safe.
-      large_consts = [m for m in re.findall(r"dense<([^>]+)>", str(f_tf_graph)) if len(m) >= at_least]
-    else:
-      # We cannot find the constants just with string matching because their
-      # representation may contain escaped "
-      large_consts = [str(n) for n in f_tf_graph.node if n.op == "Const" and len(str(n)) >= at_least]
+    # This way of finding constants may be brittle, if the constant representation
+    # contains >. It seems tobe hex-encoded, so this may be safe.
+    large_consts = [m for m in re.findall(r"dense<([^>]+)>", str(f_tf_graph)) if len(m) >= at_least]
     return large_consts
-
-  def CheckOpMetadata(self, jax_fun, x,
-                      expected: Sequence[OpMetadataGraph],
-                      include_xla_op_metadata=True):
-    """Checks that the tf.Graph obtained by converting `jax_fun` for argument
-    `x` contains all the given OpMetadata.
-
-    If `not include_xla_op_metadata` then disable the generation of the
-    OpMetadata attributes, and check that we don't find any ops with
-    metadata.
-    """
-    f_tf = tf.function(
-        jax2tf.convert(jax_fun,
-                       include_xla_op_metadata=include_xla_op_metadata),
-        autograph=False,
-        input_signature=[tf.TensorSpec(x.shape, x.dtype)])
-    # Trace the TF function to a graph
-    f_tf_concrete = f_tf.get_concrete_function(tf.convert_to_tensor(x))
-
-    found_tf_ops = []
-    def iter_nested_graph(graph: tf.Graph):
-      for n in graph._nodes_by_id.values():
-        try:
-          op_metadata = n.get_attr("_XlaOpMetadata")
-          op_metadata_proto = xla_data_pb2.OpMetadata()
-          op_metadata_proto.ParseFromString(op_metadata)
-          found_tf_ops.append(
-              OpMetadataGraph(
-                  tf_type=n.type,
-                  op_name=op_metadata_proto.op_name,
-                  op_type=op_metadata_proto.op_type,
-                  source_file=op_metadata_proto.source_file,
-                  source_line=op_metadata_proto.source_line))
-        except ValueError:
-          continue
-
-        # Look for nested graphs. There probably is a better way!
-        if n.type == "StatelessWhile":
-          iter_nested_graph(n._body_graph)
-          iter_nested_graph(n._cond_graph)
-        if n.type == "StatelessCase":
-          for idx in range(10):  # How can I tell how many cases there are?
-            branch = getattr(n, f"_branch_graph_{idx}", None)
-            if branch is None:
-              break
-            iter_nested_graph(branch)
-
-    iter_nested_graph(f_tf_concrete.graph)
-    try:
-      if include_xla_op_metadata:
-        self.assertContainsSubset(expected, found_tf_ops)
-      else:
-        self.assertEmpty(found_tf_ops)
-    except Exception:
-      print("Found nodes:\n  ", "\n   ".join([str(md) for md in found_tf_ops]))
-      raise

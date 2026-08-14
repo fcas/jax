@@ -1,8 +1,25 @@
+/* Copyright 2023 The JAX Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
 #ifndef JAXLIB_GPU_TRITON_H_
 #define JAXLIB_GPU_TRITON_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <variant>
@@ -10,9 +27,10 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "jaxlib/gpu/gpu_kernel_helpers.h"
+#include "absl/strings/string_view.h"
 #include "jaxlib/gpu/triton.pb.h"
 #include "jaxlib/gpu/vendor.h"
+#include "xla/ffi/ffi.h"
 #include "xla/service/custom_call_status.h"
 
 namespace jax::JAX_GPU_NAMESPACE {
@@ -20,31 +38,97 @@ namespace jax::JAX_GPU_NAMESPACE {
 void TritonKernelCall(gpuStream_t stream, void** buffers, const char* opaque,
                       size_t opaque_len, XlaCustomCallStatus* status);
 
+XLA_FFI_DECLARE_HANDLER_SYMBOL(kTritonKernelCallFfi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(kTritonKernelCallFfiInitialize);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(kTritonKernelCallFfiInstantiate);
+
 class ModuleImage;
+class KernelCall;
+
+// The result of the instantiate function in FFI, containing the fully compiled
+// kernel down to machine code (e.g. CUBIN).
+// For autotuned kernels, all candidates are compiled down to machine code.
+//
+// This is the structure that is serialized during AOT compilation in XLA.
+struct TritonKernelInstantiateResult {
+  jax_triton::TritonCustomCallStateProto proto;
+
+  TritonKernelInstantiateResult() { proto.set_version(2); }
+
+  static absl::StatusOr<std::string> Serialize(
+      const TritonKernelInstantiateResult& instantiate_result) {
+    return instantiate_result.proto.SerializeAsString();
+  }
+
+  static absl::StatusOr<std::unique_ptr<TritonKernelInstantiateResult>>
+  Deserialize(absl::string_view data) {
+    auto instantiate_result = std::make_unique<TritonKernelInstantiateResult>();
+    if (!instantiate_result->proto.ParseFromString(data)) {
+      return absl::InvalidArgumentError(
+          "Failed to parse TritonCustomCallStateProto");
+    }
+    if (instantiate_result->proto.version() != 2) {
+      return absl::InvalidArgumentError(
+          "Unsupported TritonCustomCallStateProto version");
+    }
+    return instantiate_result;
+  }
+};
+
+// A thin wrapper around a `KernelCall` that is ready to be executed, needed
+// since we can't use the bare pointer as a state in FFI.
+//
+// Unlike TritonKernelInstantiateResult, this structure doesn't need to be
+// serialized.
+struct TritonKernelInitializeResult {
+  explicit TritonKernelInitializeResult(KernelCall* kernel_call = nullptr)
+      : kernel_call(kernel_call) {}
+
+  // The actual kernel call is owned by an static cache within
+  // triton_kernels.cc.
+  KernelCall* kernel_call = nullptr;
+};
 
 class Kernel {
  public:
-  Kernel(std::string kernel_name, uint32_t num_warps, uint32_t shared_mem_bytes,
-         std::string ptx, std::string ttir, int compute_capability,
-         uint32_t cluster_dim_0, uint32_t cluster_dim_1,
-         uint32_t cluster_dim_2);
+  Kernel(std::string kernel_name, uint32_t num_warps, uint32_t num_ctas,
+         uint32_t shared_mem_bytes, std::string ptx, std::string ttir,
+         int compute_capability,
+         std::optional<uint32_t> global_scratch_size = std::nullopt,
+         std::optional<uint32_t> global_scratch_align = std::nullopt,
+         ModuleImage* module_image = nullptr);
 
   absl::Status Launch(gpuStream_t stream, uint32_t grid[3], void** params);
 
-  static Kernel FromProto(const jax_triton::TritonKernel& proto);
+  static absl::StatusOr<Kernel> FromProto(
+      const jax_triton::TritonKernel& proto);
   jax_triton::TritonKernel ToProto() const;
 
   // Returns true if we can launch the kernel without crashing.
   bool CanLaunchOnDevice(gpuDevice_t) const;
 
+  const std::string& kernel_name() const { return kernel_name_; }
+  uint32_t num_ctas() const { return num_ctas_; }
+  uint32_t shared_mem_bytes() const { return shared_mem_bytes_; }
+  const std::string& ptx() const { return ptx_; }
+  int compute_capability() const { return compute_capability_; }
+  std::optional<uint32_t> global_scratch_size() const {
+    return global_scratch_size_;
+  }
+  std::optional<uint32_t> global_scratch_align() const {
+    return global_scratch_align_;
+  }
+
  private:
   std::string kernel_name_;
   uint32_t block_dim_x_;
+  uint32_t num_ctas_;
   uint32_t shared_mem_bytes_;
   std::string ptx_;
   std::string ttir_;
   int compute_capability_;
-  uint32_t cluster_dims_[3];
+  std::optional<uint32_t> global_scratch_size_;
+  std::optional<uint32_t> global_scratch_align_;
 
   ModuleImage* module_image_ = nullptr;
 };
@@ -57,12 +141,21 @@ class KernelCall {
       size_t ptr_divisibility;
     };
 
+    struct TmaDescriptor {
+      uint32_t elem_type;   // CUtensorMapDataType enum value.
+      uint32_t swizzle;     // CUtensorMapSwizzle enum value.
+      std::vector<uint64_t> shape;
+      std::vector<uint64_t> strides;       // Element strides.
+      std::vector<uint32_t> block_shape;
+      uint32_t oob_fill;    // 0 = none, 1 = NaN-request-zero-FMA.
+    };
+
     static absl::StatusOr<Parameter> FromProto(
         const jax_triton::TritonKernelCall_Parameter& proto);
     jax_triton::TritonKernelCall_Parameter ToProto() const;
 
     std::variant<Array, bool, int32_t, uint32_t, int64_t, uint64_t, float,
-                 double>
+                 double, TmaDescriptor>
         value;
   };
 
@@ -77,6 +170,8 @@ class KernelCall {
 
   // Returns true if we can launch the kernel without crashing.
   bool CanLaunchOnDevice(gpuDevice_t) const;
+
+  const Kernel& kernel() const { return kernel_; }
 
  private:
   Kernel kernel_;
@@ -93,8 +188,7 @@ class AutotunedKernelCall {
 
   AutotunedKernelCall(
       std::string name, std::vector<Config> configs,
-      std::vector<std::tuple<size_t,
-      size_t, size_t>> input_output_aliases);
+      std::vector<std::tuple<size_t, size_t, size_t>> input_output_aliases);
 
   static absl::StatusOr<KernelCall> Autotune(AutotunedKernelCall kernel_call,
                                              gpuStream_t stream,

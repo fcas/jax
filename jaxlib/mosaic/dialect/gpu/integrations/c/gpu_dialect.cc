@@ -1,0 +1,102 @@
+/* Copyright 2024 The JAX Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "jaxlib/mosaic/dialect/gpu/integrations/c/gpu_dialect.h"
+
+#include "mlir-c/IR.h"
+#include "mlir-c/Support.h"
+#include "mlir/CAPI/IR.h"
+#include "mlir/CAPI/Registration.h"
+#include "mlir/CAPI/Support.h"
+#include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
+#include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
+#include "mlir/Support/LLVM.h"
+#include "jaxlib/mosaic/dialect/gpu/mosaic_gpu.h"
+
+extern "C" {
+
+MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(MosaicGPU, mosaic_gpu,
+                                      mosaic_gpu::MosaicGPUDialect);
+
+void mlirDialectRegistryInsertMosaicGpuInlinerExtensions(
+    MlirDialectRegistry registry) {
+  mlir::LLVM::registerInlinerInterface(*unwrap(registry));
+  mlir::func::registerInlinerExtension(*unwrap(registry));
+}
+
+//===----------------------------------------------------------------------===//
+// BarrierType
+//===----------------------------------------------------------------------===//
+
+bool mlirMosaicGpuIsABarrierType(MlirType type) {
+  return mlir::isa<mosaic_gpu::BarrierType>(unwrap(type));
+}
+
+MlirType mlirMosaicGpuBarrierTypeGet(MlirContext ctx, bool orders_tensor_core) {
+  return wrap(mosaic_gpu::BarrierType::get(unwrap(ctx), orders_tensor_core));
+}
+
+bool mlirMosaicGpuBarrierTypeGetOrdersTensorCore(MlirType type) {
+  return mlir::cast<mosaic_gpu::BarrierType>(unwrap(type))
+      .getOrdersTensorCore();
+}
+
+MlirTypeID mlirMosaicGpuBarrierTypeGetTypeID() {
+  return wrap(mosaic_gpu::BarrierType::getTypeID());
+}
+
+//===----------------------------------------------------------------------===//
+// B6x16P32Type
+//===----------------------------------------------------------------------===//
+
+bool mlirMosaicGpuIsAB6x16P32Type(MlirType type) {
+  return mlir::isa<mosaic_gpu::B6x16P32Type>(unwrap(type));
+}
+
+MlirType mlirMosaicGpuB6x16P32TypeGet(MlirContext ctx, MlirType element_type) {
+  return wrap(mosaic_gpu::B6x16P32Type::get(unwrap(ctx), unwrap(element_type)));
+}
+
+MlirType mlirMosaicGpuB6x16P32TypeGetElementType(MlirType type) {
+  return wrap(
+      mlir::cast<mosaic_gpu::B6x16P32Type>(unwrap(type)).getElementType());
+}
+
+MlirTypeID mlirMosaicGpuB6x16P32TypeGetTypeID() {
+  return wrap(mosaic_gpu::B6x16P32Type::getTypeID());
+}
+
+//===----------------------------------------------------------------------===//
+// P2B6Type
+//===----------------------------------------------------------------------===//
+
+bool mlirMosaicGpuIsAP2B6Type(MlirType type) {
+  return mlir::isa<mosaic_gpu::P2B6Type>(unwrap(type));
+}
+
+MlirType mlirMosaicGpuP2B6TypeGet(MlirContext ctx, MlirType element_type) {
+  return wrap(mosaic_gpu::P2B6Type::get(unwrap(ctx), unwrap(element_type)));
+}
+
+MlirType mlirMosaicGpuP2B6TypeGetElementType(MlirType type) {
+  return wrap(
+      mlir::cast<mosaic_gpu::P2B6Type>(unwrap(type)).getElementType());
+}
+
+MlirTypeID mlirMosaicGpuP2B6TypeGetTypeID() {
+  return wrap(mosaic_gpu::P2B6Type::getTypeID());
+}
+
+}  // extern "C"

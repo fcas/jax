@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import copy
 import hashlib
 import io
+import json
 import logging
 import os
 import sys
@@ -22,6 +24,7 @@ from typing import cast as type_cast
 
 from jax._src import config
 from jax._src.lib import version_str as jaxlib_version_str
+from jax._src.lib import _jax
 from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir import passmanager as pm
@@ -55,17 +58,20 @@ def get_flag_prefixes() -> list[str]:
 def custom_hook() -> str:
   """Custom hook for any addition to the cache key.
 
-  The custom hook will be called everytime get() is called and can be
+  The custom hook will be called every time get() is called and can be
   defined to return a string that will be hashed into the cache key.
   """
   return ""
 
 
-def get(module: ir.Module,
-        devices: np.ndarray,
-        compile_options: xla_client.CompileOptions,
-        backend: xla_client.Client,
-        compression_algorithm: str = "zstandard") -> str:
+def get(
+    module: ir.Module,
+    devices: np.ndarray,
+    compile_options: xla_client.CompileOptions,
+    backend: xla_client.Client,
+    compression_algorithm: str = "zstandard",
+    ignore_custom_partitioning: bool = False,
+) -> str:
   """Creates a hashed string to use as a key to the compilation cache.
 
   Creates a cache key that is a hex-encoded string of a unique hash based on
@@ -78,27 +84,51 @@ def get(module: ir.Module,
     backend: description of the platform (e.g., TPU version)
     compression_algorithm: a string representing the compression algorithm used
       for the executable before persisting in the cache
+    ignore_custom_partitioning: whether to remove custom_partitioning callback
+      pointers from the computation.
 
   Typical return value example:
    'jit__psum-14ac577cdb2ef6d986078b4054cc9893a9a14a16dbb0d8f37b89167c1f1aacdf'
   """
   entries = [
-      ("computation", lambda hash_obj: _hash_computation(hash_obj, module)),
-      ("jax_lib version",
-       lambda hash_obj: hash_obj.update(
-           bytes(jaxlib_version_str.encode("utf-8")))),
-      ("XLA flags",
-       lambda hash_obj: _hash_xla_flags(hash_obj, get_flag_prefixes())),
-      ("compile_options",
-       lambda hash_obj: _hash_serialized_compile_options(
-           hash_obj, compile_options,
-           # In case of GPU multi-process tasks we need to strip device
-           # assignment to use cache key as invariant between processes.
-           strip_device_assignment=(backend.platform == "gpu"))),
-      ("accelerator_config",
-         lambda hash_obj: _hash_accelerator_config(hash_obj, devices, backend)),
-      ("compression",
-       lambda hash_obj: _hash_string(hash_obj, compression_algorithm)),
+      (
+          "computation",
+          lambda hash_obj: _hash_computation(
+              hash_obj, module, ignore_custom_partitioning
+          ),
+      ),
+      (
+          "jax_lib version",
+          lambda hash_obj: hash_obj.update(
+              bytes(jaxlib_version_str.encode("utf-8"))
+          ),
+      ),
+      (
+          "backend version",
+          lambda hash_obj: _hash_platform(hash_obj, backend)
+      ),
+      (
+          "XLA flags",
+          lambda hash_obj: _hash_xla_flags(hash_obj, get_flag_prefixes()),
+      ),
+      (
+          "compile_options",
+          lambda hash_obj: _hash_serialized_compile_options(
+              hash_obj,
+              compile_options,
+              # In case of GPU multi-process tasks we need to strip device
+              # assignment to use cache key as invariant between processes.
+              strip_device_assignment=(backend.platform == "gpu"),
+          ),
+      ),
+      (
+          "accelerator_config",
+          lambda hash_obj: _hash_accelerator_config(hash_obj, devices),
+      ),
+      (
+          "compression",
+          lambda hash_obj: _hash_string(hash_obj, compression_algorithm),
+      ),
       ("custom_hook", lambda hash_obj: _hash_string(hash_obj, custom_hook())),
   ]
 
@@ -129,27 +159,95 @@ def _log_cache_key_hash(hash_obj, last_serialized: str, hashfn):
     )
 
 
-def _serialize_ir(m: ir.Module) -> bytes:
+def _remove_custom_partitioning_callbacks(m: ir.Module):
+  """Removes custom_partitioning callback pointers from precompiled IR.
+
+  Python function pointers are not deterministic across executions.
+  """
+  def _update_bc_attribute(op: ir.Operation) -> ir.WalkResult:
+    if "call_target_name" not in op.attributes:
+      return ir.WalkResult.ADVANCE
+    call_target_name = op.attributes["call_target_name"]
+    assert isinstance(call_target_name, ir.StringAttr)
+    if (
+        op.name == "stablehlo.custom_call"
+        and call_target_name.value == "CustomSPMDPartitioning"
+    ):
+      op.attributes["backend_config"] = ir.StringAttr.get("REMOVED")
+    return ir.WalkResult.ADVANCE
+
+  m.operation.walk(_update_bc_attribute)
+  return m
+
+
+def _strip_mosaic_debug_info(m: ir.Module) -> None:
+  """Strips debug info from Mosaic kernel bytecode in tpu_custom_call ops.
+
+  The top-level strip-debuginfo pass does not reach into the serialized kernel
+  MLIR embedded in backend_config, so source file paths leak into the cache key.
+  """
+  try:
+    from jax._src.lib import tpu  # pylint: disable=g-import-not-at-top
+  except ImportError:
+    return
+
+  def _strip_kernel(op: ir.Operation) -> ir.WalkResult:
+    if (op.name != "stablehlo.custom_call"
+        or op.attributes["call_target_name"].value != "tpu_custom_call"):  # type: ignore
+      return ir.WalkResult.ADVANCE
+    bc = json.loads(op.attributes["backend_config"].value)  # type: ignore
+    body = bc.get("custom_call_config", {}).get("body")
+    if not body:
+      return ir.WalkResult.ADVANCE
+    ctx = m.context
+    tpu.register_dialect(ctx)
+    ctx.allow_unregistered_dialects = True
+    with ctx:
+      try:
+        kernel = ir.Module.parse(base64.b64decode(body), context=ctx)
+      except ir.MLIRError:
+        return ir.WalkResult.ADVANCE
+      pm.PassManager.parse("builtin.module(strip-debuginfo)").run(
+          kernel.operation)
+      out = io.BytesIO()
+      kernel.operation.write_bytecode(out)
+    bc["custom_call_config"]["body"] = base64.b64encode(
+        out.getvalue()).decode()
+    op.attributes["backend_config"] = ir.StringAttr.get(
+        json.dumps(bc, separators=(",", ":")))
+    return ir.WalkResult.ADVANCE
+
+  m.operation.walk(_strip_kernel)
+
+
+def _serialize_ir(m: ir.Module, ignore_custom_partitioning: bool) -> bytes:
   output = io.BytesIO()
+  if ignore_custom_partitioning:
+    m = _remove_custom_partitioning_callbacks(
+        type_cast(ir.Module, m.operation.clone(ip=False))
+    )
   m.operation.write_bytecode(file=output)
   return output.getvalue()
 
 
-def _canonicalize_ir(m_original: ir.Module) -> bytes:
+def _canonicalize_ir(
+    m_original: ir.Module, ignore_custom_partitioning: bool
+) -> bytes:
   with m_original.context:
-    m = type_cast(ir.Module, m_original.operation.clone())
+    m = type_cast(ir.Module, m_original.operation.clone(ip=False))
     passes = pm.PassManager.parse(
         "builtin.module(strip-debuginfo)"
     )
     passes.run(m.operation)
-    return _serialize_ir(m)
+    _strip_mosaic_debug_info(m)
+    return _serialize_ir(m, ignore_custom_partitioning)
 
 
-def _hash_computation(hash_obj, module):
+def _hash_computation(hash_obj, module, ignore_custom_partitioning: bool):
   if config.compilation_cache_include_metadata_in_key.value:
-    canonical_ir = _serialize_ir(module)
+    canonical_ir = _serialize_ir(module, ignore_custom_partitioning)
   else:
-    canonical_ir = _canonicalize_ir(module)
+    canonical_ir = _canonicalize_ir(module, ignore_custom_partitioning)
   hash_obj.update(canonical_ir)
 
 
@@ -158,23 +256,55 @@ def _hash_devices(hash_obj, devices: np.ndarray) -> None:
     _hash_string(hash_obj, device.device_kind)
 
 
-def _hash_accelerator_config(hash_obj, accelerators: np.ndarray, backend):
+def _hash_accelerator_config(hash_obj, accelerators: np.ndarray):
   accelerator_devices = []
   for accelerator in accelerators.flat:
     accelerator_devices.append(accelerator)
   try:
-    hash_obj.update(
-        xla_client.get_topology_for_devices(accelerator_devices).serialize()
-    )
-  except xla_client._xla.XlaRuntimeError as ex:
+    topology = xla_client.get_topology_for_devices(accelerator_devices)
+    hash_obj.update(topology.fingerprint().to_bytes(8, byteorder="big"))
+  except _jax.JaxRuntimeError as ex:
     # Fall back for those backends that do not support serialized
     # PjRtTopologyDescription as yet.
     logger.info("get (_hash_accelerator_config): unable to hash "
                 "accelerator config, falling back to hashing "
-                "devices + platform: %s (type %s)", ex, type(ex))
+                "devices %s (type %s)", ex, type(ex))
     _hash_devices(hash_obj, accelerators)
-    _hash_platform(hash_obj, backend)
 
+# LINT.IfChange(xla_flags)
+xla_flags_to_exclude_from_cache_key = [
+    "--xla_dump_compress_protos",
+    "--xla_dump_module_metadata",
+    "--xla_dump_max_hlo_modules",
+    "--xla_dump_include_timestamp",
+    "--xla_dump_hlo_pass_re",
+    "--xla_dump_hlo_module_re",
+    "--xla_dump_hlo_snapshots",
+    "--xla_dump_fusion_visualization",
+    "--xla_dump_hlo_as_url",
+    "--xla_dump_hlo_as_proto",
+    "--xla_dump_hlo_as_text",
+    "--xla_dump_hlo_as_long_text",
+    "--xla_dump_hlo_as_html",
+    "--xla_dump_hlo_as_dot",
+    "--xla_dump_to",
+    "--xla_force_host_platform_device_count",
+    "--xla_dump_disable_metadata",
+    "--xla_dump_hlo_pipeline_re",
+    "--xla_tpu_sdc_checker_streamz_metric",
+    "--xla_tpu_sdc_checker_enable_sdc_event_callbacks",
+    "--xla_tpu_sdc_checker_enable_coresweep_ng_callbacks",
+    "--xla_tpu_sdc_checker_no_logging_if_callbacks_are_present",
+    "--xla_gpu_cuda_data_dir",
+    "--xla_gpu_experimental_autotune_cache_mode",
+    "--xla_gpu_per_fusion_autotune_cache_dir",
+    "--xla_tpu_compiler_variant",
+]
+
+env_override_flags_to_exclude_from_cache_key = {
+    x.strip("-") for x in xla_flags_to_exclude_from_cache_key
+}
+# LINT.ThenChange(:debug_options)
 
 def _hash_serialized_compile_options(hash_obj, compile_options_obj,
                                      strip_device_assignment=False):
@@ -206,6 +336,8 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
   debug_options.xla_dump_hlo_as_long_text = False
   debug_options.xla_dump_disable_metadata = False
   debug_options.xla_dump_hlo_pipeline_re = ""
+  debug_options.xla_gpu_experimental_autotune_cache_mode = 0
+
   # Optional way to specify the cuda install path to be used by the compiler.
   # This could possibly affect the cuda version compiled with, but this should
   # already be included in the platform information (and might not be reflected
@@ -214,13 +346,19 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
   # path changes across runs despite being the same version, so we clear it
   # here.
   debug_options.xla_gpu_cuda_data_dir = ""
+  debug_options.xla_gpu_per_fusion_autotune_cache_dir = ""
   # LINT.ThenChange(:xla_flags)
 
+  compile_options_copy.env_option_overrides = [
+      flag_value
+      for flag_value in compile_options_copy.env_option_overrides
+      if flag_value[0] not in env_override_flags_to_exclude_from_cache_key
+  ]
   if strip_device_assignment and compile_options_copy.device_assignment:
     replica_count = compile_options_copy.device_assignment.replica_count()
     computation_count = compile_options_copy.device_assignment.computation_count()
     compile_options_copy.device_assignment = xla_client.DeviceAssignment.create(
-        np.arange(replica_count * computation_count).reshape(
+        np.arange(replica_count * computation_count).reshape(  # pyrefly: ignore[bad-argument-type]
           [replica_count, computation_count])
     )
   return hash_obj.update(compile_options_copy.SerializeAsString())
@@ -229,36 +367,9 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
 def _hash_platform(hash_obj, backend):
   _hash_string(hash_obj, backend.platform)
   _hash_string(hash_obj, backend.platform_version)
-  _hash_string(hash_obj, backend.runtime_type)
 
 
 def _hash_xla_flags(hash_obj, extra_flag_prefixes: list[str]):
-  # LINT.IfChange(xla_flags)
-  xla_flags_to_exclude_from_cache_key = [
-      "--xla_dump_compress_protos",
-      "--xla_dump_module_metadata",
-      "--xla_dump_max_hlo_modules",
-      "--xla_dump_include_timestamp",
-      "--xla_dump_hlo_pass_re",
-      "--xla_dump_hlo_module_re",
-      "--xla_dump_hlo_snapshots",
-      "--xla_dump_fusion_visualization",
-      "--xla_dump_hlo_as_url",
-      "--xla_dump_hlo_as_proto",
-      "--xla_dump_hlo_as_text",
-      "--xla_dump_hlo_as_long_text",
-      "--xla_dump_hlo_as_html",
-      "--xla_dump_hlo_as_dot",
-      "--xla_dump_to",
-      "--xla_force_host_platform_device_count",
-      "--xla_dump_disable_metadata",
-      "--xla_dump_hlo_pipeline_re",
-      "--xla_tpu_sdc_checker_streamz_metric",
-      "--xla_tpu_sdc_checker_enable_sdc_event_callbacks",
-      "--xla_gpu_cuda_data_dir",
-  ]
-  # LINT.ThenChange(:debug_options)
-
   xla_flags = []
 
   xla_flags_env_var = os.getenv("XLA_FLAGS")

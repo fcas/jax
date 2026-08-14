@@ -5,7 +5,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.16.1
+    jupytext_version: 1.16.4
 kernelspec:
   display_name: Python 3
   language: python
@@ -14,6 +14,8 @@ kernelspec:
 
 (automatic-differentiation)=
 # Automatic differentiation
+
+<!--* freshness: { reviewed: '2024-05-03' } *-->
 
 In this section, you will learn about fundamental applications of automatic differentiation (autodiff) in JAX. JAX has a pretty general autodiff system.
 Computing gradients is a critical part of modern machine learning methods, and this tutorial will walk you through a few introductory autodiff topics, such as:
@@ -24,7 +26,7 @@ Computing gradients is a critical part of modern machine learning methods, and t
 - {ref}`automatic-differentiation-evaluating-using-jax-value_and_grad`
 - {ref}`automatic-differentiation-checking-against-numerical-differences`
 
-Make sure to also check out the {ref}`advanced-autodiff` tutorial for more advanced topics.
+Make sure to also check out the {ref}`"Advanced automatic differentiation" guides <advanced_guides>` for more advanced topics.
 
 While understanding how automatic differentiation works "under the hood" isn't crucial for using JAX in most contexts, you are encouraged to check out this quite accessible [video](https://www.youtube.com/watch?v=wG_nF1awSSY) to get a deeper sense of what's going on.
 
@@ -228,4 +230,4 @@ check_grads(loss, (W, b), order=2)  # check up to 2nd order derivatives
 
 ## Next steps
 
-The {ref}`advanced-autodiff` tutorial provides more advanced and detailed explanations of how the ideas covered in this document are implemented in the JAX backend. Some features, such as {ref}`advanced-autodiff-custom-derivative-rules`, depend on understanding advanced automatic differentiation, so do check out that section in the {ref}`advanced-autodiff` tutorial if you are interested.
+The {ref}`"Advanced automatic differentiation" guides <advanced_guides>` provide more advanced and detailed explanations of how the ideas covered in this document are implemented in the JAX backend. Some features, such as {ref}`advanced-autodiff-custom-derivative-rules`, depend on understanding advanced automatic differentiation, so do check out that section if you are interested.

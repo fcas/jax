@@ -12,10 +12,16 @@ List of Functions
    :toctree: _autosummary
 
    all
+   broadcast
    flatten
+   flatten_with_path
    leaves
+   leaves_with_path
    map
+   map_with_path
    reduce
+   reduce_associative
+   static
    structure
    transpose
    unflatten

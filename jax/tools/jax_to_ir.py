@@ -80,12 +80,12 @@ import jax.numpy as jnp
 try:
   from jax.experimental import jax2tf
 except ImportError:
-  jax2tf = None  # type: ignore[assignment]
+  jax2tf = None
 
 try:
   import tensorflow as tf
 except ImportError:
-  tf = None  # type: ignore
+  tf = None
 
 
 _FN = flags.DEFINE_string(
@@ -151,7 +151,8 @@ def jax_to_ir(fn, input_shapes, *, constants=None, format):
     return fn_curried(**dict(zip(arg_names, args)))
 
   if format == 'HLO':
-    comp = jax.xla_computation(ordered_wrapper)(*args)
+    comp = jax.jit(ordered_wrapper).lower(*args).compiler_ir('hlo')
+    assert comp is not None
     serialized_proto = comp.as_serialized_hlo_module_proto()
     debug_txt = comp.as_hlo_text()
   else:
@@ -159,8 +160,11 @@ def jax_to_ir(fn, input_shapes, *, constants=None, format):
     if tf is None:
       raise ValueError(
           'Conversion to TF graph requires TensorFlow to be installed.')
+    if jax2tf is None:
+      raise ValueError(
+          'Conversion to TF graph requires jax.experimental.jax2tf to be importable.')
 
-    f = jax2tf.convert(ordered_wrapper, native_serialization=False)
+    f = jax2tf.convert(ordered_wrapper)
     f = tf_wrap_with_input_names(f, input_shapes)
     f = tf.function(f, autograph=False)
     g = f.get_concrete_function(*args).graph.as_graph_def()
@@ -172,6 +176,7 @@ def jax_to_ir(fn, input_shapes, *, constants=None, format):
 
 def tf_wrap_with_input_names(f, input_shapes):
   def wrapper(*args):
+    assert tf is not None  # checked in caller
     args = tuple(
         tf.identity(a, name=name) for a, (name, _) in zip(args, input_shapes))
     # NOTE: Output names already set via `jax2tf.convert(..)`.
@@ -190,12 +195,17 @@ def main(argv):
     raise app.Error('At least one of --ir_dest and '
                     '--ir_human_dest is required.')
 
-  module_name, fn_name = _FN.value.rsplit('.', 1)
+  raw_input_shapes = _INPUT_SHAPES.value
+  raw_fn_name = _FN.value
+  assert raw_input_shapes is not None  # required by set_up_flags
+  assert raw_fn_name is not None  # required by set_up_flags
+
+  module_name, fn_name = raw_fn_name.rsplit('.', 1)
   module = importlib.import_module(module_name)
   fn = getattr(module, fn_name)
 
   input_shapes = [(name, parse_shape_str(shape_str))
-                  for name, shape_str in literal_eval(_INPUT_SHAPES.value)]
+                  for name, shape_str in literal_eval(raw_input_shapes)]
 
   # Parse --constants and --evaled_constants.
   constants = {}
@@ -240,12 +250,18 @@ def parse_shape_str(s):
 
 _DT = {
     'pred': jnp.bool_,
-    'u4': jnp.uint4, 'u8': jnp.uint8, 'u16': jnp.uint16, 'u32': jnp.uint32, 'u64': jnp.uint64,
-    's4': jnp.int4, 's8': jnp.int8, 's16': jnp.int16, 's32': jnp.int32, 's64': jnp.int64,
+    'u2': jnp.uint2, 'u4': jnp.uint4, 'u8': jnp.uint8, 'u16': jnp.uint16, 'u32': jnp.uint32, 'u64': jnp.uint64,
+    's2': jnp.int2, 's4': jnp.int4, 's8': jnp.int8, 's16': jnp.int16, 's32': jnp.int32, 's64': jnp.int64,
     'bf16': jnp.bfloat16,
     'f16': jnp.float16, 'f32': jnp.float32, 'f64': jnp.float64,
     'c64': jnp.complex64, 'c128': jnp.complex128
 }
+
+if hasattr(jnp, 'int1'):
+  _DT['s1'] = jnp.int1
+if hasattr(jnp, 'uint1'):
+  _DT['u1'] = jnp.uint1
+
 _SHAPE_RE = re.compile(f"^({'|'.join(_DT)})\\[\\s*(\\d*[\\s*,\\d+]*)\\s*\\]$")
 
 

@@ -26,6 +26,7 @@ jax.config.parse_flags_with_absl()
 FLAGS = flags.FLAGS
 
 
+@jtu.thread_unsafe_test_class()
 class KerasReuseMainTest(tf_test_util.JaxToTfTestCase):
 
   def setUp(self):
@@ -41,6 +42,7 @@ class KerasReuseMainTest(tf_test_util.JaxToTfTestCase):
   @parameterized.named_parameters(
       dict(testcase_name=f"_{model}", model=model)
       for model in ["mnist_pure_jax", "mnist_flax"])
+  @jtu.ignore_warning(message="the imp module is deprecated")
   def test_keras_reuse(self, model="mnist_pure_jax"):
     FLAGS.model = model
     keras_reuse_main.main(None)

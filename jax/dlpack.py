@@ -12,4 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from jax._src.dlpack import (to_dlpack, from_dlpack, SUPPORTED_DTYPES)
+from jax._src.dlpack import (
+  from_dlpack as from_dlpack,
+  is_supported_dtype as is_supported_dtype,
+)

@@ -21,25 +21,25 @@ See README.md for how these are used.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import functools
 import logging
 import re
 import time
-from typing import Any, Callable, Optional
+from typing import Any
+import warnings
 from absl import flags
 
-import flax  # type: ignore[import]
 from flax import linen as nn
 
 import jax
 import jax.numpy as jnp
 
-from matplotlib import pyplot as plt  # type: ignore
+from matplotlib import pyplot as plt
 import numpy as np
 import optax
-import tensorflow as tf  # type: ignore
-import tensorflow_datasets as tfds  # type: ignore
+import tensorflow as tf
+import tensorflow_datasets as tfds  # pyrefly: ignore[missing-import]
 
 _MOCK_DATA = flags.DEFINE_boolean("mock_data", False,
                                   "Use fake data, for testing.")
@@ -70,7 +70,9 @@ def load_mnist(split: tfds.Split, batch_size: int):
   if _MOCK_DATA.value:
     with tfds.testing.mock_data(num_examples=batch_size):
       try:
-        ds = tfds.load("mnist", split=split)
+        with warnings.catch_warnings():
+          warnings.simplefilter("ignore")
+          ds = tfds.load("mnist", split=split)
       except Exception as e:
         m = re.search(r'metadata files were not found in (.+/)mnist/', str(e))
         if m:
@@ -128,7 +130,7 @@ class PureJaxMNIST:
     final_w, final_b = params[-1]
     logits = jnp.dot(x, final_w) + final_b
     return logits - jax.scipy.special.logsumexp(
-      logits, axis=1, keepdims=True)  # type: ignore[attr-defined]
+      logits, axis=1, keepdims=True)
 
   @staticmethod
   def loss(params, inputs, labels):
@@ -205,23 +207,23 @@ class FlaxMNIST:
 
     @nn.compact
     def __call__(self, x, with_classifier=True):
-      x = nn.Conv(features=32, kernel_size=(3, 3))(x)
+      x = nn.Conv(features=32, kernel_size=(3, 3))(x)  # pyrefly: ignore[missing-argument]
       x = nn.relu(x)
       x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
-      x = nn.Conv(features=64, kernel_size=(3, 3))(x)
+      x = nn.Conv(features=64, kernel_size=(3, 3))(x)  # pyrefly: ignore[missing-argument]
       x = nn.relu(x)
       x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
       x = x.reshape((x.shape[0], -1))  # flatten
-      x = nn.Dense(features=256)(x)
+      x = nn.Dense(features=256)(x)  # pyrefly: ignore[missing-argument]
       x = nn.relu(x)
       if not with_classifier:
         return x
-      x = nn.Dense(features=10)(x)
+      x = nn.Dense(features=10)(x)  # pyrefly: ignore[missing-argument]
       x = nn.log_softmax(x)
       return x
 
   # Create the model and save it
-  model = Module()
+  model = Module()  # pyrefly: ignore[missing-argument]
 
   @staticmethod
   def predict(params, inputs, with_classifier=True):
@@ -308,11 +310,11 @@ def plot_images(ds,
   fig = plt.figure(figsize=(8., 4.), num=title)
   # Get the first batch
   (images, labels), = list(tfds.as_numpy(ds.take(1)))
-  if inference_fn:
-    inferred_labels = inference_fn(images)
+  inferred_labels = inference_fn(images) if inference_fn else None
   for i, image in enumerate(images[:count]):
     digit = fig.add_subplot(nr_rows, nr_cols, i + 1)
     if inference_fn:
+      assert inferred_labels is not None
       digit_title = f"infer: {np.argmax(inferred_labels[i])}\n"
     else:
       digit_title = ""

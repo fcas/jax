@@ -21,17 +21,17 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from jaxlib.mlir._mlir_libs._triton_ext import (
-    PointerType,
-    infer_reduce_op_encoding,
-    register_dialect,
+    PointerType as PointerType,
+    register_dialect as register_dialect,
+    infer_reduce_op_encoding as _infer_reduce_op_encoding,
 )
 from jaxlib.mlir import ir
 
-from ._triton_enum_gen import *  # pylint: disable=wildcard-import
-from ._triton_ops_gen import *  # pylint: disable=wildcard-import
+from ._triton_enum_gen import *
+from ._triton_ops_gen import *
 
 
-class ReduceOp(ReduceOp):  # type: ignore
+class ReduceOp(ReduceOp):
 
   def __init__(
       self,
@@ -49,7 +49,7 @@ class ReduceOp(ReduceOp):  # type: ignore
 del reduce
 
 
-class ScanOp(ScanOp):  # type: ignore
+class ScanOp(ScanOp):
 
   def __init__(
       self,
@@ -86,7 +86,7 @@ def _infer_reduce_op_return_types(
     if not shape:
       return_types.append(op_type.element_type)
     elif op_encoding := op_type.encoding:
-      encoding = infer_reduce_op_encoding(op_encoding, axis)
+      encoding = _infer_reduce_op_encoding(op_encoding, axis)
       if encoding is not None:
         raise RuntimeError("Failed to infer return type encoding for ReduceOp")
       return_types.append(

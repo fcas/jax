@@ -1,18 +1,33 @@
+/* Copyright 2023 The JAX Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
 #include "jaxlib/gpu/triton_utils.h"
 
-#include <zlib.h>
-
 #include <string>
+#include <string_view>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/string_view.h"
 #include "jaxlib/gpu/gpu_kernel_helpers.h"
 #include "jaxlib/gpu/triton.pb.h"
+#include "jaxlib/gpu/vendor.h"
+#include <zlib.h>
 
 namespace jax::JAX_GPU_NAMESPACE {
 
-absl::StatusOr<std::string> ZlibUncompress(absl::string_view compressed) {
+absl::StatusOr<std::string> ZlibUncompress(std::string_view compressed) {
   std::string data;
   uLongf dest_len = 5 * compressed.size();
   while (true) {
@@ -33,7 +48,7 @@ absl::StatusOr<std::string> ZlibUncompress(absl::string_view compressed) {
   return data;
 }
 
-absl::StatusOr<std::string> GetTritonKernelCallName(absl::string_view opaque) {
+absl::StatusOr<std::string> GetTritonKernelCallName(std::string_view opaque) {
   JAX_ASSIGN_OR_RETURN(std::string serialized, ZlibUncompress(opaque));
   jax_triton::TritonAnyKernelCall proto;
   if (!proto.ParseFromString(serialized)) {
@@ -43,7 +58,7 @@ absl::StatusOr<std::string> GetTritonKernelCallName(absl::string_view opaque) {
 }
 
 absl::StatusOr<std::string> GetTritonKernelCallSerializedMetadata(
-    absl::string_view opaque) {
+    std::string_view opaque) {
   JAX_ASSIGN_OR_RETURN(std::string serialized, ZlibUncompress(opaque));
   jax_triton::TritonAnyKernelCall proto;
   if (!proto.ParseFromString(serialized)) {

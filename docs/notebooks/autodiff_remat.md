@@ -5,7 +5,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.16.1
+    jupytext_version: 1.16.4
 kernelspec:
   display_name: Python 3
   name: python3
@@ -15,6 +15,8 @@ kernelspec:
 
 ## Control autodiff's saved values with `jax.checkpoint` (aka `jax.remat`)
 
+<!--* freshness: { reviewed: '2024-04-08' } *-->
+
 ```{code-cell}
 import jax
 import jax.numpy as jnp
@@ -22,7 +24,7 @@ import jax.numpy as jnp
 
 +++ {"id": "qaIsQSh1XoKF"}
 
-### TL;DR
+### Summary
 
 Use the `jax.checkpoint` decorator (aliased as `jax.remat`) with `jax.grad` to control which intermediates are saved on the forward pass versus recomputed on the backward pass, trading off memory and FLOPs.
 
@@ -154,7 +156,7 @@ print_fwd_bwd(f3, W1, W2, W3, x)
 
 ### Let's think step by step
 
-You might want to first (re)read [the Autodiff Cookbook Part 1](https://jax.readthedocs.io/en/latest/notebooks/autodiff_cookbook.html).
+You might want to first (re)read [the Autodiff Cookbook Part 1](https://docs.jax.dev/en/latest/notebooks/autodiff_cookbook.html).
 
 +++ {"id": "VMfwm_yinvoZ"}
 
@@ -229,7 +231,7 @@ The cost we pay is redundant work: in `f_bwd2` we must re-evaluate `g(x)` as par
 
 +++ {"id": "LqTrjPoGqrK7"}
 
-We can get this VJP behavior in autodiff &#151; without having to write VJP functions directly &#151; by instead using `jax.checkpoint` in an alternative definition of the original function `f`:
+We can get this VJP behavior in autodiff --- without having to write VJP functions directly --- by instead using `jax.checkpoint` in an alternative definition of the original function `f`:
 
 ```{code-cell}
 def f_checkpoint(x):
@@ -273,7 +275,7 @@ Notice that if `f = lambda x: h(g(x))` is the function we want to differentiate,
 That is, in code we'd have something like:
 
 ```{code-cell}
-def f_grad_bad(x):
+def f_grad_bad1(x):
   _ = f(x)                  # step 1
   _, f_vjp = jax.vjp(f, x)  # step 2
   x_bar, = f_vjp(1.0)       # step 3
@@ -294,7 +296,7 @@ That is, in code we'd have something like:
 ```{code-cell}
 def f_grad_bad2(x):
   y, g_vjp = jax.vjp(g, x)  # step 1
-  z = h(y)                  # step 2
+  _z = h(y)                 # step 2
   _, h_vjp = jax.vjp(h, y)  # step 3
   y_bar, = h_vjp(1.0)       # step 3
   x_bar, = g_vjp(y_bar)     # step 5
@@ -368,8 +370,6 @@ Notice also that by providing a policy, we didn't need to edit the code defining
 Some policies can refer to values named with `jax.ad_checkpoint.checkpoint_name`:
 
 ```{code-cell}
-from jax.ad_checkpoint import checkpoint_name
-
 def predict(params, x):
   *Ws, Wlast = params
   for i, W in enumerate(Ws):
@@ -396,17 +396,7 @@ print_saved_residuals(loss_checkpoint2, params, x, y)
 
 Another policy which refers to names is `jax.checkpoint_policies.save_only_these_names`.
 
-Some of the policies are:
-* `everything_saveable` (the default strategy, as if `jax.checkpoint` were not being used at all)
-* `nothing_saveable` (i.e. rematerialize everything, as if a custom policy were not being used at all)
-* `dots_saveable` or its alias `checkpoint_dots`
-* `dots_with_no_batch_dims_saveable` or its alias `checkpoint_dots_with_no_batch_dims`
-* `save_anything_but_these_names` (save any values except for the output of
-  `checkpoint_name` with any of the names given)
-* `save_any_names_but_these` (save only named values, i.e. any outputs of
-  `checkpoint_name`, except for those with the names given)
-* `save_only_these_names` (save only named values, and only among the names
-  given)
+A list of policies can be found [here](https://docs.jax.dev/en/latest/jax.html#checkpoint-policies).
 
 Policies only indicate what is saveable; a value is only saved if it's actually needed by the backward pass.
 
@@ -490,7 +480,7 @@ print_fwd_bwd(f, 3.)
 
 When differentiated functions are staged out to XLA for compilation, for example by applying `jax.jit` to a function which contains a `jax.grad` call, XLA will automatically optimize the computation, including decisions about when to compute or rematerialize values. As a result, **`jax.checkpoint` often isn't needed for differentiated functions under a `jax.jit`**. XLA will optimize things for you.
 
-One exception is when using staged-out control flow, like `jax.lax.scan`. Automatic compiler optimizations across multiple control flow primitives, e.g. across a forward-pass `scan` and the corresponding backward-pass `scan`, typically aren't aren't as thorough. As a result, it's often a good idea to use `jax.checkpoint` on the body function passed to `jax.lax.scan`.
+One exception is when using staged-out control flow, like `jax.lax.scan`. Automatic compiler optimizations across multiple control flow primitives, e.g. across a forward-pass `scan` and the corresponding backward-pass `scan`, typically aren't as thorough. As a result, it's often a good idea to use `jax.checkpoint` on the body function passed to `jax.lax.scan`.
 
 For example, one common pattern in large [Transformer models](https://en.wikipedia.org/wiki/Transformer_(machine_learning_model)) is to express the architecture as a `jax.lax.scan` over layers so as to reduce compilation times. That is, using a simple fully-connected network as an analogy, instead of writing something like this:
 

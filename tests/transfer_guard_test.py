@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for transfer guards."""
 
 import contextlib
 import pickle
@@ -99,19 +98,23 @@ _COMMON_TEST_PARAMETERS = [
 ]
 
 
+# TransferGuardTest disables `--jax_enable_checks` because it
+# can prematurely fetch the value of device arrays and make
+# device-to-host tests to incur no transfers unexpectedly.
+@jtu.with_config(jax_enable_checks=False)
 class TransferGuardTest(jtu.JaxTestCase):
-  # `_default_config` is used by `jtu.JaxTestCase` to update the JAX config for
-  # every test case. TransferGuardTest disables `--jax_enable_checks` because it
-  # can prematurely fetch the value of device arrays and make device-to-host
-  # tests to incur no transfers unexpectedly.
-  _default_config = {"jax_enable_checks": False}
+  def setUp(self):
+    super().setUp()
+    # Nearly all test methods use the deprecated device argument to JIT.
+    self.enter_context(jtu.ignore_warning(category=DeprecationWarning,
+                                          message="backend and device argument"))
 
   @contextlib.contextmanager
   def assertAllows(self, func_name):
     """Asserts that a transfer in the context is allowed."""
     try:
       yield
-    except Exception as e:  # pylint: disable=broad-except
+    except Exception as e:
       raise RuntimeError(
           f"Expected a transfer to be allowed while running: {func_name}"
       ) from e
@@ -130,7 +133,7 @@ class TransferGuardTest(jtu.JaxTestCase):
     try:
       with self.assertRaises(Exception):
         yield
-    except Exception as e:  # pylint: disable=broad-except
+    except Exception as e:
       raise RuntimeError(
           f"Expected a transfer to be disallowed while running: {func_name}"
       ) from e

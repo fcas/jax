@@ -22,41 +22,46 @@ from __future__ import annotations
 from collections.abc import Sequence
 import math
 import typing
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypeAlias
 
 import numpy as np
 
-import jax.numpy as jnp
-from jax import lax
-from jax import random
 from jax._src import core
 from jax._src import dtypes
-from jax._src.typing import Array, ArrayLike
+from jax._src import numpy as jnp
+from jax._src import random
+from jax._src.named_sharding import NamedSharding
+from jax._src.partition_spec import PartitionSpec
+from jax._src.sharding_impls import canonicalize_sharding
+from jax._src.typing import Array, ArrayLike, DType
 from jax._src.util import set_module
 
 export = set_module('jax.nn.initializers')
 
-KeyArray = Array
 # TODO: Import or define these to match
 # https://github.com/numpy/numpy/blob/main/numpy/typing/_dtype_like.py.
 DTypeLikeFloat = Any
 DTypeLikeComplex = Any
 DTypeLikeInexact = Any  # DTypeLikeFloat | DTypeLikeComplex
 RealNumeric = Any  # Scalar jnp array or float
+OutShardingType: TypeAlias = NamedSharding | PartitionSpec | None
 
 @export
 @typing.runtime_checkable
 class Initializer(Protocol):
-  @staticmethod
-  def __call__(key: KeyArray,
+  """Protocol for initializers returned by :mod:`jax.nn.initializers` APIs."""
+  def __call__(self,
+               key: Array,
                shape: core.Shape,
-               dtype: DTypeLikeInexact = jnp.float_) -> Array:
+               dtype: DTypeLikeInexact | None = None,
+               out_sharding: OutShardingType = None) -> Array:
     raise NotImplementedError
 
 @export
-def zeros(key: KeyArray,
+def zeros(key: Array,
           shape: core.Shape,
-          dtype: DTypeLikeInexact = jnp.float_) -> Array:
+          dtype: DTypeLikeInexact | None = None,
+          out_sharding: OutShardingType = None) -> Array:
   """An initializer that returns a constant array full of zeros.
 
   The ``key`` argument is ignored.
@@ -66,12 +71,14 @@ def zeros(key: KeyArray,
   Array([[0., 0., 0.],
          [0., 0., 0.]], dtype=float32)
   """
-  return jnp.zeros(shape, dtypes.canonicalize_dtype(dtype))
+  dtype = dtypes.default_float_dtype() if dtype is None else dtype
+  return jnp.zeros(shape, dtype, out_sharding=out_sharding)
 
 @export
-def ones(key: KeyArray,
+def ones(key: Array,
          shape: core.Shape,
-         dtype: DTypeLikeInexact = jnp.float_) -> Array:
+         dtype: DTypeLikeInexact | None = None,
+         out_sharding: OutShardingType = None) -> Array:
   """An initializer that returns a constant array full of ones.
 
   The ``key`` argument is ignored.
@@ -82,12 +89,12 @@ def ones(key: KeyArray,
          [1., 1.],
          [1., 1.]], dtype=float32)
   """
-  return jnp.ones(shape, dtypes.canonicalize_dtype(dtype))
+  dtype = dtypes.default_float_dtype() if dtype is None else dtype
+  return jnp.ones(shape, dtype, out_sharding=out_sharding)
 
 @export
 def constant(value: ArrayLike,
-             dtype: DTypeLikeInexact = jnp.float_
-             ) -> Initializer:
+             dtype: DTypeLikeInexact | None = None) -> Initializer:
   """Builds an initializer that returns arrays full of a constant ``value``.
 
   Args:
@@ -100,16 +107,18 @@ def constant(value: ArrayLike,
   Array([[-7., -7., -7.],
          [-7., -7., -7.]], dtype=float32)
   """
-  def init(key: KeyArray,
+  def init(key: Array,
            shape: core.Shape,
-           dtype: DTypeLikeInexact = dtype) -> Array:
-    dtype = dtypes.canonicalize_dtype(dtype)
-    return jnp.full(shape, value, dtype=dtype)
+           dtype: DTypeLikeInexact | None = dtype,
+           out_sharding: OutShardingType = None) -> Array:
+    dtype = dtypes.default_float_dtype() if dtype is None else dtype
+    out_sharding = canonicalize_sharding(out_sharding, 'nn.initializers.constant')
+    return jnp.full(shape, value, dtype=dtype, device=out_sharding)
   return init
 
 @export
 def uniform(scale: RealNumeric = 1e-2,
-            dtype: DTypeLikeInexact = jnp.float_) -> Initializer:
+            dtype: DTypeLikeInexact | None = None) -> Initializer:
   """Builds an initializer that returns real uniformly-distributed random arrays.
 
   Args:
@@ -126,16 +135,18 @@ def uniform(scale: RealNumeric = 1e-2,
   Array([[7.298188 , 8.691938 , 8.7230015],
          [2.0818567, 1.8662417, 5.5022564]], dtype=float32)
   """
-  def init(key: KeyArray,
+  def init(key: Array,
            shape: core.Shape,
-           dtype: DTypeLikeInexact = dtype) -> Array:
-    dtype = dtypes.canonicalize_dtype(dtype)
-    return random.uniform(key, shape, dtype) * jnp.array(scale, dtype)
+           dtype: DTypeLikeInexact | None = dtype,
+           out_sharding: OutShardingType = None) -> Array:
+    dtype = dtypes.default_float_dtype() if dtype is None else dtype
+    return random.uniform(key, shape, dtype,
+                          out_sharding=out_sharding) * jnp.array(scale, dtype)
   return init
 
 @export
 def normal(stddev: RealNumeric = 1e-2,
-           dtype: DTypeLikeInexact = jnp.float_) -> Initializer:
+           dtype: DTypeLikeInexact | None = None) -> Initializer:
   """Builds an initializer that returns real normally-distributed random arrays.
 
   Args:
@@ -152,16 +163,18 @@ def normal(stddev: RealNumeric = 1e-2,
   Array([[ 3.0613258 ,  5.6129413 ,  5.6866574 ],
          [-4.063663  , -4.4520254 ,  0.63115686]], dtype=float32)
   """
-  def init(key: KeyArray,
+  def init(key: Array,
            shape: core.Shape,
-           dtype: DTypeLikeInexact = dtype) -> Array:
-    dtype = dtypes.canonicalize_dtype(dtype)
-    return random.normal(key, shape, dtype) * jnp.array(stddev, dtype)
+           dtype: DTypeLikeInexact | None = dtype,
+           out_sharding: OutShardingType = None) -> Array:
+    dtype = dtypes.default_float_dtype() if dtype is None else dtype
+    return random.normal(key, shape, dtype,
+                         out_sharding=out_sharding) * jnp.array(stddev, dtype)
   return init
 
 @export
 def truncated_normal(stddev: RealNumeric = 1e-2,
-                     dtype: DTypeLikeInexact = jnp.float_,
+                     dtype: DTypeLikeInexact | None = None,
                      lower: RealNumeric = -2.0,
                      upper: RealNumeric = 2.0) -> Initializer:
   r"""Builds an initializer that returns truncated-normal random arrays.
@@ -184,34 +197,38 @@ def truncated_normal(stddev: RealNumeric = 1e-2,
 
   >>> import jax, jax.numpy as jnp
   >>> initializer = jax.nn.initializers.truncated_normal(5.0)
-  >>> initializer(jax.random.PRNGKey(42), (2, 3), jnp.float32)  # doctest: +SKIP
+  >>> initializer(jax.random.key(42), (2, 3), jnp.float32)  # doctest: +SKIP
   Array([[ 2.9047365,  5.2338114,  5.29852  ],
          [-3.836303 , -4.192359 ,  0.6022964]], dtype=float32)
   """
-
-  def init(key: KeyArray,
+  def init(key: Array,
            shape: core.Shape,
-           dtype: DTypeLikeInexact = dtype) -> Array:
-    dtype = dtypes.canonicalize_dtype(dtype)
+           dtype: DTypeLikeInexact | None = dtype,
+           out_sharding: OutShardingType = None) -> Array:
+    dtype = dtypes.default_float_dtype() if dtype is None else dtype
     return random.truncated_normal(
-        key, lower, upper, shape, dtype) * jnp.array(stddev, dtype)
+        key, lower, upper, shape, dtype,
+        out_sharding=out_sharding) * jnp.array(stddev, dtype)
   return init
 
 @export
-def _compute_fans(shape: core.NamedShape,
+def _compute_fans(shape: Sequence[int],
                   in_axis: int | Sequence[int] = -2,
                   out_axis: int | Sequence[int] = -1,
                   batch_axis: int | Sequence[int] = ()
-                  ) -> tuple[Array, Array]:
+                  ) -> tuple[float, float]:
   """
   Compute effective input and output sizes for a linear or convolutional layer.
 
   Axes not in in_axis, out_axis, or batch_axis are assumed to constitute the
   "receptive field" of a convolution (kernel spatial dimensions).
   """
-  if shape.rank <= 1:
-    raise ValueError(f"Can't compute input and output sizes of a {shape.rank}"
-                     "-dimensional weights tensor. Must be at least 2D.")
+  if isinstance(in_axis, int) and in_axis == -2 and len(shape) <= 1:
+    raise ValueError(
+        f"Can't compute input and output sizes of a {len(shape)}-dimensional"
+        " weights tensor with default in_axis. Must be at least 2D or specify"
+        " in_axis explicitly."
+    )
 
   if isinstance(in_axis, int):
     in_size = shape[in_axis]
@@ -225,14 +242,14 @@ def _compute_fans(shape: core.NamedShape,
     batch_size = shape[batch_axis]
   else:
     batch_size = math.prod([shape[i] for i in batch_axis])
-  receptive_field_size = shape.total / in_size / out_size / batch_size
+  receptive_field_size = math.prod(shape) / in_size / out_size / batch_size
   fan_in = in_size * receptive_field_size
   fan_out = out_size * receptive_field_size
   return fan_in, fan_out
 
-def _complex_uniform(key: KeyArray,
-                     shape: Sequence[int] | core.NamedShape,
-                     dtype: DTypeLikeInexact) -> Array:
+def _complex_uniform(key: Array,
+                     shape: Sequence[int],
+                     dtype: DType) -> Array:
   """
   Sample uniform random values within a disk on the complex plane,
   with zero mean and unit variance.
@@ -241,12 +258,12 @@ def _complex_uniform(key: KeyArray,
   real_dtype = np.array(0, dtype).real.dtype
   dtype = dtypes.to_complex_dtype(real_dtype)
   r = jnp.sqrt(2 * random.uniform(key_r, shape, real_dtype)).astype(dtype)
-  theta = 2 * jnp.pi * random.uniform(key_theta, shape, real_dtype).astype(dtype)
+  theta = 2 * np.pi * random.uniform(key_theta, shape, real_dtype).astype(dtype)
   return r * jnp.exp(1j * theta)
 
-def _complex_truncated_normal(key: KeyArray, upper: ArrayLike,
-                              shape: Sequence[int] | core.NamedShape,
-                              dtype: DTypeLikeInexact) -> Array:
+def _complex_truncated_normal(key: Array, upper: ArrayLike,
+                              shape: Sequence[int],
+                              dtype: DType) -> Array:
   """
   Sample random values from a centered normal distribution on the complex plane,
   whose modulus is truncated to `upper`, and the variance before the truncation
@@ -258,19 +275,19 @@ def _complex_truncated_normal(key: KeyArray, upper: ArrayLike,
   t = ((1 - jnp.exp(jnp.array(-(upper ** 2), dtype)))
        * random.uniform(key_r, shape, real_dtype).astype(dtype))
   r = jnp.sqrt(-jnp.log(1 - t))
-  theta = 2 * jnp.pi * random.uniform(key_theta, shape, real_dtype).astype(dtype)
+  theta = 2 * np.pi * random.uniform(key_theta, shape, real_dtype).astype(dtype)
   return r * jnp.exp(1j * theta)
 
 @export
 def variance_scaling(
   scale: RealNumeric,
-  mode: Literal["fan_in"] | Literal["fan_out"] | Literal["fan_avg"],
+  mode: Literal["fan_in"] | Literal["fan_out"] | Literal["fan_avg"] | Literal["fan_geo_avg"],
   distribution: (Literal["truncated_normal"] | Literal["normal"] |
                       Literal["uniform"]),
   in_axis: int | Sequence[int] = -2,
   out_axis: int | Sequence[int] = -1,
-  batch_axis: Sequence[int] = (),
-  dtype: DTypeLikeInexact = jnp.float_
+  batch_axis: int | Sequence[int] = (),
+  dtype: DTypeLikeInexact | None = None
 ) -> Initializer:
   r"""
   Initializer that adapts its scale to the shape of the weights tensor.
@@ -278,11 +295,12 @@ def variance_scaling(
   With ``distribution="truncated_normal"`` or ``distribution="normal"``, samples
   are drawn from a (truncated) normal distribution with a mean of zero
   and a standard deviation (after truncation, if applicable) of
-  :math:`\sqrt{\frac{scale}{n}}`, where `n` is:
+  :math:`\sqrt{\frac{scale}{n}}`, where `n` is, for each ``mode``:
 
-  * the number of input units in the weights tensor, if ``mode="fan_in"``,
-  * the number of output units, if ``mode="fan_out"``, or
-  * the average of the numbers of input and output units, if ``mode="fan_avg"``.
+  * ``"fan_in"``: the number of inputs
+  * ``"fan_out"``: the number of outputs
+  * ``"fan_avg"``: the arithmetic average of the numbers of inputs and outputs
+  * ``"fan_geo_avg"``: the geometric average of the numbers of inputs and outputs
 
   This initializer can be configured with ``in_axis``, ``out_axis``, and
   ``batch_axis`` to work with general convolutional or dense layers; axes that
@@ -302,7 +320,7 @@ def variance_scaling(
 
   Args:
     scale: scaling factor (positive float).
-    mode: one of ``"fan_in"``, ``"fan_out"``, and ``"fan_avg"``.
+    mode: one of ``"fan_in"``, ``"fan_out"``, ``"fan_avg"``, and ``"fan_geo_avg"``.
     distribution: random distribution to use. One of ``"truncated_normal"``,
       ``"normal"`` and ``"uniform"``.
     in_axis: axis or sequence of axes of the input dimension in the weights
@@ -313,37 +331,41 @@ def variance_scaling(
       ignored.
     dtype: the dtype of the weights.
   """
-
-  def init(key: KeyArray,
+  def init(key: Array,
            shape: core.Shape,
-           dtype: DTypeLikeInexact = dtype) -> Array:
-    dtype = dtypes.canonicalize_dtype(dtype)
-    named_shape = core.as_named_shape(shape)
-    fan_in, fan_out = _compute_fans(named_shape, in_axis, out_axis, batch_axis)
+           dtype: DTypeLikeInexact | None = dtype,
+           out_sharding: OutShardingType = None) -> Array:
+    shape = core.canonicalize_shape(shape)
+    dtype = dtypes.default_float_dtype() if dtype is None else dtype
+    fan_in, fan_out = _compute_fans(shape, in_axis, out_axis, batch_axis)
     if mode == "fan_in": denominator = fan_in
     elif mode == "fan_out": denominator = fan_out
     elif mode == "fan_avg": denominator = (fan_in + fan_out) / 2
+    elif mode == "fan_geo_avg": denominator = (fan_in * fan_out) ** 0.5
     else:
       raise ValueError(
         f"invalid mode for variance scaling initializer: {mode}")
     variance = jnp.array(scale / denominator, dtype=dtype)
 
     if distribution == "truncated_normal":
-      if jnp.issubdtype(dtype, jnp.floating):
+      if dtypes.issubdtype(dtype, np.floating):
         # constant is stddev of standard normal truncated to (-2, 2)
         stddev = jnp.sqrt(variance) / jnp.array(.87962566103423978, dtype)
-        return random.truncated_normal(key, -2, 2, named_shape, dtype) * stddev
+        return random.truncated_normal(key, -2, 2, shape, dtype,
+                                       out_sharding=out_sharding) * stddev
       else:
         # constant is stddev of complex standard normal truncated to 2
         stddev = jnp.sqrt(variance) / jnp.array(.95311164380491208, dtype)
-        return _complex_truncated_normal(key, 2, named_shape, dtype) * stddev
+        return _complex_truncated_normal(key, 2, shape, dtype) * stddev
     elif distribution == "normal":
-      return random.normal(key, named_shape, dtype) * jnp.sqrt(variance)
+      return random.normal(key, shape, dtype,
+                           out_sharding=out_sharding) * jnp.sqrt(variance)
     elif distribution == "uniform":
-      if jnp.issubdtype(dtype, jnp.floating):
-        return random.uniform(key, named_shape, dtype, -1) * jnp.sqrt(3 * variance)
+      if dtypes.issubdtype(dtype, np.floating):
+        return random.uniform(key, shape, dtype, -1,
+                              out_sharding=out_sharding) * jnp.sqrt(3 * variance)
       else:
-        return _complex_uniform(key, named_shape, dtype) * jnp.sqrt(variance)
+        return _complex_uniform(key, shape, dtype) * jnp.sqrt(variance)
     else:
       raise ValueError(f"invalid distribution for variance scaling initializer: {distribution}")
 
@@ -352,8 +374,8 @@ def variance_scaling(
 @export
 def glorot_uniform(in_axis: int | Sequence[int] = -2,
                    out_axis: int | Sequence[int] = -1,
-                   batch_axis: Sequence[int] = (),
-                   dtype: DTypeLikeInexact = jnp.float_) -> Initializer:
+                   batch_axis: int | Sequence[int] = (),
+                   dtype: DTypeLikeInexact | None = None) -> Initializer:
   """Builds a Glorot uniform initializer (aka Xavier uniform initializer).
 
   A `Glorot uniform initializer`_ is a specialization of
@@ -372,7 +394,7 @@ def glorot_uniform(in_axis: int | Sequence[int] = -2,
   Returns:
     An initializer.
 
-  Example:
+  Examples:
 
   >>> import jax, jax.numpy as jnp
   >>> initializer = jax.nn.initializers.glorot_uniform()
@@ -390,8 +412,8 @@ xavier_uniform = glorot_uniform
 @export
 def glorot_normal(in_axis: int | Sequence[int] = -2,
                   out_axis: int | Sequence[int] = -1,
-                  batch_axis: Sequence[int] = (),
-                  dtype: DTypeLikeInexact = jnp.float_) -> Initializer:
+                  batch_axis: int | Sequence[int] = (),
+                  dtype: DTypeLikeInexact | None = None) -> Initializer:
   """Builds a Glorot normal initializer (aka Xavier normal initializer).
 
   A `Glorot normal initializer`_ is a specialization of
@@ -410,7 +432,7 @@ def glorot_normal(in_axis: int | Sequence[int] = -2,
   Returns:
     An initializer.
 
-  Example:
+  Examples:
 
   >>> import jax, jax.numpy as jnp
   >>> initializer = jax.nn.initializers.glorot_normal()
@@ -428,8 +450,8 @@ xavier_normal = glorot_normal
 @export
 def lecun_uniform(in_axis: int | Sequence[int] = -2,
                   out_axis: int | Sequence[int] = -1,
-                  batch_axis: Sequence[int] = (),
-                  dtype: DTypeLikeInexact = jnp.float_) -> Initializer:
+                  batch_axis: int | Sequence[int] = (),
+                  dtype: DTypeLikeInexact | None = None) -> Initializer:
   """Builds a Lecun uniform initializer.
 
   A `Lecun uniform initializer`_ is a specialization of
@@ -448,7 +470,7 @@ def lecun_uniform(in_axis: int | Sequence[int] = -2,
   Returns:
     An initializer.
 
-  Example:
+  Examples:
 
   >>> import jax, jax.numpy as jnp
   >>> initializer = jax.nn.initializers.lecun_uniform()
@@ -464,8 +486,8 @@ def lecun_uniform(in_axis: int | Sequence[int] = -2,
 @export
 def lecun_normal(in_axis: int | Sequence[int] = -2,
                  out_axis: int | Sequence[int] = -1,
-                 batch_axis: Sequence[int] = (),
-                 dtype: DTypeLikeInexact = jnp.float_) -> Initializer:
+                 batch_axis: int | Sequence[int] = (),
+                 dtype: DTypeLikeInexact | None = None) -> Initializer:
   """Builds a Lecun normal initializer.
 
   A `Lecun normal initializer`_ is a specialization of
@@ -484,7 +506,7 @@ def lecun_normal(in_axis: int | Sequence[int] = -2,
   Returns:
     An initializer.
 
-  Example:
+  Examples:
 
   >>> import jax, jax.numpy as jnp
   >>> initializer = jax.nn.initializers.lecun_normal()
@@ -500,8 +522,8 @@ def lecun_normal(in_axis: int | Sequence[int] = -2,
 @export
 def he_uniform(in_axis: int | Sequence[int] = -2,
                out_axis: int | Sequence[int] = -1,
-               batch_axis: Sequence[int] = (),
-               dtype: DTypeLikeInexact = jnp.float_) -> Initializer:
+               batch_axis: int | Sequence[int] = (),
+               dtype: DTypeLikeInexact | None = None) -> Initializer:
   """Builds a He uniform initializer (aka Kaiming uniform initializer).
 
   A `He uniform initializer`_ is a specialization of
@@ -520,7 +542,7 @@ def he_uniform(in_axis: int | Sequence[int] = -2,
   Returns:
     An initializer.
 
-  Example:
+  Examples:
 
   >>> import jax, jax.numpy as jnp
   >>> initializer = jax.nn.initializers.he_uniform()
@@ -538,8 +560,8 @@ kaiming_uniform = he_uniform
 @export
 def he_normal(in_axis: int | Sequence[int] = -2,
               out_axis: int | Sequence[int] = -1,
-              batch_axis: Sequence[int] = (),
-              dtype: DTypeLikeInexact = jnp.float_) -> Initializer:
+              batch_axis: int | Sequence[int] = (),
+              dtype: DTypeLikeInexact | None = None) -> Initializer:
   """Builds a He normal initializer (aka Kaiming normal initializer).
 
   A `He normal initializer`_ is a specialization of
@@ -558,7 +580,7 @@ def he_normal(in_axis: int | Sequence[int] = -2,
   Returns:
     An initializer.
 
-  Example:
+  Examples:
 
   >>> import jax, jax.numpy as jnp
   >>> initializer = jax.nn.initializers.he_normal()
@@ -576,7 +598,7 @@ kaiming_normal = he_normal
 @export
 def orthogonal(scale: RealNumeric = 1.0,
                column_axis: int = -1,
-               dtype: DTypeLikeInexact = jnp.float_) -> Initializer:
+               dtype: DTypeLikeInexact | None = None) -> Initializer:
   """
   Builds an initializer that returns uniformly distributed orthogonal matrices.
 
@@ -591,7 +613,7 @@ def orthogonal(scale: RealNumeric = 1.0,
   Returns:
     An orthogonal initializer.
 
-  Example:
+  Examples:
 
   >>> import jax, jax.numpy as jnp
   >>> initializer = jax.nn.initializers.orthogonal()
@@ -599,19 +621,22 @@ def orthogonal(scale: RealNumeric = 1.0,
   Array([[ 3.9026976e-01,  7.2495741e-01, -5.6756169e-01],
          [ 8.8047469e-01, -4.7409311e-01, -1.3157725e-04]],            dtype=float32)
   """
-  def init(key: KeyArray,
+  def init(key: Array,
            shape: core.Shape,
-           dtype: DTypeLikeInexact = dtype) -> Array:
-    dtype = dtypes.canonicalize_dtype(dtype)
+           dtype: DTypeLikeInexact | None = dtype,
+           out_sharding: OutShardingType = None) -> Array:
+    if out_sharding is not None:
+      raise NotImplementedError
+    dtype = dtypes.default_float_dtype() if dtype is None else dtype
     if len(shape) < 2:
       raise ValueError("orthogonal initializer requires at least a 2D shape")
+
+    if any(dim == 0 for dim in shape):
+      # empty shape
+      return jnp.zeros(shape, dtype=dtype, out_sharding=out_sharding)
+
     n_rows, n_cols = math.prod(shape) // shape[column_axis], shape[column_axis]
-    matrix_shape = (n_cols, n_rows) if n_rows < n_cols else (n_rows, n_cols)
-    A = random.normal(key, matrix_shape, dtype)
-    Q, R = jnp.linalg.qr(A)
-    diag_sign = lax.broadcast_to_rank(jnp.sign(jnp.diag(R)), rank=Q.ndim)
-    Q *= diag_sign # needed for a uniform distribution
-    if n_rows < n_cols: Q = Q.T
+    Q = random.orthogonal(key, n_rows, (), dtype, n_cols)
     Q = jnp.reshape(Q, tuple(np.delete(shape, column_axis)) + (shape[column_axis],))
     Q = jnp.moveaxis(Q, -1, column_axis)
     return jnp.array(scale, dtype) * Q
@@ -621,7 +646,7 @@ def orthogonal(scale: RealNumeric = 1.0,
 def delta_orthogonal(
   scale: RealNumeric = 1.0,
   column_axis: int = -1,
-  dtype: DTypeLikeInexact = jnp.float_) -> Initializer:
+  dtype: DTypeLikeInexact | None = None) -> Initializer:
   """
   Builds an initializer for delta orthogonal kernels.
 
@@ -634,7 +659,7 @@ def delta_orthogonal(
     A `delta orthogonal initializer`_. The shape passed to the initializer must
     be 3D, 4D, or 5D.
 
-  Example:
+  Examples:
 
   >>> import jax, jax.numpy as jnp
   >>> initializer = jax.nn.initializers.delta_orthogonal()
@@ -654,10 +679,13 @@ def delta_orthogonal(
 
   .. _delta orthogonal initializer: https://arxiv.org/abs/1806.05393
   """
-  def init(key: KeyArray,
+  def init(key: Array,
            shape: core.Shape,
-           dtype: DTypeLikeInexact = dtype) -> Array:
-    dtype = dtypes.canonicalize_dtype(dtype)
+           dtype: DTypeLikeInexact | None = dtype,
+           out_sharding: OutShardingType = None) -> Array:
+    if out_sharding is not None:
+      raise NotImplementedError
+    dtype = dtypes.default_float_dtype() if dtype is None else dtype
     if len(shape) not in [3, 4, 5]:
       raise ValueError("Delta orthogonal initializer requires a 3D, 4D or 5D "
                        "shape.")

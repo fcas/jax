@@ -12,44 +12,128 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Note: import <name> as <name> is required for names to be exported.
+# See PEP 484 & https://github.com/jax-ml/jax/issues/7570
+
+from jax._src.interpreters import pxla as _deprecated_pxla
+from jax._src import mesh as _deprecated_mesh
+from jax._src import op_shardings as _deprecated_op_shardings
+
 from jax._src.interpreters.pxla import (
-  Index as Index,
-  MapTracer as MapTracer,
-  MeshAxisName as MeshAxisName,
-  MeshComputation as MeshComputation,
-  MeshExecutable as MeshExecutable,
-  PmapExecutable as PmapExecutable,
-  global_aval_to_result_handler as global_aval_to_result_handler,
-  global_avals_to_results_handler as global_avals_to_results_handler,
-  global_result_handlers as global_result_handlers,
-  parallel_callable as parallel_callable,
-  shard_arg as shard_arg,
-  shard_args as shard_args,
-  xla_pmap_p as xla_pmap_p,
-)
-from jax._src.mesh import (
-  thread_resources as thread_resources,
+  create_compile_options as create_compile_options,
 )
 
-from jax._src.op_shardings import (
-  are_op_shardings_equal as are_op_shardings_equal,
-  is_op_sharding_replicated as is_op_sharding_replicated,
-  op_sharding_to_indices as op_sharding_to_indices,
-)
+_deprecations = {
+    # deprecated in JAX v0.8.2 and finalized in JAX v0.11.0
+    "Index": (
+        (
+            "jax.interpreters.pxla.Index was deprecated as of JAX v0.8.2 and"
+            " removed in JAX v0.11.0."
+        ),
+        None,
+    ),
+    "MeshAxisName": (
+        (
+            "jax.interpreters.pxla.MeshAxisName was deprecated in JAX v0.8.2"
+            " and removed in JAX v0.11.0. Use jax.sharding.Mesh axis names"
+            " directly."
+        ),
+        None,
+    ),
+    "MeshExecutable": (
+        (
+            "jax.interpreters.pxla.MeshExecutable was deprecated in JAX v0.8.2"
+            " and removed in JAX v0.11.0."
+        ),
+        None,
+    ),
+    "global_aval_to_result_handler": (
+        (
+            "jax.interpreters.pxla.global_aval_to_result_handler was deprecated"
+            " in JAX v0.8.2 and removed in JAX v0.11.0."
+        ),
+        None,
+    ),
+    "global_result_handlers": (
+        (
+            "jax.interpreters.pxla.global_result_handlers was deprecated in"
+            " JAX v0.8.2 and removed in JAX v0.11.0."
+        ),
+        None,
+    ),
+    "are_hlo_shardings_equal": (
+        (
+            "jax.interpreters.pxla.are_hlo_shardings_equal was deprecated in"
+            " JAX v0.8.2 and removed in JAX v0.11.0."
+        ),
+        None,
+    ),
+    "is_hlo_sharding_replicated": (
+        (
+            "jax.interpreters.pxla.is_hlo_sharding_replicated is deprecated as"
+            " of JAX v0.8.2."
+        ),
+        None,
+    ),
+    "ArrayMapping": (
+        (
+            "jax.interpreters.pxla.ArrayMapping was deprecated in JAX v0.8.2 and"
+            " removed in JAX v0.11.0."
+        ),
+        None,
+    ),
+    "_UNSPECIFIED": (
+        (
+            "jax.interpreters.pxla._UNSPECIFIED was deprecated in JAX v0.8.2 and"
+            " removed in JAX v0.11.0."
+        ),
+        None,
+    ),
+    "array_mapping_to_axis_resources": (
+        (
+            "jax.interpreters.pxla.array_mapping_to_axis_resources was"
+            " deprecated in JAX v0.8.2 and removed in JAX v0.11.0."
+        ),
+        None,
+    ),
+    "op_sharding_to_indices": (
+        (
+            "jax.interpreters.pxla.op_sharding_to_indices was deprecated in JAX"
+            " v0.8.2 and removed in JAX v0.11.0."
+        ),
+        None,
+    ),
+    # Deprecated in JAX v0.8.2, TODO(jakevdp) finalize after v0.11.0
+    "MeshComputation": (
+        "jax.interpreters.pxla.MeshComputation is deprecated as of JAX v0.8.2.",
+        _deprecated_pxla.MeshComputation,
+    ),
+    "global_avals_to_results_handler": (
+        (
+            "jax.interpreters.pxla.global_avals_to_results_handler is"
+            " deprecated as of JAX v0.8.2."
+        ),
+        _deprecated_pxla.global_avals_to_results_handler,
+    ),
+    "thread_resources": (
+        (
+            "jax.interpreters.pxla.thread_resources is deprecated as of JAX"
+            " v0.8.2. Please switch to using `with jax.set_mesh(mesh)` instead"
+            " of `with mesh:` and then use `jax.sharding.get_abstract_mesh()`"
+            " to get the current mesh."
+        ),
+        _deprecated_mesh.thread_resources,
+    ),
+}
 
-from jax._src.sharding_impls import (
-  ArrayMapping as ArrayMapping,
-  UNSPECIFIED as _UNSPECIFIED,
-  array_mapping_to_axis_resources as array_mapping_to_axis_resources,
-  is_unspecified as _is_unspecified,
-)
-
-from jax._src.sharding_specs import (
-  Chunked as Chunked,
-  NoSharding as NoSharding,
-  Replicated as Replicated,
-  ShardedAxis as ShardedAxis,
-  ShardingSpec as ShardingSpec,
-  Unstacked as Unstacked,
-  spec_to_indices as spec_to_indices,
-)
+import typing as _typing
+if _typing.TYPE_CHECKING:
+  MeshComputation = _deprecated_pxla.MeshComputation
+  global_avals_to_results_handler = _deprecated_pxla.global_avals_to_results_handler
+  thread_resources = _deprecated_mesh.thread_resources
+  op_sharding_to_indices = _deprecated_op_shardings.op_sharding_to_indices
+else:
+  from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
+  __getattr__ = _deprecation_getattr(__name__, _deprecations)
+  del _deprecation_getattr
+del _typing

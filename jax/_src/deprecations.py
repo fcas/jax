@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
+import functools
 from types import ModuleType
 import warnings
 
@@ -34,7 +36,7 @@ import warnings
 # __getattr__ = _deprecation_getattr(__name__, _deprecations)
 # del _deprecation_getattr
 
-# Note that type checkers such as Pytype will not know about the deprecated
+# Note that type checkers such as Pyrefly will not know about the deprecated
 # names. If it is desirable that a deprecated name is known to the type checker,
 # add:
 # import typing
@@ -44,6 +46,7 @@ import warnings
 #   )
 # del typing
 def deprecation_getattr(module, deprecations):
+  @functools.cache
   def getattr(name):
     if name in deprecations:
       message, fn = deprecations[name]
@@ -56,36 +59,80 @@ def deprecation_getattr(module, deprecations):
   return getattr
 
 
-def accelerate_module_deprecation(module: ModuleType, name: str) -> None:
+def accelerate_getattr_deprecation(module: ModuleType, *names: str) -> None:
   """Accelerate the deprecation of a module-level attribute.
 
   Raises an AttributeError instead of a DeprecationWarning upon attribute access.
   Used in Google-internal code to implement faster deprecation.
   """
-  message, _ = module._deprecations[name]
-  module._deprecations[name] = (message, None)
+  for name in names:
+    message, _ = module._deprecations[name]
+    module._deprecations[name] = (message, None)
+
+
+def is_accelerated_attribute(module: ModuleType, name: str) -> bool:
+  """Returns true if given name is accelerated.
+
+  Raises an error if name is not a deprecated attribute in module.
+  """
+  return module._deprecations[name][1] is None
 
 # The following mechanism is a separate one, for registering and
 # accelerating deprecations that are not imports (for example, deprecations
 # of a function argument).
-# Maps a pair of strings to a boolean specifying whether the deprecation
-# is accelerated. The intent is that non-accelerated deprecations will warn,
-# and accelerated deprecations will error.
-_registered_deprecations: dict[tuple[str, str], bool] = {}
+# Maps a globally unique string ID to a DeprecationState, which tracks whether
+# the deprecation is accelerated.
+# The intent is that non-accelerated deprecations will warn, and accelerated
+# deprecations will error.
+
+@dataclass(slots=True)
+class DeprecationState:
+  accelerated: bool = False
+
+_registered_deprecations: dict[str, DeprecationState] = {}
 
 
-def register(module: str, key: str) -> None:
-  _registered_deprecations[module, key] = False
+def register(deprecation_id: str) -> None:
+  _registered_deprecations[deprecation_id] = DeprecationState()
 
 
-def unregister(module: str, key: str) -> None:
-  _registered_deprecations.pop((module, key))
+def unregister(deprecation_id: str) -> None:
+  if deprecation_id not in _registered_deprecations:
+    raise ValueError(f"{deprecation_id=!r} not registered.")
+  _registered_deprecations.pop(deprecation_id)
 
 
-def accelerate(module: str, key: str) -> None:
-  assert (module, key) in _registered_deprecations
-  _registered_deprecations[module, key] = True
+def accelerate(deprecation_id: str) -> None:
+  if deprecation_id not in _registered_deprecations:
+    raise ValueError(f"{deprecation_id=!r} not registered.")
+  _registered_deprecations[deprecation_id].accelerated = True
 
 
-def is_accelerated(module: str, key: str) -> bool:
-  return _registered_deprecations[module, key]
+def is_accelerated(deprecation_id: str) -> bool:
+  if deprecation_id not in _registered_deprecations:
+    raise ValueError(f"{deprecation_id=!r} not registered.")
+  return _registered_deprecations[deprecation_id].accelerated
+
+
+def warn(deprecation_id: str, message: str, stacklevel: int, *,
+         error_class: type[Exception] = ValueError) -> None:
+  """Warns about a deprecation, or errors if the deprecation is accelerated."""
+  if is_accelerated(deprecation_id):
+    assert issubclass(error_class, Exception)
+    raise error_class(message)
+  else:
+    warnings.warn(message, category=DeprecationWarning,
+                  stacklevel=stacklevel + 1)
+
+
+# Register a number of deprecations: we do this here to ensure they're
+# always registered by the time `accelerate` and `is_acelerated` are called.
+register('jax-array-numpy-dtype')
+register('jax-nn-one-hot-float-input')
+register('jax-numpy-astype-complex-to-real')
+register('jax-array-positional-args')
+register('jax-pallas-call-mgpu')
+register('jax-pallas-mgpu-shapes-types')
+register('jax-numpy-cross-2d-input')
+register('jax-pallas-mgpu-load-idx')
+register('jax-pallas-triton')

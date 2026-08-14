@@ -1,11 +1,14 @@
-# `jax.debug.print` and `jax.debug.breakpoint`
+# Compiled prints and breakpoints
+
+<!--* freshness: { reviewed: '2024-03-13' } *-->
 
 The {mod}`jax.debug` package offers some useful tools for inspecting values
-inside of JIT-ted functions.
+inside of compiled functions.
 
 ## Debugging with `jax.debug.print` and other debugging callbacks
 
-**TL;DR** Use {func}`jax.debug.print` to print traced array values to stdout in `jit`- and `pmap`-decorated functions:
+**Summary:** Use {func}`jax.debug.print` to print traced array values to
+stdout in compiled (e.g. `jax.jit` or `jax.pmap`-decorated) functions:
 
 ```python
 import jax
@@ -24,7 +27,6 @@ f(2.)
 # 🤯 0.9092974662780762 🤯
 ```
 
-<!-- mattjj added this line -->
 With some transformations, like `jax.grad` and `jax.vmap`, you can use Python's builtin `print` function to print out numerical values. But `print` won't work with `jax.jit` or `jax.pmap` because those transformations delay numerical evaluation. So use `jax.debug.print` instead!
 
 Semantically, `jax.debug.print` is roughly equivalent to the following Python function
@@ -89,8 +91,8 @@ def f(x):
   jax.debug.print("x: {}", x)
   return x
 jax.pmap(f)(xs)
-# Prints: x: 1.0
-#         x: 0.0
+# Prints: x: 0.0
+#         x: 1.0
 # OR
 # Prints: x: 1.0
 #         x: 0.0
@@ -136,7 +138,7 @@ jax.grad(f)(1.)
 
 #### Printing in other transformations
 
-`jax.debug.print` also works in other transformations like `xmap` and `pjit`.
+`jax.debug.print` also works in other transformations like `pjit`.
 
 ### More control with `jax.debug.callback`
 
@@ -176,6 +178,10 @@ f(2., 3.)
 Why? Under the hood, the compiler gets a functional representation of the staged-out computation, where the imperative order of the Python function is lost and only data dependence remains. This change is invisible to users with functionally pure code, but in the presence of side-effects like printing, it's noticeable.
 
 To preserve the original order of `jax.debug.print`s as written in your Python function, you can use `jax.debug.print(..., ordered=True)`, which will ensure the relative order of prints is preserved. But using `ordered=True` will raise an error under `jax.pmap` and other JAX transformations involving parallelism, since ordering can't be guaranteed under parallel execution.
+
+#### Computation perturbation
+
+Adding `jax.debug.print` or `jax.debug.breakpoint` statements will change the computation that XLA is asked to compile. This can potentially result in numeric discrepancies compared to the same code without debug statements because XLA might perform different operation fusions during compilation. Keep this in mind when debugging numerical issues, as the act of adding debug statements might affect the behavior you're trying to investigate.
 
 #### Asynchronous callbacks
 
@@ -234,7 +240,7 @@ Furthermore, when using `jax.debug.print` with `jax.pjit`, a global synchronizat
 
 ## Interactive inspection with `jax.debug.breakpoint()`
 
-**TL;DR** Use `jax.debug.breakpoint()` to pause the execution of your JAX program to inspect values:
+**Summary:** Use `jax.debug.breakpoint()` to pause the execution of your JAX program to inspect values:
 
 ```python
 @jax.jit

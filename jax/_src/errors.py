@@ -21,7 +21,7 @@ export = set_module('jax.errors')
 
 class _JAXErrorMixin:
   """Mixin for JAX-specific errors"""
-  _error_page = 'https://jax.readthedocs.io/en/latest/errors.html'
+  _error_page = 'https://docs.jax.dev/en/latest/errors.html'
   _module_name = "jax.errors"
 
   def __init__(self, message: str):
@@ -29,18 +29,17 @@ class _JAXErrorMixin:
     module_name = self._module_name
     class_name = self.__class__.__name__
     error_msg = f'{message}\nSee {error_page}#{module_name}.{class_name}'
-    # https://github.com/python/mypy/issues/5887
-    super().__init__(error_msg)  # type: ignore
+    super().__init__(error_msg)  # pyrefly: ignore[bad-argument-count]
 
 
 @export
 class JAXTypeError(_JAXErrorMixin, TypeError):
-  pass
+  """JAX-specific :class:`TypeError`"""
 
 
 @export
 class JAXIndexError(_JAXErrorMixin, IndexError):
-  pass
+  """JAX-specific :class:`IndexError`"""
 
 
 @export
@@ -74,7 +73,7 @@ class ConcretizationTypeError(JAXTypeError):
 
     This can often be fixed by marking the problematic argument as static::
 
-        >>> @partial(jit, static_argnums=1)
+        >>> @jit(static_argnums=1)
         ... def func(x, axis):
         ...   return x.min(axis)
 
@@ -295,7 +294,7 @@ class TracerArrayConversionError(JAXTypeError):
     or by declaring the index as a static argument::
 
       >>> from functools import partial
-      >>> @partial(jit, static_argnums=(0,))
+      >>> @jit(static_argnums=(0,))
       ... def func(i):
       ...   return x[i]
 
@@ -306,7 +305,7 @@ class TracerArrayConversionError(JAXTypeError):
   and concrete vs. abstract values, you may want to read
   :ref:`faq-different-kinds-of-jax-values`.
 
-  .. _External Callbacks: https://jax.readthedocs.io/en/latest/notebooks/external_callbacks.html
+  .. _External Callbacks: https://docs.jax.dev/en/latest/notebooks/external_callbacks.html
   """
   def __init__(self, tracer: core.Tracer):
     super().__init__(
@@ -342,7 +341,7 @@ class TracerIntegerConversionError(JAXTypeError):
     static::
 
       >>> from functools import partial
-      >>> @partial(jit, static_argnums=1)
+      >>> @jit(static_argnums=1)
       ... def func(x, axis):
       ...   return np.split(x, 2, axis)
 
@@ -393,7 +392,7 @@ class TracerIntegerConversionError(JAXTypeError):
     or by declaring the index as a static argument::
 
       >>> from functools import partial
-      >>> @partial(jit, static_argnums=0)
+      >>> @jit(static_argnums=0)
       ... def func(i):
       ...   return L[i]
 
@@ -477,7 +476,7 @@ class TracerBoolConversionError(ConcretizationTypeError):
     value as static::
 
       >>> from functools import partial
-      >>> @partial(jit, static_argnames=['normalize'])
+      >>> @jit(static_argnames=['normalize'])
       ... def func(x, normalize=True):
       ...   if normalize:
       ...     return x / x.sum()
@@ -503,7 +502,7 @@ class TracerBoolConversionError(ConcretizationTypeError):
 
     In this case, the error occurs because Python's built-in ``min`` function is not
     compatible with JAX transforms. This can be fixed by replacing it with
-    ``jnp.minumum``:
+    ``jnp.minimum``:
 
       >>> @jit
       ... def func(x):
@@ -530,7 +529,7 @@ class UnexpectedTracerError(JAXTypeError):
   function ``f`` that stores, in some scope outside of ``f``, a reference to
   an intermediate value, that value is considered to have been leaked.
   Leaking values is a side effect. (Read more about avoiding side effects in
-  `Pure Functions <https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions>`_)
+  `Pure Functions <https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions>`_)
 
   JAX detects leaks when you then use the leaked value in another
   operation later on, at which point it raises an ``UnexpectedTracerError``.
@@ -677,7 +676,6 @@ class KeyReuseError(JAXTypeError):
     KeyReuseError: Previously-consumed key passed to jit-compiled function at index 0
 
   This sort of key reuse is problematic because the JAX PRNG is stateless, and keys
-  must be manually split; For more information on this see `Sharp Bits: Random Numbers
-  <https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#random-numbers>`_.
+  must be manually split; For more information on this see `the Pseudorandom Numbers
+  tutorial <https://docs.jax.dev/en/latest/random-numbers.html>`_.
   """
-  pass

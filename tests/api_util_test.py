@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for jax.api_util."""
 
 import itertools as it
 from absl.testing import absltest
@@ -68,6 +67,63 @@ class ApiUtilTest(jtu.JaxTestCase):
   def test_rebase_donate_argnums(self, donate, static, expected):
     self.assertEqual(expected,
                      api_util.rebase_donate_argnums(donate, static))
+
+  def test_resolve_kwargs(self):
+    def fun(x, y, z=3):
+      return x, y, z
+    assert api_util.resolve_kwargs(fun, (1,), {"y": 2}) == (1, 2, 3)
+    assert api_util.resolve_kwargs(fun, (1, 2), {"z": 3}) == (1, 2, 3)
+    assert api_util.resolve_kwargs(
+        fun, (), {"x": 1, "y": 2, "z": 3}) == (1, 2, 3)
+
+  def test_resolve_kwargs_with_keyword(self):
+    def fun(x, y, z, *, kw=True):
+      del kw
+      return x, y, z
+    assert api_util.resolve_kwargs(fun, (1, 2), {"z": 3}) == (1, 2, 3)
+    with self.assertRaisesRegex(TypeError, "keyword arguments"):
+      api_util.resolve_kwargs(fun, (1, 2), {"z": 3, "kw": False})
+
+  def test_flatten_axes_valid_prefix(self):
+    treedef = jax.tree.structure({"a": [1, 2], "b": 3})
+    spec = {"a": 0, "b": 1}
+    result = api_util.flatten_axes("test", treedef, spec)
+    self.assertEqual(result, [0, 0, 1])
+
+  def test_flatten_axes_error_shows_mismatch_detail(self):
+    treedef = jax.tree.structure({"a": 1, "b": 2})
+    spec = {"a": 0, "b": (1, 2)}
+    with self.assertRaisesRegex(
+        ValueError, r"(?s)Mismatch details.*different types"
+    ):
+      api_util.flatten_axes("test_spec", treedef, spec)
+
+  def test_flatten_axes_error_shows_all_mismatches(self):
+    treedef = jax.tree.structure({"a": 1, "b": 2})
+    spec = {"a": [0, 1], "b": (2, 3)}
+    with self.assertRaisesRegex(ValueError, r"Mismatch details \(2 found\)"):
+      api_util.flatten_axes("test_spec", treedef, spec)
+
+  def test_flatten_axis_resources_valid_prefix(self):
+    tree = jax.tree.structure({"a": [1, 2], "b": 3})
+    shardings = {"a": None, "b": None}
+    result = api_util.flatten_axis_resources("test", tree, shardings, False)
+    self.assertEqual(result, (None, None, None))
+
+  def test_flatten_axis_resources_error_shows_mismatch_detail(self):
+    tree = jax.tree.structure({"a": 1, "b": 2})
+    shardings = {"a": None, "b": (None, None)}
+    with self.assertRaisesRegex(
+        ValueError, r"(?s)Mismatch details.*different types"
+    ):
+      api_util.flatten_axis_resources("test_spec", tree, shardings, False)
+
+  def test_flatten_axis_resources_error_shows_all_mismatches(self):
+    tree = jax.tree.structure({"a": 1, "b": 2})
+    shardings = {"a": [None, None], "b": (None, None)}
+    with self.assertRaisesRegex(ValueError, r"Mismatch details \(2 found\)"):
+      api_util.flatten_axis_resources("test_spec", tree, shardings, False)
+
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

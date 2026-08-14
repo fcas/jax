@@ -12,33 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for --debug_nans."""
-
 from absl.testing import absltest
 
 import jax
 import numpy as np
 from unittest import SkipTest
 
-from jax._src import api
 from jax._src import test_util as jtu
 from jax import numpy as jnp
-from jax.experimental import pjit
-from jax._src.maps import xmap
+from jax._src.shard_map import shard_map
+from jax.sharding import PartitionSpec as P
 
 jax.config.parse_flags_with_absl()
 
 
+@jtu.with_config(jax_debug_nans=True)
 class DebugNaNsTest(jtu.JaxTestCase):
-
-  def setUp(self):
-    super().setUp()
-    self.cfg = jax.config._read("jax_debug_nans")
-    jax.config.update("jax_debug_nans", True)
-
-  def tearDown(self):
-    jax.config.update("jax_debug_nans", self.cfg)
-    super().tearDown()
 
   def testSinc(self):
     # Regression test for #6936
@@ -65,8 +54,8 @@ class DebugNaNsTest(jtu.JaxTestCase):
       ans = jax.jit(lambda x: 0. / x)(A)
       ans.block_until_ready()
 
+  @jax.debug_nans(False)
   def testJitComputationNaNContextManager(self):
-    jax.config.update("jax_debug_nans", False)
     A = jnp.array(0.)
     f = jax.jit(lambda x: 0. / x)
     ans = f(A)
@@ -97,68 +86,95 @@ class DebugNaNsTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(FloatingPointError, msg):
       f(1)
 
-  def testPmap(self):
-    pmap_funcs = [api._cpp_pmap]
+  def testShardMap(self):
+    mesh = jtu.create_mesh((1,), ('x',))
+    f = shard_map(lambda x: 0. / x, mesh=mesh, in_specs=(P('x')), out_specs=P('x'))
+    # For the Cpp pmap, the first execution always goes through Python.
+    f(jnp.array([1.]))
 
-    for pmap in pmap_funcs:
-      f = pmap(lambda x: 0. / x)
-      # For the Cpp pmap, the first execution always goes through Python.
-      f(jnp.array([1.]))
+    with self.assertRaisesRegex(
+        FloatingPointError,
+        r"Invalid value \(nan\) encountered in sharded computation"):
+      ans = f(jnp.array([0.]))
+      ans.block_until_ready()
 
+    if jax.device_count() >= 2:
       with self.assertRaisesRegex(
           FloatingPointError,
-          r"invalid value \(nan\) encountered in parallel computation"):
-        ans = f(jnp.array([0.]))
+          r"Invalid value \(nan\) encountered in sharded computation"):
+        ans = f(jnp.array([1., 0.]))
         ans.block_until_ready()
 
-      if jax.device_count() >= 2:
-        with self.assertRaisesRegex(
-            FloatingPointError,
-            r"invalid value \(nan\) encountered in parallel computation"):
-          ans = f(jnp.array([1., 0.]))
-          ans.block_until_ready()
+  def testPmap(self):
+    f = jax.pmap(lambda x: 0. / x)
+    f(jnp.array([1.]))
+
+    with self.assertRaisesRegex(
+        FloatingPointError,
+        r"Invalid value \(nan\) encountered in sharded computation"):
+      ans = f(jnp.array([0.]))
+      ans.block_until_ready()
+
+    if jax.device_count() >= 2:
+      with self.assertRaisesRegex(
+          FloatingPointError,
+          r"Invalid value \(nan\) encountered in sharded computation"):
+        ans = f(jnp.array([1., 0.]))
+        ans.block_until_ready()
+
+  def testGradPmap(self):
+    @jax.jit
+    def f(x):
+      y = x**2
+      return jnp.log(y)
+
+    _, f_vjp = jax.vjp(jax.pmap(f), jnp.zeros([1]))
+
+    expected_regex = (
+        r"Invalid value \(nan\) encountered in sharded computation."
+    )
+
+    with self.assertRaisesRegex(
+        FloatingPointError, expected_regex):
+      ans, = f_vjp(jnp.ones([1]))
+      ans.block_until_ready()
+
+  def testGradShardMap(self):
+    @jax.jit
+    def f(x):
+      y = x**2
+      return jnp.log(y)
+
+    mesh = jtu.create_mesh((1,), ('x',))
+    shmap_f = shard_map(f, mesh=mesh, in_specs=(P('x')), out_specs=P('x'))
+    _, f_vjp = jax.vjp(shmap_f, jnp.zeros([1]))
+
+    with self.assertRaisesRegex(
+        FloatingPointError, r"Invalid value \(nan\) encountered"):
+      ans, = f_vjp(jnp.ones([1]))
+      ans.block_until_ready()
 
   def testPmapNoNaN(self):
     ans = jax.pmap(lambda x: 0. / x)(jnp.array([1.]))
     ans.block_until_ready()
 
   @jtu.ignore_warning(message=".*is an experimental.*")
-  def testXmap(self):
-
-    f = xmap(
-        lambda x: 0. / x,
-        in_axes=["i"],
-        out_axes=["i"],
-        axis_resources={"i": "x"})
-
-    with jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ('x',)):
-      with self.assertRaisesRegex(
-          FloatingPointError,
-          r"invalid value \(nan\) encountered in xmap"):
-        ans = f(jnp.array([0.]))
-        ans.block_until_ready()
-
-    if jax.device_count() >= 2:
-      with jax.sharding.Mesh(np.array(jax.local_devices()[:2]), ('x',)):
-        with self.assertRaises(FloatingPointError):
-          ans = f(jnp.array([1., 0.]))
-          ans.block_until_ready()
-
-  @jtu.ignore_warning(message=".*is an experimental.*")
-  def testPjit(self):
+  def test_jit(self):
     if jax.device_count() < 2:
       raise SkipTest("test requires >=2 devices")
 
     p = jax.sharding.PartitionSpec('x')
-    f = pjit.pjit(lambda x: 0. / x, in_shardings=p, out_shardings=p)
+    f = jax.jit(lambda x: 0. / x, in_shardings=p, out_shardings=p)
+    inp = jnp.array([0., 1.])
 
-    with jax.sharding.Mesh(np.array(jax.local_devices()[:2]), ('x',)):
+    with jax.set_mesh(
+        jax.sharding.Mesh(np.array(jax.local_devices()[:2]), ('x',))):
       with self.assertRaises(FloatingPointError):
-        ans = f(jnp.array([0., 1.]))
+        ans = f(inp)
         ans.block_until_ready()
 
   def testDebugNansJitWithDonation(self):
-    # https://github.com/google/jax/issues/12514
+    # https://github.com/jax-ml/jax/issues/12514
     a = jnp.array(0.)
     with self.assertRaises(FloatingPointError):
       ans = jax.jit(lambda x: 0. / x, donate_argnums=(0,))(a)
@@ -170,20 +186,18 @@ class DebugNaNsTest(jtu.JaxTestCase):
       ans = jax.pmap(lambda x: 0. / x, donate_argnums=(0,))(a)
       ans.block_until_ready()
 
-  @jtu.ignore_warning(message=".*is an experimental.*")
-  def testDebugNansPjitWithDonation(self):
+  def testDebugNansJitWithDonationSharded(self):
     if jax.device_count() < 2:
       raise SkipTest("test requires >=2 devices")
 
-    p = jax.sharding.PartitionSpec('x')
-    f = pjit.pjit(lambda x: 0. / x,
-                  in_shardings=p,
-                  out_shardings=p,
-                  donate_argnums=(0,))
+    inp = jnp.array([0., 1.])
+    f = jax.jit(lambda x: 0. / x, in_shardings=jax.P('x'),
+                out_shardings=jax.P('x'), donate_argnums=(0,))
 
-    with jax.sharding.Mesh(np.array(jax.local_devices()[:2]), ('x',)):
+    with jax.set_mesh(
+        jax.sharding.Mesh(np.array(jax.local_devices()[:2]), ('x',))):
       with self.assertRaises(FloatingPointError):
-        ans = f(jnp.array([0., 1.]))
+        ans = f(inp)
         ans.block_until_ready()
 
   def testDebugNansZeroDiv(self):
@@ -193,28 +207,26 @@ class DebugNaNsTest(jtu.JaxTestCase):
 
     with self.assertRaisesRegex(
         FloatingPointError,
-        r"invalid value \(nan\) encountered in jit\(true_divide\)"):
+        r"invalid value \(nan\) encountered in div"):
       f(inp, inp)
 
-    # TODO(yashkatariya): Fix this and make true_divide appear in the name again.
-    # Instead of `f` showing up in the error, the name should be of the
-    # primitive (true_divide) in this case.
     with self.assertRaisesRegex(
         FloatingPointError,
-        r"invalid value \(nan\) encountered in jit\(f\)"):
+        r"invalid value \(nan\) encountered in div"):
       jax.jit(f)(inp, inp)
 
+  def testDebugNansInput(self):
 
+    @jax.jit
+    def f(x):
+      return x * 3.
+
+    with self.assertRaisesRegex(FloatingPointError, "the de-optimized function did not .*input"):
+      f(np.nan)
+
+
+@jtu.with_config(jax_debug_infs=True)
 class DebugInfsTest(jtu.JaxTestCase):
-
-  def setUp(self):
-    super().setUp()
-    self.cfg = jax.config._read("jax_debug_infs")
-    jax.config.update("jax_debug_infs", True)
-
-  def tearDown(self):
-    jax.config.update("jax_debug_infs", self.cfg)
-    super().tearDown()
 
   def testSingleResultPrimitiveNoInf(self):
     A = jnp.array([[1., 2.], [2., 3.]])
@@ -253,7 +265,7 @@ class DebugInfsTest(jtu.JaxTestCase):
       f(1)
 
   def testDebugNansDoesntCorruptCaches(self):
-    # https://github.com/google/jax/issues/6614
+    # https://github.com/jax-ml/jax/issues/6614
     @jax.jit
     def f(x):
       return jnp.divide(x, x)
@@ -271,7 +283,7 @@ class DebugInfsTest(jtu.JaxTestCase):
       y = x + 2  # avoid trivial dispatch path by adding some eqn
       return jnp.nan, y
 
-    with self.assertRaisesRegex(FloatingPointError, "de-optimized"):
+    with self.assertRaisesRegex(FloatingPointError, "the de-optimized function did not .*literal"):
       with jax.debug_nans(True):
         f(3)
 

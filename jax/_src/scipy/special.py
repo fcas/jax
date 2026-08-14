@@ -16,25 +16,30 @@ from __future__ import annotations
 
 from functools import partial
 import operator
-from typing import cast, Any
+from typing import Any
 
 import numpy as np
 
-import jax.numpy as jnp
-from jax import jit
-from jax import jvp
-from jax import vmap
-from jax import lax
-
+from jax._src import api_util
+from jax._src import config
 from jax._src import core
 from jax._src import custom_derivatives
+from jax._src import dispatch
 from jax._src import dtypes
+from jax._src import lax
+from jax._src import numpy as jnp
+from jax._src.numpy.ufuncs import arctan, isposinf, isneginf, sinc
+from jax._src.api import jit, jvp, vmap
 from jax._src.lax.lax import _const as _lax_const
-from jax._src.numpy.util import promote_args_inexact, promote_dtypes_inexact
+from jax._src.lax.special import ndtr as _ndtr
+from jax._src.numpy import einsum as jnp_einsum
+from jax._src.numpy import vectorize as jnp_vectorize
+from jax._src.numpy.util import promote_args_complex, promote_args_inexact, promote_dtypes_inexact
 from jax._src.ops import special as ops_special
 from jax._src.third_party.scipy.betaln import betaln as _betaln_impl
 from jax._src.typing import Array, ArrayLike
-
+from jax._src.nn.functions import softmax as nn_softmax
+from jax._src.nn.functions import log_softmax as nn_log_softmax
 
 def gammaln(x: ArrayLike) -> Array:
   r"""Natural log of the absolute value of the gamma function.
@@ -56,6 +61,7 @@ def gammaln(x: ArrayLike) -> Array:
   See Also:
     - :func:`jax.scipy.special.gammaln`: the natural log of the gamma function
     - :func:`jax.scipy.special.gammasgn`: the sign of the gamma function
+    - :func:`jax.scipy.special.loggamma`: the principal branch of the log-gamma function
 
   Notes:
     ``gammaln`` does not support complex-valued inputs.
@@ -64,6 +70,7 @@ def gammaln(x: ArrayLike) -> Array:
   return lax.lgamma(x)
 
 
+@jit
 def gammasgn(x: ArrayLike) -> Array:
   r"""Sign of the gamma function.
 
@@ -79,6 +86,13 @@ def gammasgn(x: ArrayLike) -> Array:
   Where :math:`\Gamma` is the :func:`~jax.scipy.special.gamma` function.
   Because :math:`\Gamma(x)` is never zero, no condition is required for this case.
 
+  * if :math:`x = -\infty`, NaN is returned.
+  * if :math:`x = \pm 0`, :math:`\pm 1` is returned.
+  * if :math:`x` is a negative integer, NaN is returned. The sign of gamma
+    at a negative integer depends on from which side the pole is approached.
+  * if :math:`x = \infty`, :math:`1` is returned.
+  * if :math:`x` is NaN, NaN is returned.
+
   Args:
     x: arraylike, real valued.
 
@@ -90,8 +104,150 @@ def gammasgn(x: ArrayLike) -> Array:
     - :func:`jax.scipy.special.gammaln`: the natural log of the gamma function
   """
   x, = promote_args_inexact("gammasgn", x)
+  if dtypes.issubdtype(x.dtype, np.complexfloating):
+    raise ValueError("gammasgn does not support complex-valued inputs.")
+  typ = x.dtype.type
   floor_x = lax.floor(x)
-  return jnp.where((x > 0) | (x == floor_x) | (floor_x % 2 == 0), 1.0, -1.0)
+  x_negative = x < 0
+  return jnp.select(
+    [(x_negative & (x == floor_x)) | jnp.isnan(x),
+     (x_negative & (floor_x % 2 != 0)) | ((x == 0) & jnp.signbit(x))],
+    [typ(np.nan), typ(-1.0)],
+    typ(1.0))
+
+
+# Lanczos coefficients for g=7, N=9.
+# Method: C. Lanczos, "A Precision Approximation of the Gamma Function",
+#   SIAM J. Numer. Anal. Ser. B, 1, 1964. https://doi.org/10.1137/0701008
+# Coefficients: GSL (specfunc/gamma.c), lanczos_7_c[9].
+#   https://git.savannah.gnu.org/cgit/gsl.git/plain/specfunc/gamma.c
+# See also: https://en.wikipedia.org/wiki/Lanczos_approximation
+_LANCZOS_G = 7.0
+_LANCZOS_COEFFS = np.array([
+    0.99999999999980993,
+    676.5203681218851,
+    -1259.1392167224028,
+    771.32342877765313,
+    -176.61502916214059,
+    12.507343278686905,
+    -0.13857109526572012,
+    9.9843695780195716e-6,
+    1.5056327351493116e-7,
+])
+
+
+def _complex_loggamma(z: Array) -> Array:
+  """Principal-branch log-gamma for complex arguments via Lanczos approximation.
+
+  Uses the reflection formula for Re(z) < 0.5.
+  """
+  assert dtypes.issubdtype(z.dtype, np.complexfloating)
+
+  # Reflection: for Re(z) < 0.5, use Gamma(z) = pi / (sin(pi*z) * Gamma(1-z))
+  needs_reflection = jnp.real(z) < 0.5
+  z_lanczos = jnp.where(needs_reflection, 1.0 - z, z)
+
+  # Lanczos approximation: Ag(z) = c[0] + sum(c[k] / (z + k - 1), k=1..N-1)
+  zz = z_lanczos - 1.0
+  coeffs = jnp.asarray(_LANCZOS_COEFFS, dtype=z.dtype)
+  ks = lax.expand_dims(jnp.arange(1, 9, dtype=z.dtype), tuple(range(zz.ndim)))
+  ag = coeffs[0] + jnp.sum(
+      lax.expand_dims(coeffs[1:], tuple(range(zz.ndim)))
+      / (lax.expand_dims(zz, (zz.ndim,)) + ks), axis=-1)
+
+  t = zz + _LANCZOS_G + 0.5
+  half_log2pi = jnp.asarray(0.5 * np.log(2.0 * np.pi), dtype=z.dtype)
+  log_gamma_lanczos = (
+      half_log2pi
+      + (zz + 0.5) * jnp.log(t)
+      - t
+      + jnp.log(ag)
+  )
+
+  # Mask z to a safe value in the reflection branch so the unselected
+  # path never produces NaN (which would contaminate gradients via
+  # jnp.where's VJP: 0 * NaN = NaN in IEEE 754).
+  z_safe = jnp.where(needs_reflection, z, jnp.full_like(z, 0.5))
+  reflected = (
+      jnp.log(jnp.asarray(np.pi, dtype=z.dtype))
+      - jnp.log(jnp.sin(np.pi * z_safe))
+      - log_gamma_lanczos
+  )
+
+  return jnp.where(needs_reflection, reflected, log_gamma_lanczos)
+
+
+def _complex_gamma(z: Array) -> Array:
+  """Gamma function for complex arguments via exp(loggamma(z))."""
+  is_nan = jnp.isnan(z)
+  is_pole = (jnp.imag(z) == 0) & (jnp.real(z) == jnp.floor(jnp.real(z))) & (jnp.real(z) <= 0)
+  nan_val = jnp.array(complex(jnp.nan, jnp.nan), dtype=z.dtype)
+  # Mask poles/NaN to a safe value before calling loggamma, so the
+  # unselected path doesn't produce NaN that contaminates gradients
+  # via jnp.where's VJP (0 * NaN = NaN).
+  safe = is_pole | is_nan
+  z_safe = jnp.where(safe, jnp.ones_like(z), z)
+  return jnp.where(safe, nan_val, jnp.exp(_complex_loggamma(z_safe)))
+
+
+@jit
+def _complex_loggamma_scipy(z: Array) -> Array:
+  """Principal branch of the logarithm of the gamma function for complex arguments.
+
+  Matches SciPy's branch cuts (single cut on the negative real axis).
+  """
+  is_nan = jnp.isnan(z)
+  is_pole = (jnp.imag(z) == 0) & (jnp.real(z) == jnp.floor(jnp.real(z))) & (jnp.real(z) <= 0)
+  nan_val = jnp.array(complex(jnp.nan, jnp.nan), dtype=z.dtype)
+
+  safe = is_pole | is_nan
+  z_safe = jnp.where(safe, jnp.ones_like(z), z)
+
+  n = jnp.maximum(0, jnp.ceil(0.5 - jnp.real(z_safe)).astype(int))
+
+  def cond_fun(state):
+    k, _ = state
+    return jnp.any(k < n)
+
+  def body_fun(state):
+    k, sum_log = state
+    mask = k < n
+    zk = jnp.where(mask, z_safe + k, jnp.ones_like(z_safe))
+    return k + 1, sum_log + jnp.where(mask, jnp.log(zk), jnp.zeros_like(sum_log))
+
+  # Shift z into the right half-plane using loggamma(z) = loggamma(z+n) - sum_{k=0}^{n-1} log(z+k)
+  # to match SciPy's branch cuts along the negative real axis.
+  _, sum_log = lax.while_loop(cond_fun, body_fun, (0, jnp.zeros_like(z_safe)))
+
+  res = _complex_loggamma(z_safe + n) - sum_log
+  return jnp.where(safe, nan_val, res)
+
+
+def loggamma(x: ArrayLike) -> Array:
+  r"""Principal branch of the logarithm of the gamma function.
+
+  JAX implementation of :obj:`scipy.special.loggamma`.
+
+  Defined to be :math:`\log(\Gamma(x))` for :math:`x > 0` and
+  extended to the complex plane by analytic continuation. The
+  function has a single branch cut on the negative real axis.
+
+  Args:
+    x: arraylike, real or complex valued.
+
+  Returns:
+    array containing the values of the loggamma function. For complex inputs,
+    the output is complex-valued.
+
+  See Also:
+    - :func:`jax.scipy.special.gamma`: the gamma function.
+    - :func:`jax.scipy.special.gammaln`: the natural log of the absolute value of the gamma function.
+  """
+  x, = promote_args_inexact("loggamma", x)
+  if dtypes.issubdtype(x.dtype, np.complexfloating):
+    return _complex_loggamma_scipy(x)
+  res = lax.lgamma(x)
+  return jnp.where(x > 0, res, jnp.nan)
 
 
 def gamma(x: ArrayLike) -> Array:
@@ -113,11 +269,27 @@ def gamma(x: ArrayLike) -> Array:
 
      \Gamma(n) = (n - 1)!
 
+  For real inputs:
+
+  * if :math:`x = -\infty`, NaN is returned.
+  * if :math:`x = \pm 0`, :math:`\pm \infty` is returned.
+  * if :math:`x` is a negative integer, NaN is returned. The sign of gamma
+    at a negative integer depends on from which side the pole is approached.
+  * if :math:`x = \infty`, :math:`\infty` is returned.
+  * if :math:`x` is NaN, NaN is returned.
+
+  For complex inputs:
+
+  * at non-positive integers (poles), ``nan+nanj`` is returned, matching SciPy.
+  * if either real or imaginary component is NaN, ``nan+nanj`` is returned.
+
   Args:
-    x: arraylike, real valued.
+    x: arraylike, real or complex valued. Complex inputs use a Lanczos
+       approximation with reflection formula.
 
   Returns:
-    array containing the values of the gamma function
+    array containing the values of the gamma function. For complex inputs,
+    the output is complex-valued.
 
   See Also:
     - :func:`jax.scipy.special.factorial`: the factorial function.
@@ -125,9 +297,12 @@ def gamma(x: ArrayLike) -> Array:
     - :func:`jax.scipy.special.gammasgn`: the sign of the gamma function
 
   Notes:
-    Unlike the scipy version, JAX's ``gamma`` does not support complex-valued inputs.
+    For complex inputs, the implementation uses the Lanczos approximation
+    (g=7, N=9 coefficients) with the reflection formula for Re(z) < 0.5.
   """
   x, = promote_args_inexact("gamma", x)
+  if dtypes.issubdtype(x.dtype, np.complexfloating):
+    return _complex_gamma(x)
   return gammasgn(x) * lax.exp(lax.lgamma(x))
 
 
@@ -138,7 +313,7 @@ def betaln(a: ArrayLike, b: ArrayLike) -> Array:
 
   .. math::
 
-     \mathrm{betaln}(a, b) = \log B(a, b)
+     \mathrm{betaln}(a, b) = \log |B(a, b)|
 
   where :math:`B` is the :func:`~jax.scipy.special.beta` function.
 
@@ -147,7 +322,7 @@ def betaln(a: ArrayLike, b: ArrayLike) -> Array:
     b: arraylike, real-valued.  Parameter *b* of the beta distribution.
 
   Returns:
-    array containing the values of the log-beta function
+    array containing the logarithm of the absolute value of the beta function
 
   See Also:
     :func:`jax.scipy.special.beta`
@@ -187,7 +362,49 @@ def factorial(n: ArrayLike, exact: bool = False) -> Array:
   return jnp.where(n < 0, 0, lax.exp(lax.lgamma(n + 1)))
 
 
-def beta(x: ArrayLike, y: ArrayLike) -> Array:
+def comb(N: ArrayLike, k: ArrayLike, *, repetition: bool = False) -> Array:
+  r"""The number of combinations of N things taken k at a time ("N choose k").
+
+  JAX implementation of :func:`scipy.special.comb`.
+
+  .. math::
+
+    \mathrm{comb}(N, k) = \binom{N}{k} = \frac{N!}{k!\,(N - k)!}
+
+  Args:
+    N: arraylike, number of things.
+    k: arraylike, number of elements taken.
+    repetition: bool, compute the number of combinations with repetition.
+
+  Returns:
+    array containing the total number of combinations.
+
+  Notes:
+    This computes the float-valued binomial coefficient via the
+    :func:`~jax.scipy.special.gammaln` function. The ``exact`` argument
+    from :func:`scipy.special.comb` is not supported because JAX does not
+    support arbitrary-precision integers. If ``N < 0``, ``k < 0``, or
+    ``k > N`` and ``repetition=False``, then 0 is returned.
+
+  See Also:
+    - :func:`jax.scipy.special.factorial`
+    - :func:`jax.scipy.special.gammaln`
+  """
+  N, k = promote_args_inexact("comb", N, k)
+
+  if repetition:
+    cond = (k == 0) & (N >= 0)
+    result = comb(N + k - 1, k, repetition=False)
+    return jnp.where(cond, 1.0, result)
+
+  cond = (k <= N) & (N >= 0) & (k >= 0)
+  safe_N = jnp.where(cond, N, 0.0)
+  safe_k = jnp.where(cond, k, 0.0)
+  result = lax.exp(gammaln(safe_N + 1) - gammaln(safe_k + 1) - gammaln(safe_N + 1 - safe_k))
+  return jnp.where(cond, result, 0.0)
+
+
+def beta(a: ArrayLike, b: ArrayLike) -> Array:
   r"""The beta function
 
   JAX implementation of :obj:`scipy.special.beta`.
@@ -209,9 +426,11 @@ def beta(x: ArrayLike, y: ArrayLike) -> Array:
     - :func:`jax.scipy.special.gamma`
     - :func:`jax.scipy.special.betaln`
   """
-  x, y = promote_args_inexact("beta", x, y)
-  sign = gammasgn(x) * gammasgn(y) * gammasgn(x + y)
-  return sign * lax.exp(betaln(x, y))
+  a, b = promote_args_inexact("beta", a, b)
+  if dtypes.issubdtype(a.dtype, np.complexfloating):
+    raise ValueError("beta does not support complex-valued inputs.")
+  sign = gammasgn(a) * gammasgn(b) * gammasgn(a + b)
+  return sign * lax.exp(betaln(a, b))
 
 
 def betainc(a: ArrayLike, b: ArrayLike, x: ArrayLike) -> Array:
@@ -221,7 +440,7 @@ def betainc(a: ArrayLike, b: ArrayLike, x: ArrayLike) -> Array:
 
   .. math::
 
-     \mathrm{betainc}(a, b, x) = B(a, b)\int_0^x t^{a-1}(1-t^{b-1})\mathrm{d}t
+     \mathrm{betainc}(a, b, x) = \frac{1}{B(a, b)}\int_0^x t^{a-1}(1-t)^{b-1}\mathrm{d}t
 
   where :math:`B(a, b)` is the :func:`~jax.scipy.special.beta` function.
 
@@ -238,6 +457,8 @@ def betainc(a: ArrayLike, b: ArrayLike, x: ArrayLike) -> Array:
     - :func:`jax.scipy.special.betaln`
   """
   a, b, x = promote_args_inexact("betainc", a, b, x)
+  if dtypes.issubdtype(x.dtype, np.complexfloating):
+    raise ValueError("betainc does not support complex-valued inputs.")
   return lax.betainc(a, b, x)
 
 
@@ -248,9 +469,9 @@ def digamma(x: ArrayLike) -> Array:
 
   .. math::
 
-     \mathrm{digamma}(z) = \psi(z) = \frac{\mathrm{d}}{\mathrm{d}z}\log \Gamma(z)
+     \mathrm{digamma}(x) = \psi(x) = \frac{\mathrm{d}}{\mathrm{d}x}\log \Gamma(x)
 
-  where :math:`\Gamma(z)` is the :func:`~jax.scipy.special.gamma` function.
+  where :math:`\Gamma(x)` is the :func:`~jax.scipy.special.gamma` function.
 
   Args:
     x: arraylike, real-valued.
@@ -276,7 +497,7 @@ def gammainc(a: ArrayLike, x: ArrayLike) -> Array:
 
   .. math::
 
-     \mathrm{gammainc}(x; a) = \frac{1}{\Gamma(a)}\int_0^x t^{a-1}e^{-t}\mathrm{d}t
+     \mathrm{gammainc}(a, x) = \frac{1}{\Gamma(a)}\int_0^x t^{a-1}e^{-t}\mathrm{d}t
 
   where :math:`\Gamma(a)` is the :func:`~jax.scipy.special.gamma` function.
 
@@ -302,7 +523,7 @@ def gammaincc(a: ArrayLike, x: ArrayLike) -> Array:
 
   .. math::
 
-     \mathrm{gammaincc}(x; a) = \frac{1}{\Gamma(a)}\int_x^\infty t^{a-1}e^{-t}\mathrm{d}t
+     \mathrm{gammaincc}(a, x) = \frac{1}{\Gamma(a)}\int_x^\infty t^{a-1}e^{-t}\mathrm{d}t
 
   where :math:`\Gamma(a)` is the :func:`~jax.scipy.special.gamma` function.
 
@@ -341,6 +562,7 @@ def erf(x: ArrayLike) -> Array:
 
   See also:
     - :func:`jax.scipy.special.erfc`
+    - :func:`jax.scipy.special.erfcx`
     - :func:`jax.scipy.special.erfinv`
   """
   x, = promote_args_inexact("erf", x)
@@ -370,6 +592,7 @@ def erfc(x: ArrayLike) -> Array:
 
   See also:
     - :func:`jax.scipy.special.erf`
+    - :func:`jax.scipy.special.erfcx`
     - :func:`jax.scipy.special.erfinv`
   """
   x, = promote_args_inexact("erfc", x)
@@ -400,6 +623,274 @@ def erfinv(x: ArrayLike) -> Array:
   return lax.erf_inv(x)
 
 
+# Weideman (1994) N=32 rational approximation constants for the Faddeeva function.
+# Descending-degree polynomial coefficients for jnp.polyval: polyval(c, Z) = sum_n c[n]*Z^(N-n).
+# Algorithm: w(z) = 2*polyval(c, Z)/(L-iz)^2 + 1/(sqrt(pi)*(L-iz))
+# where Z = (L+iz)/(L-iz), valid for Im(z) >= 0.
+_WOFZ_L = 4.7568284600108841
+_WOFZ_C = np.array([
+    -1.3034426067909105e-12, 3.7411838373738471e-12, 8.030427700497756e-12, -2.1543593557490879e-11,
+    -5.5442449963237932e-11, 1.165824698850374e-10, 4.1537441121999766e-10, -5.2310202114920615e-10,
+    -3.2080151339721323e-09, 8.1248864216535907e-10, 2.3797556530014025e-08, 2.2930438438915445e-08,
+    -1.4813078929137642e-07, -4.1840763750512053e-07, 4.2558331397138446e-07, 4.4015317312832251e-06,
+    6.8210319443575151e-06, -2.1409619201999998e-05, -0.00013075449254579421, -0.00024532980270038237,
+    0.00039259136070109705, 0.0045195411053493093, 0.019006155784845501, 0.057304403529837282,
+    0.14060716226893755, 0.29544451071508743, 0.54601397206393376, 0.9019254893648001,
+    1.3455441692345449, 1.8256696296324815, 2.2635372999002676, 2.5722534081245696,
+])
+
+
+def _wofz_upper(z: Array) -> Array:
+  re = lax.real(z)
+  L = lax.complex(_lax_const(re, _WOFZ_L), _lax_const(re, 0.))
+  iz = lax.complex(lax.neg(lax.imag(z)), re)
+  denom = L - iz
+  Z = (L + iz) / denom
+  p = jnp.polyval(jnp.asarray(_WOFZ_C, dtype=Z.dtype), Z)
+  one_over_sqrtpi = lax.complex(_lax_const(re, 1. / np.sqrt(np.pi)), _lax_const(re, 0.))
+  return 2 * p / (denom * denom) + one_over_sqrtpi / denom
+
+
+@custom_derivatives.custom_jvp
+def _wofz(z: Array) -> Array:
+  sign = lax.ge(lax.imag(z), _lax_const(lax.real(z), 0.))
+  z_upper = lax.select(sign, z, lax.neg(z))
+  w_upper = _wofz_upper(z_upper)
+  correction = 2 * lax.exp(lax.neg(z * z)) - w_upper
+  return lax.select(sign, w_upper, correction)
+
+_wofz.defjvps(
+    lambda g, ans, z: g * (
+        lax.neg(2 * z * ans) + lax.complex(
+            _lax_const(lax.real(z), 0.),
+            _lax_const(lax.real(z), 2. / np.sqrt(np.pi)),
+        )
+    )
+)
+
+
+def erfcx(x: ArrayLike) -> Array:
+  r"""Scaled complementary error function.
+
+  JAX implementation of :obj:`scipy.special.erfcx`.
+
+  .. math::
+
+     \mathrm{erfcx}(x) = e^{x^2} \mathrm{erfc}(x)
+
+  This is numerically stable for large positive ``x``, unlike the naive
+  formula which overflows.
+
+  Args:
+    x: arraylike, real or complex.
+
+  Returns:
+    array containing values of the scaled complementary error function.
+
+  See also:
+    - :func:`jax.scipy.special.erfc`
+    - :func:`jax.scipy.special.erf`
+    - :func:`jax.scipy.special.wofz`
+  """
+  x, = promote_args_inexact("erfcx", x)
+  if dtypes.issubdtype(x.dtype, np.complexfloating):
+    iz = lax.complex(lax.neg(lax.imag(x)), lax.real(x))
+    return _wofz(iz)
+  return _erfcx(x)
+
+
+@custom_derivatives.custom_jvp
+def _erfcx(x: Array) -> Array:
+  if x.dtype == np.float64:
+    # At threshold ~26.6, first omitted term |c_9|/x^18 ~ 1e-21 << eps64 ~ 2e-16.
+    return _erfcx_impl(x, nterms=9)
+  elif x.dtype == np.float32:
+    # At threshold ~9.4, first omitted term |c_5|/x^10 ~ 5e-9 << eps32 ~ 1e-7.
+    return _erfcx_impl(x, nterms=5)
+  else:  # float16, bfloat16 — upcast to float32
+    return _erfcx_impl(x.astype(np.float32), nterms=5).astype(x.dtype)
+
+_erfcx.defjvps(
+    lambda g, ans, x: g * (2 * x * ans - _lax_const(x, 2. / np.sqrt(np.pi))))
+
+
+def _erfcx_asymptotic(x: Array, nterms: int) -> Array:
+  # Asymptotic expansion: erfcx(x) ~ (1/(sqrt(pi)*x)) * P(1/x^2)
+  # P(t) = sum_{k=0}^{N} c_k * t^k,  c_k = (-1)^k * (2k-1)!! / 2^k
+  # Coefficients in descending order of degree (k=8..0) for jnp.polyval.
+  _coeffs = [7918.06640625, -1055.7421875, 162.421875, -29.53125, 6.5625,
+             -1.875, .75, -.5, 1.]
+  t = _lax_const(x, 1.) / lax.square(x)
+  p = jnp.polyval(np.array(_coeffs[-nterms:], dtype=x.dtype), t)
+  return p / (x * _lax_const(x, np.sqrt(np.pi)))
+
+
+def _erfcx_impl(x: Array, nterms: int) -> Array:
+  # Switch to asymptotic expansion when exp(x^2) would overflow.
+  # Overflow occurs when x^2 > log(fmax), i.e. x > sqrt(log(fmax)).
+  threshold = np.sqrt(np.log(dtypes.finfo(x.dtype).max))
+  large = x > _lax_const(x, threshold)
+  safe_x = lax.select(large, lax.full_like(x, 1.), x)
+  direct = lax.exp(lax.square(safe_x)) * lax.erfc(safe_x)
+  asymp = _erfcx_asymptotic(x, nterms)
+  return lax.select(large, asymp, direct)
+
+
+# Rational approximation coefficients for dawsn (Cody, Paciorek, Thacher 1970).
+# Region 1: [0, 3.25)  —  y = ax * P(ax^2) / Q(ax^2)
+_DAWSN_AN = np.array([
+    1.13681498971755972054e-11,
+    8.49262267667473811108e-10,
+    1.94434204175553054283e-8,
+    9.53151741254484363489e-7,
+    3.07828309874913200438e-6,
+    3.52513368520288738649e-4,
+    -8.50149846724410912031e-4,
+    4.22618223005546594270e-2,
+    -9.17480371773452345351e-2,
+    9.99999999999999994612e-1,
+])
+_DAWSN_AD = np.array([
+    2.40372073066762605484e-11,
+    1.48864681368493396752e-9,
+    5.21265281010541664570e-8,
+    1.27258478273186970203e-6,
+    2.32490249820789513991e-5,
+    3.25524741826057911661e-4,
+    3.48805814657162590916e-3,
+    2.79448531198828973716e-2,
+    1.58874241960120565368e-1,
+    5.74918629489320327824e-1,
+    1.00000000000000000539e0,
+])
+# Region 2: [3.25, 6.25)  —  y = 0.5/ax * (1 + (1/ax^2)*P(1/ax^2)/Q(1/ax^2))
+_DAWSN_BN = np.array([
+    5.08955156417900903354e-1,
+    -2.44754418142697847934e-1,
+    9.41512335303534411857e-2,
+    -2.18711255142039025206e-2,
+    3.66207612329569181322e-3,
+    -4.23209114460388756528e-4,
+    3.59641304793896631888e-5,
+    -2.14640351719968974225e-6,
+    9.10010780076391431042e-8,
+    -2.40274520828250956942e-9,
+    3.59233385440928410398e-11,
+])
+_DAWSN_BD = np.array([
+    1.00000000000000000000e0,
+    -6.31839869873368190192e-1,
+    2.36706788228248691528e-1,
+    -5.31806367003223277662e-2,
+    8.48041718586295374409e-3,
+    -9.47996768486665330168e-4,
+    7.81025592944552338085e-5,
+    -4.55875153252442634831e-6,
+    1.89100358111421846170e-7,
+    -4.91324691331920606875e-9,
+    7.18466403235734541950e-11,
+])
+# Region 3: [6.25, inf)  —  y = 0.5/ax * (1 + (1/ax^2)*P(1/ax^2)/Q(1/ax^2))
+_DAWSN_CN = np.array([
+    -5.90592860534773254987e-1,
+    6.29235242724368800674e-1,
+    -1.72858975380388136411e-1,
+    1.64837047825189632310e-2,
+    -4.86827613020462700845e-4,
+])
+_DAWSN_CD = np.array([
+    1.00000000000000000000e0,
+    -2.69820057197544900361e0,
+    1.73270799045947845857e0,
+    -3.93708582281939493482e-1,
+    3.44278924041233391079e-2,
+    -9.73655226040941223894e-4,
+])
+
+
+def dawsn(x: ArrayLike) -> Array:
+  r"""Dawson's integral.
+
+  JAX implementation of :obj:`scipy.special.dawsn`.
+
+  .. math::
+
+     \mathrm{dawsn}(x) = e^{-x^2} \int_0^x e^{t^2} \, dt
+
+  Args:
+    x: arraylike, real-valued.
+
+  Returns:
+    array containing values of Dawson's integral.
+
+  See also:
+    - :func:`jax.scipy.special.erfcx`
+  """
+  x, = promote_args_inexact("dawsn", x)
+  if dtypes.issubdtype(x.dtype, np.complexfloating):
+    raise ValueError("dawsn does not support complex-valued inputs.")
+  return _dawsn(x)
+
+
+@custom_derivatives.custom_jvp
+def _dawsn(x: Array) -> Array:
+  if x.dtype in [np.float32, np.float64]:
+    return _dawsn_impl(x)
+  else:  # float16, bfloat16 — upcast to float32
+    return _dawsn_impl(x.astype(np.float32)).astype(x.dtype)
+
+_dawsn.defjvps(
+    lambda g, ans, x: g * (_lax_const(x, 1.) - _lax_const(x, 2.) * x * ans))
+
+
+def _dawsn_impl(x: Array) -> Array:
+  # Rational approximations from Cody, Paciorek, Thacher (1970).
+  # All approximations work on |x|; odd symmetry restores the sign.
+  sign = jnp.sign(x)
+  # sign(0) == 0, but dawsn(0) == 0 so the product is correct.
+  ax = lax.abs(x)
+
+  AN = np.array(_DAWSN_AN, dtype=x.dtype)
+  AD = np.array(_DAWSN_AD, dtype=x.dtype)
+  BN = np.array(_DAWSN_BN, dtype=x.dtype)
+  BD = np.array(_DAWSN_BD, dtype=x.dtype)
+  CN = np.array(_DAWSN_CN, dtype=x.dtype)
+  CD = np.array(_DAWSN_CD, dtype=x.dtype)
+
+  ax2 = lax.square(ax)
+  t = _lax_const(x, 1.) / ax2
+
+  # Compute each region using safe dummy inputs to avoid NaN in unused branches.
+  # (Without safe inputs, polyval at extreme ax values overflows to inf, and
+  # inf/inf = NaN which lax.select does not suppress on all backends.)
+  # Region 1
+  safe_ax_r1 = lax.select(ax < _lax_const(x, 3.25), ax, lax.full_like(ax, 1.))
+  safe_ax2_r1 = lax.square(safe_ax_r1)
+  val_r1 = safe_ax_r1 * jnp.polyval(AN, safe_ax2_r1) / jnp.polyval(AD, safe_ax2_r1)
+
+  # Region 2
+  safe_t_r2 = lax.select(
+      (ax >= _lax_const(x, 3.25)) & (ax < _lax_const(x, 6.25)),
+      t, lax.full_like(t, 1.))
+  safe_ax_r2 = lax.select(
+      (ax >= _lax_const(x, 3.25)) & (ax < _lax_const(x, 6.25)),
+      ax, lax.full_like(ax, 1.))
+  val_r2 = (_lax_const(x, 0.5) / safe_ax_r2) * (
+      _lax_const(x, 1.)
+      + safe_t_r2 * jnp.polyval(BN, safe_t_r2) / jnp.polyval(BD, safe_t_r2))
+
+  # Region 3
+  safe_t_r3 = lax.select(ax >= _lax_const(x, 6.25), t, lax.full_like(t, 1.))
+  safe_ax_r3 = lax.select(ax >= _lax_const(x, 6.25), ax, lax.full_like(ax, 1.))
+  val_r3 = (_lax_const(x, 0.5) / safe_ax_r3) * (
+      _lax_const(x, 1.)
+      + safe_t_r3 * jnp.polyval(CN, safe_t_r3) / jnp.polyval(CD, safe_t_r3))
+
+  result = lax.select(ax < _lax_const(x, 3.25), val_r1,
+                      lax.select(ax < _lax_const(x, 6.25), val_r2, val_r3))
+  return sign * result
+
+
 @custom_derivatives.custom_jvp
 def logit(x: ArrayLike) -> Array:
   r"""The logit function
@@ -408,7 +899,7 @@ def logit(x: ArrayLike) -> Array:
 
   .. math::
 
-     \mathrm{logit}(p) = \log\frac{p}{1 - p}
+     \mathrm{logit}(x) = \log\frac{x}{1 - x}
 
   Args:
     x: arraylike, real-valued.
@@ -464,9 +955,10 @@ def xlogy(x: ArrayLike, y: ArrayLike) -> Array:
     :func:`jax.scipy.special.xlog1py`
   """
   # Note: xlogy(0, 0) should return 0 according to the function documentation.
+  # NaN in y is propagated even when x == 0, to match scipy.special.xlogy.
   x, y = promote_args_inexact("xlogy", x, y)
   x_ok = x != 0.
-  return jnp.where(x_ok, lax.mul(x, lax.log(y)), jnp.zeros_like(x))
+  return jnp.where(x_ok | jnp.isnan(y), lax.mul(x, lax.log(y)), jnp.zeros_like(x))
 
 def _xlogy_jvp(primals, tangents):
   (x, y) = primals
@@ -496,9 +988,10 @@ def xlog1py(x: ArrayLike, y: ArrayLike) -> Array:
     :func:`jax.scipy.special.xlogy`
   """
   # Note: xlog1py(0, -1) should return 0 according to the function documentation.
+  # NaN in y is propagated even when x == 0, to match scipy.special.xlog1py.
   x, y = promote_args_inexact("xlog1py", x, y)
   x_ok = x != 0.
-  return jnp.where(x_ok, lax.mul(x, lax.log1p(y)), jnp.zeros_like(x))
+  return jnp.where(x_ok | jnp.isnan(y), lax.mul(x, lax.log1p(y)), jnp.zeros_like(x))
 
 def _xlog1py_jvp(primals, tangents):
   (x, y) = primals
@@ -529,7 +1022,7 @@ def entr(x: ArrayLike) -> Array:
      \mathrm{entr}(x) = \begin{cases}
        -x\log(x) & x > 0 \\
        0 & x = 0\\
-       -\infty & x > 0
+       -\infty & \mathrm{otherwise}
      \end{cases}
 
   Args:
@@ -543,9 +1036,75 @@ def entr(x: ArrayLike) -> Array:
     - :func:`jax.scipy.special.rel_entr`
   """
   x, = promote_args_inexact("entr", x)
+  if dtypes.issubdtype(x.dtype, np.complexfloating):
+    raise ValueError("entr does not support complex-valued inputs.")
   return lax.select(lax.lt(x, _lax_const(x, 0)),
                     lax.full_like(x, -np.inf),
                     lax.neg(_xlogx(x)))
+
+
+def boxcox(x: ArrayLike, lmbda: ArrayLike) -> Array:
+  r"""Box-Cox power transformation.
+
+  JAX implementation of :obj:`scipy.special.boxcox`.
+
+  .. math::
+
+     \mathrm{boxcox}(x, \lambda) = \begin{cases}
+       (x^\lambda - 1) / \lambda & \lambda \ne 0 \\
+       \log(x) & \lambda = 0
+     \end{cases}
+
+  Defined for :math:`x > 0`; returns ``nan`` for non-positive ``x``.
+
+  Args:
+    x: arraylike, positive real-valued.
+    lmbda: arraylike, real-valued.
+
+  Returns:
+    array containing Box-Cox transformed values.
+
+  See also:
+    :func:`jax.scipy.special.boxcox1p`
+  """
+  x, lmbda = promote_args_inexact("boxcox", x, lmbda)
+  lmbda_is_zero = lmbda == 0
+  safe_lmbda = jnp.where(lmbda_is_zero, jnp.ones_like(lmbda), lmbda)
+  log_x = jnp.log(x)
+  power_branch = jnp.expm1(safe_lmbda * log_x) / safe_lmbda
+  return jnp.where(lmbda_is_zero, log_x, power_branch)
+
+
+def boxcox1p(x: ArrayLike, lmbda: ArrayLike) -> Array:
+  r"""Box-Cox transformation of ``1 + x``.
+
+  JAX implementation of :obj:`scipy.special.boxcox1p`.
+
+  .. math::
+
+     \mathrm{boxcox1p}(x, \lambda) = \begin{cases}
+       ((1 + x)^\lambda - 1) / \lambda & \lambda \ne 0 \\
+       \log(1 + x) & \lambda = 0
+     \end{cases}
+
+  Defined for :math:`x > -1`; returns ``nan`` for ``x <= -1``.
+
+  Args:
+    x: arraylike, real-valued, greater than ``-1``.
+    lmbda: arraylike, real-valued.
+
+  Returns:
+    array containing values of the shifted Box-Cox transform.
+
+  See also:
+    :func:`jax.scipy.special.boxcox`
+  """
+  x, lmbda = promote_args_inexact("boxcox1p", x, lmbda)
+  lmbda_is_zero = lmbda == 0
+  safe_lmbda = jnp.where(lmbda_is_zero, jnp.ones_like(lmbda), lmbda)
+  log1p_x = jnp.log1p(x)
+  power_branch = jnp.expm1(safe_lmbda * log1p_x) / safe_lmbda
+  return jnp.where(lmbda_is_zero, log1p_x, power_branch)
 
 
 def multigammaln(a: ArrayLike, d: ArrayLike) -> Array:
@@ -616,24 +1175,9 @@ def kl_div(
     - :func:`jax.scipy.special.rel_entr`
   """
   p, q = promote_args_inexact("kl_div", p, q)
-  zero = _lax_const(p, 0.0)
-  both_gt_zero_mask = lax.bitwise_and(lax.gt(p, zero), lax.gt(q, zero))
-  one_zero_mask = lax.bitwise_and(lax.eq(p, zero), lax.ge(q, zero))
-
-  safe_p = jnp.where(both_gt_zero_mask, p, 1)
-  safe_q = jnp.where(both_gt_zero_mask, q, 1)
-
-  log_val = lax.sub(
-      lax.add(
-          lax.sub(_xlogx(safe_p), xlogy(safe_p, safe_q)),
-          safe_q,
-      ),
-      safe_p,
-  )
-  result = jnp.where(
-      both_gt_zero_mask, log_val, jnp.where(one_zero_mask, q, np.inf)
-  )
-  return result
+  if dtypes.issubdtype(p.dtype, np.complexfloating):
+    raise ValueError("kl_div does not support complex-valued inputs.")
+  return rel_entr(p, q) - p + q
 
 
 def rel_entr(
@@ -664,6 +1208,8 @@ def rel_entr(
     - :func:`jax.scipy.special.kl_div`
   """
   p, q = promote_args_inexact("rel_entr", p, q)
+  if dtypes.issubdtype(p.dtype, np.complexfloating):
+    raise ValueError("rel_entr does not support complex-valued inputs.")
   zero = _lax_const(p, 0.0)
   both_gt_zero_mask = lax.bitwise_and(lax.gt(p, zero), lax.gt(q, zero))
   one_zero_mask = lax.bitwise_and(lax.eq(p, zero), lax.ge(q, zero))
@@ -672,13 +1218,13 @@ def rel_entr(
   safe_q = jnp.where(both_gt_zero_mask, q, 1)
   log_val = lax.sub(_xlogx(safe_p), xlogy(safe_p, safe_q))
   result = jnp.where(
-      both_gt_zero_mask, log_val, jnp.where(one_zero_mask, q, jnp.inf)
+      both_gt_zero_mask, log_val, jnp.where(one_zero_mask, zero, np.inf)
   )
   return result
 
 # coefs of (2k)! / B_{2k} where B are bernoulli numbers
 # those numbers are obtained using https://www.wolframalpha.com
-_BERNOULLI_COEFS = [
+_BERNOULLI_COEFS = np.array([
     12,
     -720,
     30240,
@@ -695,7 +1241,29 @@ _BERNOULLI_COEFS = [
     -37893265687455865519472640000000 / 3392780147,
     759790291646040068357842010112000000 / 1723168255201,
     -134196726836183700385281186201600000000 / 7709321041217,
-]
+])
+
+
+def wofz(z: ArrayLike) -> Array:
+  r"""Faddeeva function.
+
+  JAX implementation of :obj:`scipy.special.wofz`.
+
+  .. math::
+
+     \mathrm{wofz}(z) = e^{-z^2} \mathrm{erfc}(-iz)
+
+  Args:
+    z: arraylike, real or complex.
+
+  Returns:
+    array of complex values of the Faddeeva function.
+
+  See also:
+    - :func:`jax.scipy.special.erfcx`
+  """
+  z, = promote_args_complex("wofz", z)
+  return _wofz(z)
 
 
 @custom_derivatives.custom_jvp
@@ -738,7 +1306,7 @@ def _zeta_series_expansion(x: ArrayLike, q: ArrayLike | None = None) -> Array:
   dtype = lax.dtype(a).type
   s_, a_ = jnp.expand_dims(s, -1), jnp.expand_dims(a, -1)
   # precision ~ N, M
-  N = M = dtype(8) if lax.dtype(a) == jnp.float32 else dtype(16)
+  N = M = dtype(8) if lax.dtype(a) == np.float32 else dtype(16)
   assert M <= len(_BERNOULLI_COEFS)
   k = jnp.expand_dims(np.arange(N, dtype=N.dtype), tuple(range(a.ndim)))
   S = jnp.sum((a_ + k) ** -s_, -1)
@@ -747,14 +1315,14 @@ def _zeta_series_expansion(x: ArrayLike, q: ArrayLike | None = None) -> Array:
   m = jnp.expand_dims(np.arange(2 * M, dtype=M.dtype), tuple(range(s.ndim)))
   s_over_a = (s_ + m) / (a_ + N)
   T1 = jnp.cumprod(s_over_a, -1)[..., ::2]
-  T1 = jnp.clip(T1, max=jnp.finfo(dtype).max)
+  T1 = jnp.clip(T1, max=dtypes.finfo(dtype).max)
   coefs = np.expand_dims(np.array(_BERNOULLI_COEFS[:T1.shape[-1]], dtype=dtype),
                          tuple(range(a.ndim)))
   T1 = T1 / coefs
   T = T0 * (dtype(0.5) + T1.sum(-1))
   return S + I + T
 
-zeta.defjvp(partial(jvp, _zeta_series_expansion))  # type: ignore[arg-type]
+zeta.defjvp(partial(jvp, _zeta_series_expansion))
 
 
 def polygamma(n: ArrayLike, x: ArrayLike) -> Array:
@@ -764,9 +1332,10 @@ def polygamma(n: ArrayLike, x: ArrayLike) -> Array:
 
   .. math::
 
-     \mathrm{polygamma}(n, x) = \psi^{(n)}(x) = \frac{\mathrm{d}^n}{\mathrm{d}x^n}\log \Gamma(x)
+     \mathrm{polygamma}(n, x) = \psi^{(n)}(x) = \frac{\mathrm{d}^{n+1}}{\mathrm{d}x^{n+1}} \log \Gamma(x)
 
-  where :math:`\Gamma` is the :func:`~jax.scipy.special.gamma` function.
+  where :math:`\psi` is the :func:`~jax.scipy.special.digamma` function and
+  :math:`\Gamma` is the :func:`~jax.scipy.special.gamma` function.
 
   Args:
     n: arraylike, integer-valued. The order of the derivative.
@@ -779,8 +1348,13 @@ def polygamma(n: ArrayLike, x: ArrayLike) -> Array:
     - :func:`jax.scipy.special.gamma`
     - :func:`jax.scipy.special.digamma`
   """
-  assert jnp.issubdtype(lax.dtype(n), jnp.integer)
+  if not dtypes.issubdtype(lax.dtype(n), np.integer):
+    raise ValueError(
+        f"Argument `n` to polygamma must be of integer type. Got dtype {lax.dtype(n)}."
+    )
   n_arr, x_arr = promote_args_inexact("polygamma", n, x)
+  if dtypes.issubdtype(x_arr.dtype, np.complexfloating):
+    raise ValueError("polygamma does not support complex-valued inputs.")
   return lax.polygamma(n_arr, x_arr)
 
 
@@ -872,9 +1446,9 @@ def ndtr(x: ArrayLike) -> Array:
   .. math::
     \begin{align}
     \mathrm{ndtr}(x) =&
-      \ \frac{1}{\sqrt{2 \pi}}\int_{-\infty}^{x} e^{-\frac{1}{2}t^2} dt \\
+      \ \frac{1}{\sqrt{2 \pi}}\int_{-\infty}^{x} e^{-\frac{1}{2}t^2} \mathrm{d}t \\
     =&\ \frac{1}{2} (1 + \mathrm{erf}(\frac{x}{\sqrt{2}})) \\
-    =&\ \frac{1}{2} \mathrm{erfc}(\frac{x}{\sqrt{2}})
+    =&\ \frac{1}{2} \mathrm{erfc}(-\frac{x}{\sqrt{2}})
     \end{align}
 
   Args:
@@ -888,25 +1462,11 @@ def ndtr(x: ArrayLike) -> Array:
   """
   x = jnp.asarray(x)
   dtype = lax.dtype(x)
-  if dtype not in (jnp.float32, jnp.float64):
+  if dtype not in (np.float32, np.float64):
     raise TypeError(
         "x.dtype={} is not supported, see docstring for supported types."
         .format(dtype))
   return _ndtr(x)
-
-
-def _ndtr(x: ArrayLike) -> Array:
-  """Implements ndtr core logic."""
-  dtype = lax.dtype(x).type
-  half_sqrt_2 = dtype(0.5) * np.sqrt(2., dtype=dtype)
-  w = x * half_sqrt_2
-  z = lax.abs(w)
-  y = lax.select(lax.lt(z, half_sqrt_2),
-                      dtype(1.) + lax.erf(w),
-                      lax.select(lax.gt(w, dtype(0.)),
-                                      dtype(2.) - lax.erfc(z),
-                                      lax.erfc(z)))
-  return dtype(0.5) * y
 
 
 def ndtri(p: ArrayLike) -> Array:
@@ -930,7 +1490,7 @@ def ndtri(p: ArrayLike) -> Array:
     TypeError: if `p` is not floating-type.
   """
   dtype = lax.dtype(p)
-  if dtype not in (jnp.float32, jnp.float64):
+  if dtype not in (np.float32, np.float64):
     raise TypeError(
         "x.dtype={} is not supported, see docstring for supported types."
         .format(dtype))
@@ -939,71 +1499,62 @@ def ndtri(p: ArrayLike) -> Array:
 
 def _ndtri(p: ArrayLike) -> Array:
   """Implements ndtri core logic."""
+  dtype = lax.dtype(p).type
+  shape = np.shape(p)
 
   # Constants used in piece-wise rational approximations. Taken from the cephes
   # library:
   # https://root.cern.ch/doc/v608/SpecFuncCephesInv_8cxx_source.html
-  p0 = list(reversed([-5.99633501014107895267E1,
-                      9.80010754185999661536E1,
-                      -5.66762857469070293439E1,
-                      1.39312609387279679503E1,
-                      -1.23916583867381258016E0]))
-  q0 = list(reversed([1.0,
-                      1.95448858338141759834E0,
-                      4.67627912898881538453E0,
-                      8.63602421390890590575E1,
-                      -2.25462687854119370527E2,
-                      2.00260212380060660359E2,
-                      -8.20372256168333339912E1,
-                      1.59056225126211695515E1,
-                      -1.18331621121330003142E0]))
-  p1 = list(reversed([4.05544892305962419923E0,
-                      3.15251094599893866154E1,
-                      5.71628192246421288162E1,
-                      4.40805073893200834700E1,
-                      1.46849561928858024014E1,
-                      2.18663306850790267539E0,
-                      -1.40256079171354495875E-1,
-                      -3.50424626827848203418E-2,
-                      -8.57456785154685413611E-4]))
-  q1 = list(reversed([1.0,
-                      1.57799883256466749731E1,
-                      4.53907635128879210584E1,
-                      4.13172038254672030440E1,
-                      1.50425385692907503408E1,
-                      2.50464946208309415979E0,
-                      -1.42182922854787788574E-1,
-                      -3.80806407691578277194E-2,
-                      -9.33259480895457427372E-4]))
-  p2 = list(reversed([3.23774891776946035970E0,
-                      6.91522889068984211695E0,
-                      3.93881025292474443415E0,
-                      1.33303460815807542389E0,
-                      2.01485389549179081538E-1,
-                      1.23716634817820021358E-2,
-                      3.01581553508235416007E-4,
-                      2.65806974686737550832E-6,
-                      6.23974539184983293730E-9]))
-  q2 = list(reversed([1.0,
-                      6.02427039364742014255E0,
-                      3.67983563856160859403E0,
-                      1.37702099489081330271E0,
-                      2.16236993594496635890E-1,
-                      1.34204006088543189037E-2,
-                      3.28014464682127739104E-4,
-                      2.89247864745380683936E-6,
-                      6.79019408009981274425E-9]))
-
-  dtype = lax.dtype(p).type
-  shape = jnp.shape(p)
-
-  def _create_polynomial(var, coeffs):
-    """Compute n_th order polynomial via Horner's method."""
-    coeffs = np.array(coeffs, dtype)
-    if not coeffs.size:
-      return jnp.zeros_like(var)
-    return coeffs[0] + _create_polynomial(var, coeffs[1:]) * var
-
+  p0 = np.array([-5.99633501014107895267E1,
+                 9.80010754185999661536E1,
+                 -5.66762857469070293439E1,
+                 1.39312609387279679503E1,
+                 -1.23916583867381258016E0], dtype=dtype)
+  q0 = np.array([1.0,
+                 1.95448858338141759834E0,
+                 4.67627912898881538453E0,
+                 8.63602421390890590575E1,
+                 -2.25462687854119370527E2,
+                 2.00260212380060660359E2,
+                 -8.20372256168333339912E1,
+                 1.59056225126211695515E1,
+                 -1.18331621121330003142E0], dtype=dtype)
+  p1 = np.array([4.05544892305962419923E0,
+                 3.15251094599893866154E1,
+                 5.71628192246421288162E1,
+                 4.40805073893200834700E1,
+                 1.46849561928858024014E1,
+                 2.18663306850790267539E0,
+                 -1.40256079171354495875E-1,
+                 -3.50424626827848203418E-2,
+                 -8.57456785154685413611E-4], dtype=dtype)
+  q1 = np.array([1.0,
+                 1.57799883256466749731E1,
+                 4.53907635128879210584E1,
+                 4.13172038254672030440E1,
+                 1.50425385692907503408E1,
+                 2.50464946208309415979E0,
+                 -1.42182922854787788574E-1,
+                 -3.80806407691578277194E-2,
+                 -9.33259480895457427372E-4], dtype=dtype)
+  p2 = np.array([3.23774891776946035970E0,
+                 6.91522889068984211695E0,
+                 3.93881025292474443415E0,
+                 1.33303460815807542389E0,
+                 2.01485389549179081538E-1,
+                 1.23716634817820021358E-2,
+                 3.01581553508235416007E-4,
+                 2.65806974686737550832E-6,
+                 6.23974539184983293730E-9], dtype=dtype)
+  q2 = np.array([1.0,
+                 6.02427039364742014255E0,
+                 3.67983563856160859403E0,
+                 1.37702099489081330271E0,
+                 2.16236993594496635890E-1,
+                 1.34204006088543189037E-2,
+                 3.28014464682127739104E-4,
+                 2.89247864745380683936E-6,
+                 6.79019408009981274425E-9], dtype=dtype)
 
   maybe_complement_p = jnp.where(p > dtype(-np.expm1(-2.)), dtype(1.) - p, p)
   # Write in an arbitrary value in place of 0 for p since 0 will cause NaNs
@@ -1017,8 +1568,7 @@ def _ndtri(p: ArrayLike) -> Array:
   # Compute x for p > exp(-2): x/sqrt(2pi) = w + w**3 P0(w**2)/Q0(w**2).
   w = sanitized_mcp - dtype(0.5)
   ww = lax.square(w)
-  x_for_big_p = w + w * ww * (_create_polynomial(ww, p0)
-                              / _create_polynomial(ww, q0))
+  x_for_big_p = w + w * ww * (jnp.polyval(p0, ww) / jnp.polyval(q0, ww))
   x_for_big_p *= -dtype(np.sqrt(2. * np.pi))
 
   # Compute x for p <= exp(-2): x = z - log(z)/z - (1/z) P(1/z) / Q(1/z),
@@ -1026,12 +1576,8 @@ def _ndtri(p: ArrayLike) -> Array:
   # arrays based on whether p < exp(-32).
   z = lax.sqrt(dtype(-2.) * lax.log(sanitized_mcp))
   first_term = z - lax.log(z) / z
-  second_term_small_p = (
-      _create_polynomial(dtype(1.) / z, p2) /
-      _create_polynomial(dtype(1.) / z, q2) / z)
-  second_term_otherwise = (
-      _create_polynomial(dtype(1.) / z, p1) /
-      _create_polynomial(dtype(1.) / z, q1) / z)
+  second_term_small_p = jnp.polyval(p2, 1 / z) / jnp.polyval(q2, 1 / z) / z
+  second_term_otherwise = jnp.polyval(p1, 1 / z) / jnp.polyval(q1, 1 / z) / z
   x_for_small_p = first_term - second_term_small_p
   x_otherwise = first_term - second_term_otherwise
 
@@ -1040,10 +1586,17 @@ def _ndtri(p: ArrayLike) -> Array:
                 jnp.where(z >= dtype(8.0), x_for_small_p, x_otherwise))
 
   x = jnp.where(p > dtype(1. - np.exp(-2.)), x, -x)
-  infinity = jnp.full(shape, dtype(np.inf))
-  x_fix_boundaries = jnp.where(
-      p == dtype(0.0), -infinity, jnp.where(p == dtype(1.0), infinity, x))
-  return x_fix_boundaries
+  with config.debug_infs(False):
+    infinity = jnp.full(shape, dtype(np.inf))
+    x = jnp.where(
+        p == dtype(0.0), -infinity, jnp.where(p == dtype(1.0), infinity, x))
+  if not isinstance(x, core.Tracer):
+    try:
+      dispatch.check_special("ndtri", [x])
+    except api_util.InternalFloatingPointError as e:
+      raise FloatingPointError(
+          f"invalid value ({e.ty}) encountered in ndtri.") from None
+  return x
 
 
 @partial(custom_derivatives.custom_jvp, nondiff_argnums=(1,))
@@ -1119,10 +1672,10 @@ def log_ndtr(x: ArrayLike, series_order: int = 3) -> Array:
   x_arr = jnp.asarray(x)
   dtype = lax.dtype(x_arr)
 
-  if dtype == jnp.float64:
+  if dtype == np.float64:
     lower_segment: np.ndarray = _LOGNDTR_FLOAT64_LOWER
     upper_segment: np.ndarray = _LOGNDTR_FLOAT64_UPPER
-  elif dtype == jnp.float32:
+  elif dtype == np.float32:
     lower_segment = _LOGNDTR_FLOAT32_LOWER
     upper_segment = _LOGNDTR_FLOAT32_UPPER
   else:
@@ -1142,11 +1695,16 @@ def log_ndtr(x: ArrayLike, series_order: int = 3) -> Array:
   #   the gradient of a select involves the calculation 1*dy+0*(-inf)=nan
   #   regardless of whether dy is finite. Note that the minimum is a NOP if
   #   the branch is chosen.
+  x_arr_gt_upper_segment = lax.gt(x_arr, upper_segment)
+  ndtr_arg = jnp.where(x_arr_gt_upper_segment, -x_arr,
+                       lax.max(x_arr, lower_segment))
+  # We combine both ndtr calls to minimize program size
+  ndtr_res = _ndtr(ndtr_arg)
   return jnp.where(
-      lax.gt(x_arr, upper_segment),
-      -_ndtr(-x_arr),  # log(1-x) ~= -x, x << 1
+      x_arr_gt_upper_segment,
+      -ndtr_res,  # log(1-x) ~= -x, x << 1
       jnp.where(lax.gt(x_arr, lower_segment),
-                       lax.log(_ndtr(lax.max(x_arr, lower_segment))),
+                       lax.log(ndtr_res),
                        _log_ndtr_lower(lax.min(x_arr, lower_segment),
                                        series_order)))
 
@@ -1185,7 +1743,7 @@ def _log_ndtr_asymptotic_series(x, series_order):
   return dtype(1.) + even_sum - odd_sum
 
 
-def _double_factorial(n: int) -> np.ndarray:
+def _double_factorial(n: int) -> np.integer:
   """The double factorial function for small Python integer `n`."""
   return np.prod(np.arange(n, 1, -2))
 
@@ -1334,7 +1892,7 @@ def _bessel_jn(z: ArrayLike, *, v: int, n_iter: int=50) -> Array:
   return j_vals
 
 
-@partial(jit, static_argnames=["v", "n_iter"])
+@jit(static_argnames=["v", "n_iter"])
 def bessel_jn(z: ArrayLike, *, v: int, n_iter: int=50) -> Array:
   """Bessel function of the first kind of integer order and real argument.
 
@@ -1421,13 +1979,13 @@ def _gen_recurrence_mask(
   i, j, k = jnp.ogrid[:l_max + 1, :l_max + 1, :l_max + 1]
   mask = (i + j - k == 0).astype(dtype)
 
-  d0_mask_3d = jnp.einsum('jk,ijk->ijk', d0_mask, mask)
-  d1_mask_3d = jnp.einsum('jk,ijk->ijk', d1_mask, mask)
+  d0_mask_3d = jnp_einsum.einsum('jk,ijk->ijk', d0_mask, mask)
+  d1_mask_3d = jnp_einsum.einsum('jk,ijk->ijk', d1_mask, mask)
 
   return (d0_mask_3d, d1_mask_3d)
 
 
-@partial(jit, static_argnums=(2))
+@jit(static_argnums=(2))
 def _gen_derivatives(p: Array,
                      x: Array,
                      is_normalized: bool) -> Array:
@@ -1464,14 +2022,14 @@ def _gen_derivatives(p: Array,
       l_vec = jnp.arange(1, num_l - 1, dtype=x.dtype)
       p_p1 = p[1, 1:num_l - 1, :]
       coeff = -1.0 / ((l_vec + 1) * l_vec)
-      update_p_p1 = jnp.einsum('i,ij->ij', coeff, p_p1)
+      update_p_p1 = jnp_einsum.einsum('i,ij->ij', coeff, p_p1)
       p_mm2_lm1 = p_mm2_lm1.at[1, 2:num_l, :].set(update_p_p1)
 
     if num_l > 2:
       l_vec = jnp.arange(2, num_l - 1, dtype=x.dtype)
       p_p2 = p[2, 2:num_l - 1, :]
       coeff = 1.0 / ((l_vec + 2) * (l_vec + 1) * l_vec * (l_vec - 1))
-      update_p_p2 = jnp.einsum('i,ij->ij', coeff, p_p2)
+      update_p_p2 = jnp_einsum.einsum('i,ij->ij', coeff, p_p2)
       p_mm2_lm1 = p_mm2_lm1.at[0, 3:num_l, :].set(update_p_p2)
 
   m_mat, l_mat = jnp.meshgrid(
@@ -1493,8 +2051,8 @@ def _gen_derivatives(p: Array,
   c0_masked = c0_masked.at[1, :].set(zero_vec)
 
   # p_l^{m-1}.
-  p_mm1_l = (jnp.einsum('ij,ijk->ijk', a0_masked, p_m_lm1) +
-             jnp.einsum('ij,ijk->ijk', c0_masked, p_mm2_lm1))
+  p_mm1_l = (jnp_einsum.einsum('ij,ijk->ijk', a0_masked, p_m_lm1) +
+             jnp_einsum.einsum('ij,ijk->ijk', c0_masked, p_mm2_lm1))
 
   d0 = -0.5 / (m_mat + 1.0)
   d0_masked = coeff_zeros.at[upper_0_indices].set(d0[upper_0_indices])
@@ -1502,27 +2060,27 @@ def _gen_derivatives(p: Array,
   e0_masked = coeff_zeros.at[upper_0_indices].set(e0[upper_0_indices])
 
   # p_l^{m+1}.
-  p_mp1_l = (jnp.einsum('ij,ijk->ijk', d0_masked, p_mp2_lm1) +
-             jnp.einsum('ij,ijk->ijk', e0_masked, p_m_lm1))
+  p_mp1_l = (jnp_einsum.einsum('ij,ijk->ijk', d0_masked, p_mp2_lm1) +
+             jnp_einsum.einsum('ij,ijk->ijk', e0_masked, p_m_lm1))
 
   f0 = b0 * (l_mat - m_mat + 1.0) / 2.0
   f0_masked = coeff_zeros.at[upper_0_indices].set(f0[upper_0_indices])
-  p_derivative = jnp.einsum('ij,ijk->ijk', f0_masked, p_mm1_l) - 0.5 * p_mp1_l
+  p_derivative = jnp_einsum.einsum('ij,ijk->ijk', f0_masked, p_mm1_l) - 0.5 * p_mp1_l
 
   # Special treatment of the singularity at m = 1.
   if num_m > 1:
     l_vec = jnp.arange(num_l, dtype=p.dtype)
-    g0 = jnp.einsum('i,ij->ij', (l_vec + 1) * l_vec, p[0, :, :])
+    g0 = jnp_einsum.einsum('i,ij->ij', (l_vec + 1) * l_vec, p[0, :, :])
     if num_l > 2:
       g0 = g0 -  p[2, :, :]
-    p_derivative_m0 = jnp.einsum('j,ij->ij', 0.5 / jnp.sqrt(1 - x * x), g0)
+    p_derivative_m0 = jnp_einsum.einsum('j,ij->ij', 0.5 / jnp.sqrt(1 - x * x), g0)
     p_derivative = p_derivative.at[1, :, :].set(p_derivative_m0)
     p_derivative = p_derivative.at[1, 0, :].set(0)
 
   return p_derivative
 
 
-@partial(jit, static_argnums=(0, 2))
+@jit(static_argnums=(0, 2))
 def _gen_associated_legendre(l_max: int,
                              x: Array,
                              is_normalized: bool) -> Array:
@@ -1576,7 +2134,7 @@ def _gen_associated_legendre(l_max: int,
   a_idx = jnp.arange(1, l_max + 1, dtype=x.dtype)
   b_idx = jnp.arange(l_max, dtype=x.dtype)
   if is_normalized:
-    initial_value: ArrayLike = 0.5 / jnp.sqrt(jnp.pi)  # The initial value p(0,0).
+    initial_value: ArrayLike = 0.5 / jnp.sqrt(np.pi)  # The initial value p(0,0).
     f_a = jnp.cumprod(-1 * jnp.sqrt(1.0 + 0.5 / a_idx))
     f_b = jnp.sqrt(2.0 * b_idx + 3.0)
   else:
@@ -1590,13 +2148,13 @@ def _gen_associated_legendre(l_max: int,
   y = jnp.cumprod(
       jnp.broadcast_to(jnp.sqrt(1.0 - x * x), (l_max, x.shape[0])),
       axis=0)
-  p_diag = initial_value * jnp.einsum('i,ij->ij', f_a, y)
+  p_diag = initial_value * jnp_einsum.einsum('i,ij->ij', f_a, y)
   diag_indices = jnp.diag_indices(l_max + 1)
   p = p.at[(diag_indices[0][1:], diag_indices[1][1:])].set(p_diag)
 
   # Compute the off-diagonal entries with recurrence.
-  p_offdiag = jnp.einsum('ij,ij->ij',
-                         jnp.einsum('i,j->ij', f_b, x),
+  p_offdiag = jnp_einsum.einsum('ij,ij->ij',
+                         jnp_einsum.einsum('i,j->ij', f_b, x),
                          p[jnp.diag_indices(l_max)])
   offdiag_indices = (diag_indices[0][:l_max], diag_indices[1][:l_max] + 1)
   p = p.at[offdiag_indices].set(p_offdiag)
@@ -1608,16 +2166,16 @@ def _gen_associated_legendre(l_max: int,
   def body_fun(i, p_val):
     coeff_0 = d0_mask_3d[i]
     coeff_1 = d1_mask_3d[i]
-    h = (jnp.einsum('ij,ijk->ijk',
+    h = (jnp_einsum.einsum('ij,ijk->ijk',
                     coeff_0,
-                    jnp.einsum(
+                    jnp_einsum.einsum(
                         'ijk,k->ijk', jnp.roll(p_val, shift=1, axis=1), x)) -
-         jnp.einsum('ij,ijk->ijk', coeff_1, jnp.roll(p_val, shift=2, axis=1)))
+         jnp_einsum.einsum('ij,ijk->ijk', coeff_1, jnp.roll(p_val, shift=2, axis=1)))
     p_val = p_val + h
     return p_val
 
   # TODO(jakevdp): use some sort of fixed-point procedure here instead?
-  p = p.astype(jnp.result_type(p, x, d0_mask_3d))
+  p = p.astype(dtypes.result_type(p, x, d0_mask_3d))
   if l_max > 1:
     p = lax.fori_loop(lower=2, upper=l_max+1, body_fun=body_fun, init_val=p)
 
@@ -1646,7 +2204,7 @@ def lpmn(m: int, n: int, z: Array) -> tuple[Array, Array]:
     NotImplementedError if `m!=n`.
   """
   dtype = lax.dtype(z)
-  if dtype not in (jnp.float32, jnp.float64):
+  if dtype not in (np.float32, np.float64):
     raise TypeError(
         'z.dtype={} is not supported, see docstring for supported types.'
         .format(dtype))
@@ -1703,7 +2261,7 @@ def lpmn_values(m: int, n: int, z: Array, is_normalized: bool) -> Array:
     NotImplementedError if `m!=n`.
   """
   dtype = lax.dtype(z)
-  if dtype not in (jnp.float32, jnp.float64):
+  if dtype not in (np.float32, np.float64):
     raise TypeError(
         'z.dtype={} is not supported, see docstring for supported types.'
         .format(dtype))
@@ -1723,20 +2281,20 @@ def lpmn_values(m: int, n: int, z: Array, is_normalized: bool) -> Array:
 
 
 
-@partial(jit, static_argnums=(4,))
-def _sph_harm(m: Array,
-              n: Array,
+@jit(static_argnums=(4,))
+def _sph_harm(n: Array,
+              m: Array,
               theta: Array,
               phi: Array,
               n_max: int) -> Array:
   """Computes the spherical harmonics."""
 
-  cos_colatitude = jnp.cos(phi)
+  cos_colatitude = jnp.cos(theta)
 
   legendre = _gen_associated_legendre(n_max, cos_colatitude, True)
   legendre_val = legendre.at[abs(m), n, jnp.arange(len(n))].get(mode="clip")
 
-  angle = abs(m) * theta
+  angle = abs(m) * phi
   vandermonde = lax.complex(jnp.cos(angle), jnp.sin(angle))
   harmonics = lax.complex(legendre_val * jnp.real(vandermonde),
                           legendre_val * jnp.imag(vandermonde))
@@ -1749,51 +2307,56 @@ def _sph_harm(m: Array,
   return harmonics
 
 
-def sph_harm(m: Array,
-             n: Array,
-             theta: Array,
-             phi: Array,
-             n_max: int | None = None) -> Array:
+def sph_harm_y(n: Array,
+               m: Array,
+               theta: Array,
+               phi: Array,
+               diff_n: int | None = None,
+               n_max: int | None = None) -> Array:
   r"""Computes the spherical harmonics.
 
   The JAX version has one extra argument `n_max`, the maximum value in `n`.
 
   The spherical harmonic of degree `n` and order `m` can be written as
-  :math:`Y_n^m(\theta, \phi) = N_n^m * P_n^m(\cos \phi) * \exp(i m \theta)`,
+  :math:`Y_n^m(\theta, \phi) = N_n^m * P_n^m(\cos \theta) * \exp(i m \phi)`,
   where :math:`N_n^m = \sqrt{\frac{\left(2n+1\right) \left(n-m\right)!}
-  {4 \pi \left(n+m\right)!}}` is the normalization factor and :math:`\phi` and
-  :math:`\theta` are the colatitude and longitude, respectively. :math:`N_n^m` is
+  {4 \pi \left(n+m\right)!}}` is the normalization factor and :math:`\theta` and
+  :math:`\phi` are the colatitude and longitude, respectively. :math:`N_n^m` is
   chosen in the way that the spherical harmonics form a set of orthonormal basis
   functions of :math:`L^2(S^2)`.
 
   Args:
-    m: The order of the harmonic; must have `|m| <= n`. Return values for
-      `|m| > n` are undefined.
     n: The degree of the harmonic; must have `n >= 0`. The standard notation for
       degree in descriptions of spherical harmonics is `l (lower case L)`. We
-      use `n` here to be consistent with `scipy.special.sph_harm`. Return
+      use `n` here to be consistent with `scipy.special.sph_harm_y`. Return
       values for `n < 0` are undefined.
-    theta: The azimuthal (longitudinal) coordinate; must be in [0, 2*pi].
-    phi: The polar (colatitudinal) coordinate; must be in [0, pi].
+    m: The order of the harmonic; must have `|m| <= n`. Return values for
+      `|m| > n` are undefined.
+    theta: The polar (colatitudinal) coordinate; must be in [0, pi].
+    phi: The azimuthal (longitudinal) coordinate; must be in [0, 2*pi].
+    diff_n: Unsupported by JAX.
     n_max: The maximum degree `max(n)`. If the supplied `n_max` is not the true
       maximum value of `n`, the results are clipped to `n_max`. For example,
-      `sph_harm(m=jnp.array([2]), n=jnp.array([10]), theta, phi, n_max=6)`
+      `sph_harm_y(n=jnp.array([10]), m=jnp.array([2]), theta=theta, phi=phi, n_max=6)`
       actually returns
-      `sph_harm(m=jnp.array([2]), n=jnp.array([6]), theta, phi, n_max=6)`
+      `sph_harm_y(n=jnp.array([6]), m=jnp.array([2]), theta=theta, phi=phi, n_max=6)`.
   Returns:
-    A 1D array containing the spherical harmonics at (m, n, theta, phi).
+    A 1D array containing the spherical harmonics at (n, m, theta, phi).
   """
+  if diff_n is not None:
+    raise NotImplementedError(
+        "The 'diff_n' argument to jax.scipy.special.sph_harm_y is not supported.")
 
-  if jnp.isscalar(phi):
-    phi = jnp.array([phi])
+  if jnp.isscalar(theta):
+    theta = jnp.array([theta])
 
   if n_max is None:
     n_max = np.max(n)
   n_max = core.concrete_or_error(
-      int, n_max, 'The `n_max` argument of `jnp.scipy.special.sph_harm` must '
-      'be statically specified to use `sph_harm` within JAX transformations.')
+      int, n_max, 'The `n_max` argument of `jax.scipy.special.sph_harm_y` must '
+      'be statically specified to use `sph_harm_y` within JAX transformations.')
 
-  return _sph_harm(m, n, theta, phi, n_max)
+  return _sph_harm(n, m, theta, phi, n_max)
 
 
 # exponential integrals
@@ -1804,15 +2367,15 @@ def sph_harm(m: Array,
 
 def _expint1(x: Array) -> Array:
   # 0 < x <= 2
-  A = [
+  A = np.array([
     -5.350447357812542947283e0,
     2.185049168816613393830e2,
     -4.176572384826693777058e3,
     5.541176756393557601232e4,
     -3.313381331178144034309e5,
     1.592627163384945414220e6,
-  ]
-  B = [
+  ], dtype=x.dtype)
+  B = np.array([
     1.0,
     -5.250547959112862969197e1,
     1.259616186786790571525e3,
@@ -1820,27 +2383,23 @@ def _expint1(x: Array) -> Array:
     1.493062117002725991967e5,
     -7.294949239640527645655e5,
     1.592627163384945429726e6,
-  ]
-  A_arr = jnp.array(A, dtype=x.dtype)
-  B_arr = jnp.array(B, dtype=x.dtype)
-  f = jnp.polyval(A_arr, x) / jnp.polyval(B_arr, x)
-  return x * f + jnp.euler_gamma + jnp.log(x)
+  ], dtype=x.dtype)
+  f = jnp.polyval(A, x) / jnp.polyval(B, x)
+  return x * f + np.euler_gamma + jnp.log(x)
 
 
-def _eval_expint_k(A: list[float], B: list[float], x: Array) -> Array:
+def _eval_expint_k(A: ArrayLike, B: ArrayLike, x: Array) -> Array:
   # helper function for all subsequent intervals
-  A_arr = jnp.array(A, dtype=x.dtype)
-  B_arr = jnp.array(B, dtype=x.dtype)
   one = _lax_const(x, 1.0)
   w = one / x
-  f = jnp.polyval(A_arr, w) / jnp.polyval(B_arr, w)
+  f = jnp.polyval(A, w) / jnp.polyval(B, w)
   f = w * f + one
   return jnp.exp(x) * w * f
 
 
 def _expint2(x: Array) -> Array:
   # 2 <= x < 4
-  A = [
+  A = np.array([
     1.981808503259689673238e-2,
     -1.271645625984917501326e0,
     -2.088160335681228318920e0,
@@ -1849,8 +2408,8 @@ def _expint2(x: Array) -> Array:
     4.665623805935891391017e-2,
     -1.545042679673485262580e-3,
     7.059980605299617478514e-5,
-  ]
-  B = [
+  ], dtype=x.dtype)
+  B = np.array([
     1.0,
     1.476498670914921440652e0,
     5.629177174822436244827e-1,
@@ -1859,13 +2418,13 @@ def _expint2(x: Array) -> Array:
     4.450150439728752875043e-3,
     1.727439612206521482874e-4,
     3.953167195549672482304e-5,
-  ]
+  ], dtype=x.dtype)
   return _eval_expint_k(A, B, x)
 
 
 def _expint3(x: Array) -> Array:
   # 4 <= x <= 8
-  A = [
+  A = np.array([
     -1.373215375871208729803e0,
     -7.084559133740838761406e-1,
     1.580806855547941010501e0,
@@ -1874,8 +2433,8 @@ def _expint3(x: Array) -> Array:
     -1.038086040188744005513e-3,
     4.371064420753005429514e-5,
     2.141783679522602903795e-6,
-  ]
-  B = [
+  ], dtype=x.dtype)
+  B = np.array([
     1.0,
     8.585231423622028380768e-1,
     4.483285822873995129957e-1,
@@ -1885,13 +2444,13 @@ def _expint3(x: Array) -> Array:
     4.590952299511353531215e-4,
     -4.729848351866523044863e-6,
     2.665195537390710170105e-6,
-  ]
+  ], dtype=x.dtype)
   return _eval_expint_k(A, B, x)
 
 
 def _expint4(x: Array) -> Array:
   # 8 <= x <= 16
-  A = [
+  A = np.array([
     -2.106934601691916512584e0,
     1.732733869664688041885e0,
     -2.423619178935841904839e-1,
@@ -1902,8 +2461,8 @@ def _expint4(x: Array) -> Array:
     -3.655412321999253963714e-7,
     1.464941733975961318456e-8,
     6.176407863710360207074e-10,
-  ]
-  B = [
+  ], dtype=x.dtype)
+  B = np.array([
     1.0,
     -2.298062239901678075778e-1,
     1.105077041474037862347e-1,
@@ -1914,13 +2473,13 @@ def _expint4(x: Array) -> Array:
     -4.459311796356686423199e-7,
     1.394634930353847498145e-8,
     6.150865933977338354138e-10,
-  ]
+  ], dtype=x.dtype)
   return _eval_expint_k(A, B, x)
 
 
 def _expint5(x):
   # 16 <= x <= 32
-  A = [
+  A = np.array([
     -2.458119367674020323359e-1,
     -1.483382253322077687183e-1,
     7.248291795735551591813e-2,
@@ -1929,8 +2488,8 @@ def _expint5(x):
     -7.942465637159712264564e-5,
     2.644179518984235952241e-6,
     -4.239473659313765177195e-8,
-  ]
-  B = [
+  ], dtype=x.dtype)
+  B = np.array([
     1.0,
     -1.044225908443871106315e-1,
     -2.676453128101402655055e-1,
@@ -1940,34 +2499,34 @@ def _expint5(x):
     -8.462452563778485013756e-5,
     2.728938403476726394024e-6,
     -4.239462431819542051337e-8,
-  ]
+  ], dtype=x.dtype)
   return _eval_expint_k(A, B, x)
 
 
 def _expint6(x):
   # 32 <= x <= 64
-  A = [
+  A = np.array([
     1.212561118105456670844e-1,
     -5.823133179043894485122e-1,
     2.348887314557016779211e-1,
     -3.040034318113248237280e-2,
     1.510082146865190661777e-3,
     -2.523137095499571377122e-5,
-  ]
-  B = [
+  ], dtype=x.dtype)
+  B = np.array([
     1.0,
     -1.002252150365854016662e0,
     2.928709694872224144953e-1,
     -3.337004338674007801307e-2,
     1.560544881127388842819e-3,
     -2.523137093603234562648e-5,
-  ]
+  ], dtype=x.dtype)
   return _eval_expint_k(A, B, x)
 
 
 def _expint7(x):
   # x > 64
-  A = [
+  A = np.array([
     -7.657847078286127362028e-1,
     6.886192415566705051750e-1,
     -2.132598113545206124553e-1,
@@ -1977,8 +2536,8 @@ def _expint7(x):
     -6.103711682274170530369e-6,
     1.218032765428652199087e-7,
     -1.086076102793290233007e-9,
-  ]
-  B = [
+  ], dtype=x.dtype)
+  B = np.array([
     1.0,
     -1.888802868662308731041e0,
     1.066691687211408896850e0,
@@ -1989,7 +2548,7 @@ def _expint7(x):
     -6.345146083130515357861e-6,
     1.239754287483206878024e-7,
     -1.086076102793126632978e-9,
-  ]
+  ], dtype=x.dtype)
   return _eval_expint_k(A, B, x)
 
 
@@ -2031,8 +2590,9 @@ def expi(x: ArrayLike) -> Array:
     - :func:`jax.scipy.special.exp1`
   """
   x_arr, = promote_args_inexact("expi", x)
+  if dtypes.issubdtype(x_arr.dtype, np.complexfloating):
+    raise ValueError("expi does not support complex-valued inputs.")
   return jnp.piecewise(x_arr, [x_arr < 0], [_expi_neg, _expi_pos])
-
 
 @expi.defjvp
 @jit
@@ -2042,15 +2602,248 @@ def expi_jvp(primals, tangents):
   return expi(x), jnp.exp(x) / x * x_dot
 
 
-def _expn1(n: int, x_in: ArrayLike) -> Array:
+@custom_derivatives.custom_jvp
+@jit
+def sici(x: ArrayLike) -> tuple[Array, Array]:
+  r"""Sine and cosine integrals.
+
+  JAX implementation of :obj:`scipy.special.sici`.
+
+  .. math::
+
+    \mathrm{Si}(x) = \int_0^x \frac{\sin t}{t} \, dt
+
+  .. math::
+
+    \mathrm{Ci}(x) = \gamma + \ln(x) + \int_0^x \frac{\cos t - 1}{t} \, dt
+
+  where :math:`\gamma` is the Euler–Mascheroni constant.
+
+  Args:
+    x: array-like, real-valued input.
+
+  Returns:
+    A tuple of two arrays, each with the same shape as `x`:
+      - The first array contains the sine integral values `Si(x)`.
+      - The second array contains the cosine integral values `Ci(x)`.
+
+  See also:
+    - :func:`jax.numpy.sinc`
+  """
+
+  x, = promote_args_inexact("sici", x)
+
+  if dtypes.issubdtype(x.dtype, np.complexfloating):
+    raise ValueError(
+      f"Argument `x` to sici must be real-valued. Got dtype {x.dtype}."
+    )
+
+  x_abs = jnp.abs(x)
+
+  si_series, ci_series = _sici_series(x_abs)
+  si_asymp,  ci_asymp  = _sici_asympt(x_abs)
+  si_approx, ci_approx  = _sici_approx(x_abs)
+
+  cond1 = x_abs <= 4
+  cond2 = (x_abs > 4) & (x_abs <= 1e9)
+
+  si = jnp.select([cond1, cond2], [si_series, si_asymp], si_approx)
+  ci = jnp.select([cond1, cond2], [ci_series, ci_asymp], ci_approx)
+
+  si = jnp.sign(x) * si
+  ci = jnp.where(isneginf(x), np.nan, ci)
+
+  return si, ci
+
+def _sici_approx(x: Array):
+  # sici approximation valid for x >= 1E9
+  si = (np.pi / 2) - jnp.cos(x) / x
+  ci = jnp.sin(x) / x
+
+  si = jnp.where(isposinf(x), np.pi / 2, si)
+  ci = jnp.where(isposinf(x), 0.0, ci)
+
+  return si, ci
+
+def _sici_series(x: Array):
+  # sici series valid for x >= 0 and x <= 4
+  def si_series(x):
+    # Values come from Cephes Implementation used by Scipy https://github.com/jeremybarnes/cephes/blob/60f27df395b8322c2da22c83751a2366b82d50d1/misc/sici.c
+    SN = np.array([-8.39167827910303881427E-11,
+      4.62591714427012837309E-8,
+      -9.75759303843632795789E-6,
+      9.76945438170435310816E-4,
+      -4.13470316229406538752E-2,
+      1.00000000000000000302E0], dtype=x.dtype)
+    SD = np.array([ 2.03269266195951942049E-12,
+      1.27997891179943299903E-9,
+      4.41827842801218905784E-7,
+      9.96412122043875552487E-5,
+      1.42085239326149893930E-2,
+      9.99999999999999996984E-1], dtype=x.dtype)
+    t = x * x
+    return (x * jnp.polyval(SN, t)) / jnp.polyval(SD, t)
+
+  def ci_series(x):
+    # Values come from Cephes Implementation used by Scipy https://github.com/jeremybarnes/cephes/blob/60f27df395b8322c2da22c83751a2366b82d50d1/misc/sici.c
+    CN = np.array([ 2.02524002389102268789E-11,
+      -1.35249504915790756375E-8,
+      3.59325051419993077021E-6,
+      -4.74007206873407909465E-4,
+      2.89159652607555242092E-2,
+      -1.00000000000000000080E0], dtype=x.dtype)
+    CD = np.array([ 4.07746040061880559506E-12,
+      3.06780997581887812692E-9,
+      1.23210355685883423679E-6,
+      3.17442024775032769882E-4,
+      5.10028056236446052392E-2,
+      4.00000000000000000080E0], dtype=x.dtype)
+    t = x * x
+    return np.euler_gamma + jnp.log(x) + t * jnp.polyval(CN, t) / jnp.polyval(CD, t)
+
+  si = jnp.where(
+    x == 0,
+    0.0,
+    si_series(x)
+  )
+
+  ci = jnp.where(
+    x == 0,
+    -np.inf,
+    ci_series(x)
+  )
+
+  return si, ci
+
+def _sici_asympt(x: Array):
+  # sici asympt valid for x > 4 & x <= 1E9
+  s = jnp.sin(x)
+  c = jnp.cos(x)
+  z = 1.0 / (x * x)
+
+  # Values come from Cephes Implementation used by Scipy https://github.com/jeremybarnes/cephes/blob/60f27df395b8322c2da22c83751a2366b82d50d1/misc/sici.c
+  FN4 = np.array([
+    4.23612862892216586994E0,
+    5.45937717161812843388E0,
+    1.62083287701538329132E0,
+    1.67006611831323023771E-1,
+    6.81020132472518137426E-3,
+    1.08936580650328664411E-4,
+    5.48900223421373614008E-7,
+  ], dtype=x.dtype)
+  FD4 = np.array([
+    1,
+    8.16496634205391016773E0,
+    7.30828822505564552187E0,
+    1.86792257950184183883E0,
+    1.78792052963149907262E-1,
+    7.01710668322789753610E-3,
+    1.10034357153915731354E-4,
+    5.48900252756255700982E-7,
+  ], dtype=x.dtype)
+  GN4 = np.array([
+    8.71001698973114191777E-2,
+    6.11379109952219284151E-1,
+    3.97180296392337498885E-1,
+    7.48527737628469092119E-2,
+    5.38868681462177273157E-3,
+    1.61999794598934024525E-4,
+    1.97963874140963632189E-6,
+    7.82579040744090311069E-9,
+  ], dtype=x.dtype)
+  GD4 = np.array([
+    1,
+    1.64402202413355338886E0,
+    6.66296701268987968381E-1,
+    9.88771761277688796203E-2,
+    6.22396345441768420760E-3,
+    1.73221081474177119497E-4,
+    2.02659182086343991969E-6,
+    7.82579218933534490868E-9,
+  ], dtype=x.dtype)
+
+  FN8 = np.array([
+    4.55880873470465315206E-1,
+    7.13715274100146711374E-1,
+    1.60300158222319456320E-1,
+    1.16064229408124407915E-2,
+    3.49556442447859055605E-4,
+    4.86215430826454749482E-6,
+    3.20092790091004902806E-8,
+    9.41779576128512936592E-11,
+    9.70507110881952024631E-14,
+  ], dtype=x.dtype)
+  FD8 = np.array([
+    1.0,
+    9.17463611873684053703E-1,
+    1.78685545332074536321E-1,
+    1.22253594771971293032E-2,
+    3.58696481881851580297E-4,
+    4.92435064317881464393E-6,
+    3.21956939101046018377E-8,
+    9.43720590350276732376E-11,
+    9.70507110881952025725E-14,
+  ], dtype=x.dtype)
+  GN8 = np.array([
+    6.97359953443276214934E-1,
+    3.30410979305632063225E-1,
+    3.84878767649974295920E-2,
+    1.71718239052347903558E-3,
+    3.48941165502279436777E-5,
+    3.47131167084116673800E-7,
+    1.70404452782044526189E-9,
+    3.85945925430276600453E-12,
+    3.14040098946363334640E-15,
+  ], dtype=x.dtype)
+  GD8 = np.array([
+    1.0,
+    1.68548898811011640017E0,
+    4.87852258695304967486E-1,
+    4.67913194259625806320E-2,
+    1.90284426674399523638E-3,
+    3.68475504442561108162E-5,
+    3.57043223443740838771E-7,
+    1.72693748966316146736E-9,
+    3.87830166023954706752E-12,
+    3.14040098946363335242E-15,
+  ], dtype=x.dtype)
+
+  f4 = jnp.polyval(FN4, z) / (x * jnp.polyval(FD4, z))
+  g4 = z * jnp.polyval(GN4, z) / jnp.polyval(GD4, z)
+
+  f8 = jnp.polyval(FN8, z) / (x * jnp.polyval(FD8, z))
+  g8 = z * jnp.polyval(GN8, z) / jnp.polyval(GD8, z)
+
+  mask = x < 8.0
+  f = jnp.where(mask, f4, f8)
+  g = jnp.where(mask, g4, g8)
+
+  si = (np.pi / 2) - f * c - g * s
+  ci = f * s - g * c
+
+  return si, ci
+
+@sici.defjvp
+@jit
+def sici_jvp(primals, tangents):
+  (p,), (t,) = primals, tangents
+  primal_out = sici(p)
+
+  sin_term = sinc(p / np.pi)
+  cos_term = jnp.cos(p) / p
+
+  tangent_out = (sin_term * t, cos_term * t)
+  return primal_out, tangent_out
+
+
+def _expn1(x: Array, n: Array) -> Array:
   # exponential integral En
   _c = _lax_const
-  x = jnp.asarray(x_in)
-  MACHEP = jnp.finfo(x.dtype).eps
+  MACHEP = dtypes.finfo(x.dtype).eps
 
   zero = _c(x, 0.0)
   one = _c(x, 1.0)
-  psi = -jnp.euler_gamma - jnp.log(x)
+  psi = -np.euler_gamma - jnp.log(x)
   psi = lax.fori_loop(_c(n, 1), n, lambda i, psi: psi + one / i, psi)
   n1 = jnp.where(n == _c(n, 1), one + one, n)
   init = dict(
@@ -2060,7 +2853,7 @@ def _expn1(n: int, x_in: ArrayLike) -> Array:
     yk=one,
     pk=one - n,
     ans=jnp.where(n == _c(n, 1), zero, one / (one - n1)),
-    t=jnp.inf,
+    t=np.inf,
   )
 
   def body(d):
@@ -2080,11 +2873,11 @@ def _expn1(n: int, x_in: ArrayLike) -> Array:
   return d["z"] ** r * psi / jnp.exp(gammaln(t)) - d["ans"]
 
 
-def _expn2(n: int, x: Array) -> Array:
+def _expn2(x: Array, n: Array) -> Array:
   # x > 1.
   _c = _lax_const
   BIG = _c(x, 1.44115188075855872e17)
-  MACHEP = jnp.finfo(BIG.dtype).eps  # ?
+  MACHEP = dtypes.finfo(x.dtype).eps
   zero = _c(x, 0.0)
   one = _c(x, 1.0)
 
@@ -2095,7 +2888,7 @@ def _expn2(n: int, x: Array) -> Array:
     pkm1=one,
     qkm1=x + n,
     ans=one / (x + n),
-    t=_c(x, jnp.inf),
+    t=_c(x, np.inf),
     r=zero,
     x=x,
   )
@@ -2131,7 +2924,7 @@ def _expn2(n: int, x: Array) -> Array:
   return d["ans"] * jnp.exp(-x)
 
 
-def _expn3(n: int, x: Array) -> Array:
+def _expn3(x: Array, n: Array) -> Array:
   # n >= 5000
   _c = _lax_const
   one = _c(x, 1.0)
@@ -2145,7 +2938,7 @@ def _expn3(n: int, x: Array) -> Array:
 
 
 @partial(custom_derivatives.custom_jvp, nondiff_argnums=(0,))
-@jnp.vectorize
+@jnp_vectorize.vectorize
 @jit
 def expn(n: ArrayLike, x: ArrayLike) -> Array:
   r"""Generalized exponential integral function.
@@ -2154,7 +2947,7 @@ def expn(n: ArrayLike, x: ArrayLike) -> Array:
 
   .. math::
 
-     \mathrm{expn}(x) = E_n(x) = x^{n-1}\int_x^\infty\frac{e^{-t}}{t^n}\mathrm{d}t
+     \mathrm{expn}(n, x) = E_n(x) = x^{n-1}\int_x^\infty\frac{e^{-t}}{t^n}\mathrm{d}t
 
   Args:
     n: arraylike, real-valued
@@ -2168,6 +2961,8 @@ def expn(n: ArrayLike, x: ArrayLike) -> Array:
     - :func:`jax.scipy.special.exp1`
   """
   n, x = promote_args_inexact("expn", n, x)
+  if dtypes.issubdtype(x.dtype, np.complexfloating):
+    raise ValueError("expn does not support complex-valued inputs.")
   _c = _lax_const
   zero = _c(x, 0)
   one = _c(x, 1)
@@ -2181,15 +2976,15 @@ def expn(n: ArrayLike, x: ArrayLike) -> Array:
   ]
   n1 = jnp.where(n == _c(n, 1), n + n, n)
   vals = [
-    jnp.nan,
-    jnp.inf,
+    np.nan,
+    np.inf,
     one / n1,  # prevent div by zero
     jnp.exp(-x) / x,
-    partial(_expn3, n),
-    partial(_expn2, n),
-    partial(_expn1, n),
+    _expn3,
+    _expn2,
+    _expn1,
   ]
-  ret = jnp.piecewise(x, conds, vals)
+  ret = jnp.piecewise(x, conds, vals, n=n)
   return ret
 
 
@@ -2209,7 +3004,7 @@ def exp1(x: ArrayLike) -> Array:
 
   .. math::
 
-     \mathrm{exp1}(x) = E_1(x) = x^{n-1}\int_x^\infty\frac{e^{-t}}{t}\mathrm{d}t
+     \mathrm{exp1}(x) = E_1(x) = \int_x^\infty\frac{e^{-t}}{t}\mathrm{d}t
 
 
   Args:
@@ -2223,8 +3018,9 @@ def exp1(x: ArrayLike) -> Array:
     - :func:`jax.scipy.special.expn`
   """
   x, = promote_args_inexact("exp1", x)
-  # Casting because custom_jvp generic does not work correctly with mypy.
-  return cast(Array, expn(1, x))
+  if dtypes.issubdtype(x.dtype, np.complexfloating):
+    raise ValueError("exp1 does not support complex-valued inputs.")
+  return expn(1, x)
 
 
 def _spence_poly(w: Array) -> Array:
@@ -2267,7 +3063,7 @@ def _spence_calc(x: Array) -> Array:
                       lambda x: x - 1.0])
 
   y = _spence_poly(w)
-  y_flag_one = jnp.pi ** 2 / 6.0 - jnp.log(x) * jnp.log(1.0 - x) - y
+  y_flag_one = np.pi ** 2 / 6.0 - jnp.log(x) * jnp.log(1.0 - x) - y
   y = jnp.where(x_5_bool, y_flag_one, y)
   y_flag_two = -0.5 * jnp.log(x) ** 2 - y
   return jnp.where(x2_bool, y_flag_two, y)
@@ -2276,7 +3072,7 @@ def _spence_calc(x: Array) -> Array:
 def _spence(x: Array) -> Array:
   return jnp.piecewise(x,
                        [x < 0.0, x == 1.0, x == 0.0],
-                       [jnp.nan, 0, jnp.pi ** 2 / 6, _spence_calc])
+                       [np.nan, 0, np.pi ** 2 / 6, _spence_calc])
 
 
 def spence(x: Array) -> Array:
@@ -2287,52 +3083,50 @@ def spence(x: Array) -> Array:
   It is defined to be:
 
   .. math::
-    \mathrm{spence}(x) = \begin{equation}
-    \int_1^x \frac{\log(t)}{1 - t}dt
-    \end{equation}
 
-  Unlike the SciPy implementation, this is only defined for positive
-  real values of `z`. For negative values, `NaN` is returned.
+    \mathrm{spence}(x) = \int_1^x \frac{\log(t)}{1 - t}\,\mathrm{d}t
+
+  Unlike the SciPy implementation, this is only defined for non-negative
+  real values of `x`. For negative values, `NaN` is returned.
 
   Args:
-    z: An array of type `float32`, `float64`.
+    x: An array of type `float32`, `float64`.
 
   Returns:
-    An array with `dtype=z.dtype`.
-    computed values of Spence's function.
+    An array with `dtype=x.dtype` containing the computed values of Spence's
+    function.
 
   Raises:
-    TypeError: if elements of array `z` are not in (float32, float64).
+    TypeError: if elements of array `x` are not in (float32, float64).
 
   Notes:
-  There is a different convention which defines Spence's function by the
-  integral:
+    There is a different convention which defines Spence's function by the
+    integral:
 
-  .. math::
-    \begin{equation}
-    -\int_0^z \frac{\log(1 - t)}{t}dt
-    \end{equation}
+    .. math::
 
-  This is our spence(1 - z).
+       -\int_0^x \frac{\log(1 - t)}{t}\mathrm{d}t
+
+    This is our spence(1 - x).
   """
   x = jnp.asarray(x)
   dtype = lax.dtype(x)
-  if dtype not in (jnp.float32, jnp.float64):
+  if dtype not in (np.float32, np.float64):
     raise TypeError(
       f"x.dtype={dtype} is not supported, see docstring for supported types.")
   return _spence(x)
 
 
 def bernoulli(n: int) -> Array:
-  """Generate the first N Bernoulli numbers.
+  r"""Generate the Bernoulli numbers :math:`B_0` through :math:`B_n`, inclusive.
 
   JAX implementation of :func:`scipy.special.bernoulli`.
 
   Args:
-    n: integer, the number of Bernoulli terms to generate.
+    n: integer, the index of the last Bernoulli number to generate.
 
   Returns:
-    Array containing the first ``n`` Bernoulli numbers.
+    Array containing the Bernoulli numbers :math:`B_0` through :math:`B_n`, inclusive.
 
   Notes:
     ``bernoulli`` generates numbers using the :math:`B_n^-` convention,
@@ -2347,7 +3141,7 @@ def bernoulli(n: int) -> Array:
     return b3[:n + 1]
   bn = jnp.zeros(n + 1).at[:3].set(b3)
   m = jnp.arange(4, n + 1, 2, dtype=bn.dtype)
-  q1 = (1. / jnp.pi ** 2) * jnp.cumprod(-(m - 1) * m / 4 / jnp.pi ** 2)
+  q1 = (1. / np.pi ** 2) * jnp.cumprod(-(m - 1) * m / 4 / np.pi ** 2)
   k = jnp.arange(2, 50, dtype=bn.dtype)  # Choose 50 because 2 ** -50 < 1E-15
   q2 = jnp.sum(k[:, None] ** -m[None, :], axis=0)
   return bn.at[4::2].set(q1 * (1 + q2))
@@ -2355,7 +3149,7 @@ def bernoulli(n: int) -> Array:
 
 @custom_derivatives.custom_jvp
 def poch(z: ArrayLike, m: ArrayLike) -> Array:
-  r"""The Pochammer symbol.
+  r"""The Pochhammer symbol.
 
   JAX implementation of :obj:`scipy.special.poch`.
 
@@ -2370,13 +3164,14 @@ def poch(z: ArrayLike, m: ArrayLike) -> Array:
     m: arraylike, real-valued
 
   Returns:
-    array of Pochammer values.
+    array of Pochhammer values.
 
   Notes:
     The JAX version supports only real-valued inputs.
   """
-  # Factorial definition when m is close to an integer, otherwise gamma definition.
   z, m = promote_args_inexact("poch", z, m)
+  if dtypes.issubdtype(z.dtype, np.complexfloating):
+    raise ValueError("jnp.poch does not support complex-valued inputs.")
 
   return jnp.where(m == 0., jnp.array(1, dtype=z.dtype), gamma(z + m) / gamma(z))
 
@@ -2412,6 +3207,8 @@ def _hyp1f1_serie(a, b, x):
   https://doi.org/10.48550/arXiv.1407.7786
   """
 
+  precision = dtypes.finfo(x.dtype).eps
+
   def body(state):
     serie, k, term = state
     serie += term
@@ -2423,7 +3220,7 @@ def _hyp1f1_serie(a, b, x):
   def cond(state):
     serie, k, term = state
 
-    return (k < 250) & (lax.abs(term) / lax.abs(serie) > 1e-8)
+    return (k < 250) & (lax.abs(term) / lax.abs(serie) > precision)
 
   init = 1, 1, a / b * x
 
@@ -2437,6 +3234,8 @@ def _hyp1f1_asymptotic(a, b, x):
   https://doi.org/10.48550/arXiv.1407.7786
   """
 
+  precision = dtypes.finfo(x.dtype).eps
+
   def body(state):
     serie, k, term = state
     serie += term
@@ -2448,7 +3247,7 @@ def _hyp1f1_asymptotic(a, b, x):
   def cond(state):
     serie, k, term = state
 
-    return (k < 250) & (lax.abs(term) / lax.abs(serie) > 1e-8)
+    return (k < 250) & (lax.abs(term) / lax.abs(serie) > precision)
 
   init = 1, 1, (b - a) * (1 - a) / x
   serie = lax.while_loop(cond, body, init)[0]
@@ -2457,12 +3256,14 @@ def _hyp1f1_asymptotic(a, b, x):
 
 
 @jit
-@jnp.vectorize
+@jnp_vectorize.vectorize
 def _hyp1f1_a_derivative(a, b, x):
   """
-  Define it as a serie using :
+  Define it as a series using:
   https://functions.wolfram.com/HypergeometricFunctions/Hypergeometric1F1/20/01/01/
   """
+
+  precision = dtypes.finfo(x.dtype).eps
 
   def body(state):
     serie, k, term = state
@@ -2475,7 +3276,7 @@ def _hyp1f1_a_derivative(a, b, x):
   def cond(state):
     serie, k, term = state
 
-    return (k < 250) & (lax.abs(term) / lax.abs(serie) > 1e-15)
+    return (k < 250) & (lax.abs(term) / lax.abs(serie) > precision)
 
   init = 0, 1, a / b * x
 
@@ -2483,12 +3284,14 @@ def _hyp1f1_a_derivative(a, b, x):
 
 
 @jit
-@jnp.vectorize
+@jnp_vectorize.vectorize
 def _hyp1f1_b_derivative(a, b, x):
   """
-  Define it as a serie using :
+  Define it as a series using:
   https://functions.wolfram.com/HypergeometricFunctions/Hypergeometric1F1/20/01/02/
   """
+
+  precision = dtypes.finfo(x.dtype).eps
 
   def body(state):
     serie, k, term = state
@@ -2501,7 +3304,7 @@ def _hyp1f1_b_derivative(a, b, x):
   def cond(state):
     serie, k, term = state
 
-    return (k < 250) & (lax.abs(term) / lax.abs(serie) > 1e-15)
+    return (k < 250) & (lax.abs(term) / lax.abs(serie) > precision)
 
   init = 0, 1, a / b * x
 
@@ -2511,7 +3314,7 @@ def _hyp1f1_b_derivative(a, b, x):
 @jit
 def _hyp1f1_x_derivative(a, b, x):
   """
-  Define it as a serie using :
+  Define it as a series using:
   https://functions.wolfram.com/HypergeometricFunctions/Hypergeometric1F1/20/01/04/
   """
 
@@ -2520,7 +3323,7 @@ def _hyp1f1_x_derivative(a, b, x):
 
 @custom_derivatives.custom_jvp
 @jit
-@jnp.vectorize
+@jnp_vectorize.vectorize
 def hyp1f1(a: ArrayLike, b: ArrayLike, x: ArrayLike) -> Array:
   r"""The 1F1 hypergeometric function.
 
@@ -2528,9 +3331,9 @@ def hyp1f1(a: ArrayLike, b: ArrayLike, x: ArrayLike) -> Array:
 
   .. math::
 
-     \mathrm{hyp1f1}(a, b, x) = {}_1F_1(x;a, b) = \sum_{k=0}^\infty \frac{(a)_k}{(b)_kk!}x^k
+     \mathrm{hyp1f1}(a, b, x) = {}_1F_1(a; b; x) = \sum_{k=0}^\infty \frac{(a)_k}{(b)_k}\frac{x^k}{k!}
 
-  where :math:`(\cdot)_k` is the Pochammer symbol (refer to :func:`~jax.scipy.special.poch`).
+  where :math:`(\cdot)_k` is the Pochhammer symbol (refer to :func:`~jax.scipy.special.poch`).
 
   The JAX version only accepts positive and real inputs. Values of ``a``, ``b``,
   and ``x``, leading to high values of 1F1 may lead to erroneous results;
@@ -2550,6 +3353,9 @@ def hyp1f1(a: ArrayLike, b: ArrayLike, x: ArrayLike) -> Array:
   # evaluate lower values of hyp1f1 when a or b or both are > 60-80
   a, b, x = promote_args_inexact('hyp1f1', a, b, x)
 
+  if dtypes.issubdtype(x.dtype, np.complexfloating):
+    raise ValueError("hyp1f1 does not support complex-valued inputs.")
+
   result = lax.cond(lax.abs(x) < 100, _hyp1f1_serie, _hyp1f1_asymptotic, a, b, x)
   index = (a == 0) * 1 + ((a == b) & (a != 0)) * 2 + ((b == 0) & (a != 0)) * 3
 
@@ -2557,7 +3363,7 @@ def hyp1f1(a: ArrayLike, b: ArrayLike, x: ArrayLike) -> Array:
                       result,
                       jnp.array(1, dtype=x.dtype),
                       jnp.exp(x),
-                      jnp.array(jnp.inf, dtype=x.dtype))
+                      jnp.array(np.inf, dtype=x.dtype))
 
 
 hyp1f1.defjvps(
@@ -2565,3 +3371,542 @@ hyp1f1.defjvps(
   lambda b_dot, primal_out, a, b, x: _hyp1f1_b_derivative(a, b, x) * b_dot,
   lambda x_dot, primal_out, a, b, x: _hyp1f1_x_derivative(a, b, x) * x_dot
 )
+
+
+def _hyp2f1_terminal(a, b, c, x):
+  """
+  The Taylor series representation of the 2F1 hypergeometric function
+  terminates when either a or b is a non-positive integer. See Eq. 4.1 and
+  Taylor Series Method (a) from PEARSON, OLVER & PORTER 2014
+  https://doi.org/10.48550/arXiv.1407.7786
+  """
+  # Ensure that between a and b, the negative integer parameter with the greater
+  # absolute value - that still has a magnitude less than the absolute value of
+  # c if c is non-positive - is used for the upper limit in the loop.
+  eps = dtypes.finfo(x.dtype).eps * 50
+  ib = jnp.round(b)
+  mask = jnp.logical_and(
+      b < a,
+      jnp.logical_and(
+        jnp.abs(b - ib) < eps,
+        jnp.logical_not(
+          jnp.logical_and(
+            c % 1 == 0,
+            jnp.logical_and(
+              c <= 0,
+              c > b
+            )
+          )
+        )
+      )
+    )
+  orig_a = a
+  a = jnp.where(mask, b, a)
+  b = jnp.where(mask, orig_a, b)
+
+  a = jnp.abs(a)
+
+  def body(i, state):
+    serie, term = state
+
+    term *= -(a - i + 1) / (c + i - 1) * (b + i - 1) / i * x
+    serie += term
+
+    return serie, term
+
+  init = (jnp.array(1, dtype=x.dtype), jnp.array(1, dtype=x.dtype))
+
+  return lax.fori_loop(jnp.array(1, dtype=a.dtype),
+                       a + 1,
+                       body,
+                       init)[0]
+
+
+def _hyp2f1_serie(a, b, c, x):
+  """
+  Compute the 2F1 hypergeometric function using the Taylor expansion.
+  See Eq. 4.1 from PEARSON, OLVER & PORTER 2014
+  https://doi.org/10.48550/arXiv.1407.7786
+  """
+  rtol = dtypes.finfo(x.dtype).eps
+
+  def body(state):
+    serie, k, term = state
+
+    serie += term
+    term *= (a + k - 1) * (b + k - 1) / (c + k - 1) / k * x
+    k += 1
+
+    return serie, k, term
+
+  def cond(state):
+    serie, k, term = state
+
+    return (k < 250) & (lax.abs(term) > rtol * lax.abs(serie))
+
+  init = (jnp.array(0, dtype=x.dtype),
+          jnp.array(1, dtype=x.dtype),
+          jnp.array(1, dtype=x.dtype))
+
+  return lax.while_loop(cond, body, init)[0]
+
+
+def _hyp2f1_terminal_or_serie(a, b, c, x):
+  """
+  Check for recurrence relations along with whether or not the series
+  terminates. True recursion is not possible; however, the recurrence
+  relation may still be approximated.
+  See 4.6.1. Recurrence Relations from PEARSON, OLVER & PORTER 2014
+  https://doi.org/10.48550/arXiv.1407.7786
+  """
+  eps = dtypes.finfo(x.dtype).eps * 50
+
+  d = c - a - b
+
+  ia = jnp.round(a)
+  ib = jnp.round(b)
+  id = jnp.round(d)
+
+  neg_int_a = jnp.logical_and(a <= 0, jnp.abs(a - ia) < eps)
+  neg_int_b = jnp.logical_and(b <= 0, jnp.abs(b - ib) < eps)
+  neg_int_a_or_b = jnp.logical_or(neg_int_a, neg_int_b)
+  not_neg_int_a_or_b = jnp.logical_not(neg_int_a_or_b)
+
+  index = jnp.where(jnp.logical_and(x > 0.9, not_neg_int_a_or_b),
+        jnp.where(jnp.abs(d - id) >= eps, 0, 1),
+        jnp.where(neg_int_a_or_b, 2, 0))
+
+  return lax.select_n(index,
+                      _hyp2f1_serie(a, b, c, x),
+                      _hyp2f1_digamma_transform(a, b, c, x),
+                      _hyp2f1_terminal(a, b, c, x))
+
+
+def _hyp2f1_digamma_transform(a, b, c, x):
+  """
+  Digamma transformation of the 2F1 hypergeometric function.
+  See AMS55 #15.3.10, #15.3.11, #15.3.12
+  """
+  rtol = dtypes.finfo(x.dtype).eps
+
+  d = c - a - b
+  s = 1 - x
+  rd = jnp.round(d)
+
+  e = jnp.where(rd >= 0, d, -d)
+  d1 = jnp.where(rd >= 0, d, jnp.array(0, dtype=d.dtype))
+  d2 = jnp.where(rd >= 0, jnp.array(0, dtype=d.dtype), d)
+  ard = jnp.where(rd >= 0, rd, -rd).astype('int32')
+
+  ax = jnp.log(s)
+
+  y = digamma(1.0) + digamma(1.0 + e) - digamma(a + d1) - digamma(b + d1) - ax
+  y /= gamma(e + 1.0)
+
+  p = (a + d1) * (b + d1) * s / gamma(e + 2.0)
+
+  def cond(state):
+    _, _, _, _, _, _, q, _, _, t, y = state
+
+    return jnp.logical_and(
+      t < 250,
+      jnp.abs(q) >= rtol * jnp.abs(y)
+    )
+
+  def body(state):
+    a, ax, b, d1, e, p, q, r, s, t, y = state
+
+    r = digamma(1.0 + t) + digamma(1.0 + t + e) - digamma(a + t + d1) \
+        - digamma(b + t + d1) - ax
+    q = p * r
+    y += q
+    p *= s * (a + t + d1) / (t + 1.0)
+    p *= (b + t + d1) / (t + 1.0 + e)
+    t += 1.0
+
+    return a, ax, b, d1, e, p, q, r, s, t, y
+
+  init = (a, ax, b, d1, e, p, y, jnp.array(0, dtype=x.dtype), s,
+          jnp.array(1, dtype=x.dtype), y)
+  _, _, _, _, _, _, q, r, _, _, y = lax.while_loop(cond, body, init)
+
+  def compute_sum(y):
+    y1 = jnp.array(1, dtype=x.dtype)
+    t = jnp.array(0, dtype=x.dtype)
+    p = jnp.array(1, dtype=x.dtype)
+
+    def for_body(i, state):
+      a, b, d2, e, p, s, t, y1 = state
+
+      r = 1.0 - e + t
+      p *= s * (a + t + d2) * (b + t + d2) / r
+      t += 1.0
+      p /= t
+      y1 += p
+
+      return a, b, d2, e, p, s, t, y1
+
+    init_val = a, b, d2, e, p, s, t, y1
+    y1 = lax.fori_loop(1, ard, for_body, init_val)[-1]
+
+    p = gamma(c)
+    y1 *= gamma(e) * p / (gamma(a + d1) * gamma(b + d1))
+    y *= p / (gamma(a + d2) * gamma(b + d2))
+
+    y = jnp.where((ard & 1) != 0, -y, y)
+    q = s ** rd
+
+    return jnp.where(rd > 0, y * q + y1, y + y1 * q)
+
+  return jnp.where(
+    rd == 0,
+    y * gamma(c) / (gamma(a) * gamma(b)),
+    compute_sum(y)
+  )
+
+
+@jit
+@jnp_vectorize.vectorize
+def _hyp2f1_a_derivative(a, b, c, x):
+  """
+  Define it as a series using:
+  https://functions.wolfram.com/HypergeometricFunctions/Hypergeometric2F1/20/01/01/
+  """
+
+  precision = dtypes.finfo(x.dtype).eps
+
+  def body(state):
+    serie, k, term = state
+    serie += term * (digamma(a + k) - digamma(a))
+    term *= (a + k) * (b + k) / (c + k) / (k + 1) * x
+    k += 1
+
+    return serie, k, term
+
+  def cond(state):
+    serie, k, term = state
+
+    return (k < 250) & (lax.abs(term) / lax.abs(serie) > precision)
+
+  init = 0, 1, a * b / c * x
+
+  return lax.while_loop(cond, body, init)[0]
+
+
+@jit
+@jnp_vectorize.vectorize
+def _hyp2f1_b_derivative(a, b, c, x):
+  """
+  Define it as a series using:
+  https://functions.wolfram.com/HypergeometricFunctions/Hypergeometric2F1/20/01/02/
+  """
+
+  precision = dtypes.finfo(x.dtype).eps
+
+  def body(state):
+    serie, k, term = state
+    serie += term * (digamma(b + k) - digamma(b))
+    term *= (a + k) * (b + k) / (c + k) / (k + 1) * x
+    k += 1
+
+    return serie, k, term
+
+  def cond(state):
+    serie, k, term = state
+
+    return (k < 250) & (lax.abs(term) / lax.abs(serie) > precision)
+
+  init = 0, 1, a * b / c * x
+
+  return lax.while_loop(cond, body, init)[0]
+
+
+@jit
+@jnp_vectorize.vectorize
+def _hyp2f1_c_derivative(a, b, c, x):
+  """
+  Define it as a series using:
+  https://functions.wolfram.com/HypergeometricFunctions/Hypergeometric2F1/20/01/03/
+  """
+
+  precision = dtypes.finfo(x.dtype).eps
+
+  def body(state):
+    serie, k, term = state
+    serie += term * (digamma(c) - digamma(c + k))
+    term *= (a + k) * (b + k) / (c + k) / (k + 1) * x
+    k += 1
+
+    return serie, k, term
+
+  def cond(state):
+    serie, k, term = state
+
+    return (k < 250) & (lax.abs(term) / lax.abs(serie) > precision)
+
+  init = 0, 1, a * b / c * x
+
+  return lax.while_loop(cond, body, init)[0]
+
+
+@jit
+def _hyp2f1_x_derivative(a, b, c, x):
+  """
+  Define the derivative with respect to ``x``:
+  https://functions.wolfram.com/HypergeometricFunctions/Hypergeometric2F1/20/01/05/
+  """
+
+  return a * b / c * hyp2f1(a + 1, b + 1, c + 1, x)
+
+
+@custom_derivatives.custom_jvp
+@jit
+@jnp_vectorize.vectorize
+def hyp2f1(a: ArrayLike, b: ArrayLike, c: ArrayLike, x: ArrayLike) -> Array:
+  r"""The 2F1 hypergeometric function.
+
+  JAX implementation of :obj:`scipy.special.hyp2f1`.
+
+  .. math::
+
+     \mathrm{hyp2f1}(a, b, c, x) = {}_2F_1(a, b; c; x) = \sum_{k=0}^\infty \frac{(a)_k(b)_k}{(c)_k}\frac{x^k}{k!}
+
+  where :math:`(\cdot)_k` is the Pochhammer symbol.
+
+  The JAX version only accepts positive and real inputs. Values of
+  ``a``, ``b``, ``c``, and ``x`` leading to high values of 2F1 may
+  lead to erroneous results; consider enabling double precision in this case.
+
+  Args:
+    a: arraylike, real-valued
+    b: arraylike, real-valued
+    c: arraylike, real-valued
+    x: arraylike, real-valued
+
+  Returns:
+    array of 2F1 values.
+  """
+  # This is backed by https://doi.org/10.48550/arXiv.1407.7786
+  a, b, c, x = promote_args_inexact('hyp2f1', a, b, c, x)
+  eps = dtypes.finfo(x.dtype).eps * 50
+
+  d = c - a - b
+  s = 1 - x
+  ca = c - a
+  cb = c - b
+
+  id = jnp.round(d)
+
+  index = jnp.where(jnp.logical_or(x == 0, jnp.logical_and(jnp.logical_or(a == 0, b == 0), c != 0)), 0,
+            jnp.where(jnp.logical_or(c == 0, jnp.logical_and(c < 0, c % 1 == 0)), 1,
+              jnp.where(jnp.logical_and(d <= -1, jnp.logical_not(jnp.logical_and(jnp.abs(d - id) >= eps, s < 0))), 2,
+                jnp.where(jnp.logical_and(d <= 0, x == 1), 1,
+                  jnp.where(jnp.logical_and(x < 1, b == c), 3,
+                    jnp.where(jnp.logical_and(x < 1, a == c), 4,
+                      jnp.where(x > 1, 1,
+                        jnp.where(x == 1, 5, 6))))))))
+
+  return lax.select_n(index,
+                      jnp.array(1, dtype=x.dtype),
+                      jnp.array(np.inf, dtype=x.dtype),
+                      s ** d * _hyp2f1_terminal_or_serie(ca, cb, c, x),
+                      s ** (-a),
+                      s ** (-b),
+                      gamma(c) * gamma(d) / (gamma(ca) * gamma(cb)),
+                      _hyp2f1_terminal_or_serie(a, b, c, x))
+
+
+hyp2f1.defjvps(
+  lambda a_dot, primal_out, a, b, c, x: _hyp2f1_a_derivative(a, b, c, x) * a_dot,
+  lambda b_dot, primal_out, a, b, c, x: _hyp2f1_b_derivative(a, b, c, x) * b_dot,
+  lambda c_dot, primal_out, a, b, c, x: _hyp2f1_c_derivative(a, b, c, x) * c_dot,
+  lambda x_dot, primal_out, a, b, c, x: _hyp2f1_x_derivative(a, b, c, x) * x_dot
+)
+
+
+# 13-point Gauss-type quadrature on the canonical Owen's T integral
+#   T(h, a) = (1/2π) ∫_0^a exp(-h²(1+u²)/2) / (1+u²) du,
+# under the substitution u² = a²·t, which absorbs the 1/(2π) factor and
+# the Jacobian into the tabulated weights so that
+#   T(h, a) ≈ a · Σ_i w_i · exp(-h²(1+a²·t_i)/2) / (1+a²·t_i).
+# Patefield & Tandy (2000) Method T5: https://www.jstatsoft.org/v05/i05/paper
+_OWENS_T_QUAD_PTS = np.array([
+    0.0035082039676451715, 0.031279042338030754,
+    0.085266826283219451,  0.16245071730812277,
+    0.25851196049125435,   0.36807553840697534,
+    0.48501092905604697,   0.60277514152618577,
+    0.71477884217753227,   0.81475510988760099,
+    0.89711029755948966,   0.95723808085944262,
+    0.99178832974629704,
+])
+
+_OWENS_T_QUAD_WTS = np.array([
+    0.018831438115323503, 0.018567086243977649,
+    0.018042093461223386, 0.017263829606398753,
+    0.016243219975989857, 0.014994592034116705,
+    0.013535474469662088, 0.011886351605820165,
+    0.010070377242777432, 0.0081130545742299587,
+    0.0060419009528470239, 0.0038862217010742058,
+    0.0016793031084546090,
+])
+
+
+def _owens_t_quadrature(h, a):
+  quad_pts = jnp.expand_dims(_OWENS_T_QUAD_PTS, tuple(range(a.ndim)))
+  r = jnp.square(a)[..., None] * quad_pts
+  integrand = jnp.exp(-0.5 * jnp.square(h)[..., None] * (1. + r)) / (1. + r)
+  return a * (integrand @ _OWENS_T_QUAD_WTS)
+
+
+@custom_derivatives.custom_jvp
+def _owens_t_impl(h, a):
+  h = jnp.abs(h)
+  abs_a = jnp.abs(a)
+  root_2 = _lax_const(h, np.sqrt(2))
+  h_normed = h / root_2
+
+  modified_a = jnp.where(abs_a <= 1., abs_a, jnp.reciprocal(abs_a))
+  modified_h = jnp.where(abs_a <= 1., h, abs_a * h)
+
+  result = _owens_t_quadrature(modified_h, modified_a)
+
+  # Exact values for h=0 and a=1
+  result = jnp.where(modified_h == 0., arctan(modified_a) / (2 * np.pi), result)
+  result = jnp.where(
+      modified_a == 1.,
+      0.125 * lax.erfc(-modified_h / root_2) * lax.erfc(modified_h / root_2),
+      result)
+
+  # Reciprocal correction for |a| > 1
+  normh = lax.erfc(h_normed)
+  normah = lax.erfc(abs_a * h_normed)
+  result = jnp.where(
+      abs_a > 1.,
+      jnp.where(
+          abs_a * h <= 0.67,
+          (0.25 - 0.25 * lax.erf(h_normed) * lax.erf(abs_a * h_normed)
+           - result),
+          0.25 * (normh + normah - normh * normah) - result),
+      result)
+
+  result = lax.sign(a) * result
+  return jnp.where(jnp.isnan(a) | jnp.isnan(h), jnp.full_like(result, jnp.nan), result)
+
+
+def _owens_t_jvp(primals, tangents):
+  (h, a) = primals
+  (dh, da) = tangents
+  result = _owens_t_impl(h, a)
+  root_2 = _lax_const(h, np.sqrt(2))
+  # ∂T/∂h = -exp(-h²/2) · erf(ah/√2) / (2√(2π))
+  dout_dh = (-lax.exp(-0.5 * lax.square(h)) * lax.erf(a * h / root_2)
+             / (2. * _lax_const(h, np.sqrt(2. * np.pi))))
+  # ∂T/∂a = exp(-½(a²+1)h²) / (2π(a²+1))
+  dout_da = (lax.exp(-0.5 * (lax.square(a) + 1.) * lax.square(h))
+             / (2. * np.pi * (lax.square(a) + 1.)))
+  return result, (dout_dh * dh + dout_da * da).astype(result.dtype)
+
+_owens_t_impl.defjvp(_owens_t_jvp)
+
+
+def owens_t(h: ArrayLike, a: ArrayLike) -> Array:
+  r"""Owen's T function.
+
+  JAX implementation of :obj:`scipy.special.owens_t`.
+
+  Computes Owen's T function:
+
+  .. math::
+
+     T(h, a) = \frac{1}{2\pi} \int_0^a
+         \frac{\exp\!\left(-\tfrac{1}{2}h^2(1+x^2)\right)}{1+x^2} \, dx
+
+  Computed via 13-point Gauss-type quadrature on the canonical integral
+  form (Patefield & Tandy 2000 method T5).
+  The full 18-region dispatch from Patefield & Tandy is
+  intentionally avoided because XLA evaluates every branch of a
+  ``where`` / ``select`` unconditionally, which turns per-region
+  dispatch into added cost rather than savings.
+
+  Args:
+    h: array_like, real-valued.
+    a: array_like, real-valued.
+
+  Returns:
+    Array of Owen's T values with dtype matching the promoted inputs.
+
+  See also:
+    :func:`jax.scipy.special.ndtr`
+  """
+  h, a = promote_args_inexact("owens_t", h, a)
+  return _owens_t_impl(h, a)
+
+
+def softmax(x: ArrayLike,
+            /,
+            *,
+            axis: int | tuple[int, ...] | None = None,
+            ) -> Array:
+  r"""Softmax function.
+
+  JAX implementation of :func:`scipy.special.softmax`.
+
+  Computes the function which rescales elements to the range :math:`[0, 1]`
+  such that the elements along :code:`axis` sum to :math:`1`.
+
+  .. math ::
+    \mathrm{softmax}(x)_i = \frac{\exp(x_i)}{\sum_j \exp(x_j)}
+
+  Args:
+    x : input array
+    axis: the axis or axes along which the softmax should be computed. The
+      softmax output summed across these dimensions should sum to :math:`1`.
+      ``None`` means all axes.
+
+  Returns:
+    An array of the same shape as ``x``.
+
+  Note:
+    If any input values are ``+inf``, the result will be all ``NaN``: this
+    reflects the fact that ``inf / inf`` is not well-defined in the context of
+    floating-point math.
+
+  See also:
+    :func:`log_softmax`
+  """
+  return nn_softmax(x, axis=axis)
+
+
+def log_softmax(x: ArrayLike,
+                /,
+                *,
+                axis: int | tuple[int, ...] | None = None,
+                ) -> Array:
+  r"""Log-Softmax function.
+
+  JAX implementation of :func:`scipy.special.log_softmax`
+
+  Computes the logarithm of the :code:`softmax` function, which rescales
+  elements to the range :math:`(-\infty, 0]`.
+
+  .. math ::
+    \mathrm{log\_softmax}(x)_i = \log \left( \frac{\exp(x_i)}{\sum_j \exp(x_j)}
+    \right)
+
+  Args:
+    x : input array
+    axis: the axis or axes along which the :code:`log_softmax` should be
+      computed. ``None`` means all axes.
+
+  Returns:
+    An array of the same shape as ``x``
+
+  Note:
+    If any input values are ``+inf``, the result will be all ``NaN``: this
+    reflects the fact that ``inf / inf`` is not well-defined in the context of
+    floating-point math.
+
+  See also:
+    :func:`softmax`
+  """
+  return nn_log_softmax(x, axis=axis)

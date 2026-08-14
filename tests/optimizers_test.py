@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the optimizers module."""
-
 import functools
 
 from absl.testing import absltest
@@ -43,7 +41,7 @@ class OptimizerTests(jtu.JaxTestCase):
     self.assertEqual(jax.tree.structure(opt_state),
                      jax.tree.structure(opt_state2))
 
-  @jtu.skip_on_devices('gpu')
+  @jtu.skip_on_devices('cuda')
   def _CheckRun(self, optimizer, loss, x0, num_steps, *args, **kwargs):
     init_fun, update_fun, get_params = optimizer(*args)
 
@@ -260,7 +258,7 @@ class OptimizerTests(jtu.JaxTestCase):
     self.assertAllClose(ans, expected, check_dtypes=False)
 
   def testIssue758(self):
-    # code from https://github.com/google/jax/issues/758
+    # code from https://github.com/jax-ml/jax/issues/758
     # this is more of a scan + jacfwd/jacrev test, but it lives here to use the
     # optimizers.py code
 

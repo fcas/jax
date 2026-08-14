@@ -14,7 +14,6 @@
 
 from absl.testing import absltest
 import numpy as np
-import scipy
 import scipy.optimize
 
 import jax
@@ -97,6 +96,7 @@ class TestBFGS(jtu.JaxTestCase):
     self.assertAllClose(scipy_res, jax_res, atol=2e-4, rtol=2e-4,
                         check_dtypes=False)
 
+  @jax.default_matmul_precision("highest")
   def test_fixes4594(self):
     n = 2
     A = jnp.eye(n) * 1e4
@@ -117,6 +117,7 @@ class TestBFGS(jtu.JaxTestCase):
     jax_res = jax.scipy.optimize.minimize(fun=eval_func, x0=x0, method='BFGS')
     self.assertLess(jax_res.fun, 1e-6)
 
+  @jtu.ignore_warning(category=RuntimeWarning, message='divide by zero')
   def test_minimize_bad_initial_values(self):
     # This test runs deliberately "bad" initial values to test that handling
     # of failed line search, etc. is the same across implementations
@@ -239,4 +240,4 @@ class TestLBFGS(jtu.JaxTestCase):
 
 
 if __name__ == "__main__":
-  absltest.main()
+  absltest.main(testLoader=jtu.JaxTestLoader())

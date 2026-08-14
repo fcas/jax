@@ -15,20 +15,20 @@
 
 See README.md for instructions.
 """
-import grpc  # type: ignore[import]
+import grpc  # pyrefly: ignore[missing-import]
 import json
 import logging
-import requests  # type: ignore[import]
+import requests
 
 from absl import app
 from absl import flags
 
-from jax.experimental.jax2tf.examples import mnist_lib  # type: ignore
+from jax.experimental.jax2tf.examples import mnist_lib
 
 import numpy as np
-import tensorflow as tf  # type: ignore[import]
-import tensorflow_datasets as tfds  # type: ignore[import]
-from tensorflow_serving.apis import predict_pb2  # type: ignore[import]
+import tensorflow as tf
+import tensorflow_datasets as tfds  # pyrefly: ignore[missing-import]
+from tensorflow_serving.apis import predict_pb2  # pyrefly: ignore[missing-import]
 from tensorflow_serving.apis import prediction_service_pb2_grpc
 
 
@@ -92,7 +92,7 @@ def serving_call_mnist(images):
     # You can see the name of the input ("inputs") in the SavedModel dump.
     data = f'{{"inputs": {images_json}}}'
     predict_url = f"http://{_PREDICTION_SERVICE_ADDR.value}/v1/models/{_MODEL_SPEC_NAME.value}:predict"
-    response = requests.post(predict_url, data=data)
+    response = requests.post(predict_url, data=data, timeout=60)
     if response.status_code != 200:
       msg = (f"Received error response {response.status_code} from model "
              f"server: {response.text}")
@@ -106,12 +106,12 @@ def main(_):
     raise ValueError(f"The count_images ({_COUNT_IMAGES.value}) must be a "
                      "multiple of "
                      f"serving_batch_size ({_SERVING_BATCH_SIZE.value})")
-  test_ds = mnist_lib.load_mnist(tfds.Split.TEST,
+  test_ds = mnist_lib.load_mnist(tfds.Split("test"),
                                  batch_size=_SERVING_BATCH_SIZE.value)
   images_and_labels = tfds.as_numpy(test_ds.take(
       _COUNT_IMAGES.value // _SERVING_BATCH_SIZE.value))
 
-  accurate_count = 0
+  accurate_count = np.array(0)
   for batch_idx, (images, labels) in enumerate(images_and_labels):
     predictions_one_hot = serving_call_mnist(images)
     predictions_digit = np.argmax(predictions_one_hot, axis=1)

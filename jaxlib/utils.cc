@@ -15,9 +15,25 @@ limitations under the License.
 
 #include <Python.h>
 
-#include "nanobind/nanobind.h"
+#include <cstddef>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "absl/base/log_severity.h"
 #include "absl/cleanup/cleanup.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/container/inlined_vector.h"
+#include "absl/debugging/failure_signal_handler.h"
+#include "absl/log/globals.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
+#include "absl/synchronization/mutex.h"
+#include "nanobind/nanobind.h"
+#include "nanobind/stl/string_view.h"  // IWYU pragma: keep
+#include "tsl/platform/platform.h"
 
 namespace nb = nanobind;
 
@@ -58,9 +74,9 @@ PyObject* SafeMap(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
   absl::InlinedVector<PyObject*, 4> values(nargs, nullptr);
   while (true) {
     absl::Cleanup values_cleanup = [&values]() {
-      for (PyObject* v : values) {
-        Py_XDECREF(v);
-        v = nullptr;
+      for (size_t i = 1; i < values.size(); ++i) {
+        Py_XDECREF(values[i]);
+        values[i] = nullptr;
       }
     };
     values[1] = PyIter_Next(iterators[0].ptr());
@@ -124,6 +140,141 @@ PyMethodDef safe_map_def = {
     METH_FASTCALL,
 };
 
+// Similar to SafeMap, but ignores the return values of the function and returns
+// None.
+PyObject* ForEach(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
+  if (nargs < 2) {
+    PyErr_SetString(PyExc_TypeError, "foreach() requires at least 2 arguments");
+    return nullptr;
+  }
+  PyObject* fn = args[0];
+  absl::InlinedVector<nb::object, 4> iterators;
+  iterators.reserve(nargs - 1);
+  for (Py_ssize_t i = 1; i < nargs; ++i) {
+    PyObject* it = PyObject_GetIter(args[i]);
+    if (!it) return nullptr;
+    iterators.push_back(nb::steal<nb::object>(it));
+  }
+
+  // The arguments we will pass to fn. We allocate space for one more argument
+  // than we need at the start of the argument list so we can use
+  // PY_VECTORCALL_ARGUMENTS_OFFSET which may speed up the callee.
+  absl::InlinedVector<PyObject*, 4> values(nargs, nullptr);
+  while (true) {
+    absl::Cleanup values_cleanup = [&values]() {
+      for (size_t i = 1; i < values.size(); ++i) {
+        Py_XDECREF(values[i]);
+        values[i] = nullptr;
+      }
+    };
+    values[1] = PyIter_Next(iterators[0].ptr());
+    if (PyErr_Occurred()) return nullptr;
+
+    if (values[1]) {
+      for (size_t i = 1; i < iterators.size(); ++i) {
+        values[i + 1] = PyIter_Next(iterators[i].ptr());
+        if (PyErr_Occurred()) return nullptr;
+        if (!values[i + 1]) {
+          PyErr_Format(PyExc_ValueError,
+                       "foreach() argument %u is shorter than argument 1",
+                       i + 1);
+          return nullptr;
+        }
+      }
+    } else {
+      // No more elements should be left. Checks the other iterators are
+      // exhausted.
+      for (size_t i = 1; i < iterators.size(); ++i) {
+        values[i + 1] = PyIter_Next(iterators[i].ptr());
+        if (PyErr_Occurred()) return nullptr;
+        if (values[i + 1]) {
+          PyErr_Format(PyExc_ValueError,
+                       "foreach() argument %u is longer than argument 1",
+                       i + 1);
+          return nullptr;
+        }
+      }
+      Py_INCREF(Py_None);
+      return Py_None;
+    }
+
+    nb::object out = nb::steal<nb::object>(PyObject_Vectorcall(
+        fn, &values[1], (nargs - 1) | PY_VECTORCALL_ARGUMENTS_OFFSET,
+        /*kwnames=*/nullptr));
+    if (PyErr_Occurred()) {
+      return nullptr;
+    }
+  }
+}
+
+PyMethodDef foreach_def = {
+    "foreach", reinterpret_cast<PyCFunction>(ForEach), METH_FASTCALL,
+    "foreach() applies a function elementwise to one or more iterables, "
+    "ignoring the return values and returns None. The iterables must all have "
+    "the same lengths."};
+
+// Maximum number of elements to drain from an iterator when computing lengths
+// for error messages. Prevents hanging on infinite iterators.
+constexpr int kMaxDrainCount = 10;
+
+// Sentinel value returned by DrainIterator when kMaxDrainCount is exceeded.
+constexpr int kDrainLimitExceeded = -1;
+
+// Drains remaining elements from an iterator and returns the count.
+// Stops after kMaxDrainCount to handle infinite iterators.
+// Returns kDrainLimitExceeded if kMaxDrainCount is exceeded.
+int DrainIterator(nb::object& it) {
+  int count = 0;
+  while (auto elem = nb::steal<nb::object>(PyIter_Next(it.ptr()))) {
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+      break;
+    }
+    ++count;
+    if (count >= kMaxDrainCount) {
+      return kDrainLimitExceeded;
+    }
+  }
+  if (PyErr_Occurred()) PyErr_Clear();
+  return count;
+}
+
+// Helper to format a safe_zip length mismatch error and set PyErr.
+// Drains all remaining iterators to compute true lengths.
+// n: number of fully completed tuples before the error
+// mismatch_idx: index of the mismatched iterator (0-indexed internally)
+// arg_is_longer: true if mismatch_idx is longer than arg1, false if shorter
+void SetSafeZipLengthError(absl::InlinedVector<nb::object, 4>& iterators,
+                           size_t n, size_t mismatch_idx, bool arg_is_longer) {
+  absl::InlinedVector<std::string, 4> lengths(iterators.size());
+  absl::InlinedVector<size_t, 4> capped_args;
+  for (size_t j = 0; j < iterators.size(); ++j) {
+    // Compute how many elements were consumed from this iterator.
+    // If arg_is_longer: arg0 exhausted, only mismatch_idx had one more fetched.
+    // If !arg_is_longer: mismatch_idx exhausted early, iterators before it had
+    // one more fetched.
+    size_t consumed = arg_is_longer ? (j == mismatch_idx ? n + 1 : n)
+                                    : (j < mismatch_idx ? n + 1 : n);
+    int remaining = DrainIterator(iterators[j]);
+    if (remaining == kDrainLimitExceeded) {
+      lengths[j] = absl::StrCat(consumed + kMaxDrainCount, "+");
+      capped_args.push_back(j);  // 0-indexed for user display
+    } else {
+      lengths[j] = absl::StrCat(consumed + remaining);
+    }
+  }
+  std::string msg = absl::StrFormat(
+      "safe_zip() argument %zu has length %s but argument 0 has length %s. "
+      "All lengths: (%s)",
+      mismatch_idx, lengths[mismatch_idx], lengths[0],
+      absl::StrJoin(lengths, ", "));
+  if (!capped_args.empty()) {
+    absl::StrAppend(&msg, " (Note: length capped for argument(s) ",
+                    absl::StrJoin(capped_args, ", "), ")");
+  }
+  PyErr_SetString(PyExc_ValueError, msg.c_str());
+}
+
 // A variant of zip(...) that:
 // a) returns a list instead of an iterator, and
 // b) checks that the input iterables are of equal length.
@@ -169,9 +320,8 @@ PyObject* SafeZip(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
         v = nb::steal<nb::object>(PyIter_Next(iterators[i].ptr()));
         if (PyErr_Occurred()) return nullptr;
         if (!v.ptr()) {
-          PyErr_Format(PyExc_ValueError,
-                       "safe_zip() argument %u is shorter than argument 1",
-                       i + 1);
+          // Arg i+1 is shorter than arg 1.
+          SetSafeZipLengthError(iterators, n, i, /*arg_is_longer=*/false);
           return nullptr;
         }
         PyTuple_SET_ITEM(tuple.ptr(), i, v.release().ptr());
@@ -183,9 +333,8 @@ PyObject* SafeZip(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
         v = nb::steal<nb::object>(PyIter_Next(iterators[i].ptr()));
         if (PyErr_Occurred()) return nullptr;
         if (v.ptr()) {
-          PyErr_Format(PyExc_ValueError,
-                       "safe_zip() argument %u is longer than argument 1",
-                       i + 1);
+          // Arg i+1 is longer than arg 1.
+          SetSafeZipLengthError(iterators, n, i, /*arg_is_longer=*/true);
           return nullptr;
         }
       }
@@ -217,12 +366,124 @@ PyMethodDef safe_zip_def = {
     METH_FASTCALL,
 };
 
+nb::list TopologicalSort(nb::str parents_attr,
+                         nb::iterable end_nodes_iterable) {
+  // This is a direct conversion of the original Python implementation.
+  // More efficient implementations of a topological sort are possible (and
+  // indeed, easier to write), but changing the choice of topological order
+  // would break existing tests.
+  std::vector<nb::object> end_nodes;
+  absl::flat_hash_set<PyObject*> seen;
+  for (nb::handle n : end_nodes_iterable) {
+    nb::object node = nb::borrow(n);
+    if (seen.insert(node.ptr()).second) {
+      end_nodes.push_back(node);
+    }
+  }
+
+  nb::list sorted_nodes;
+  if (end_nodes.empty()) {
+    return sorted_nodes;
+  }
+
+  std::vector<nb::object> stack = end_nodes;
+  absl::flat_hash_map<PyObject*, int> child_counts;
+  while (!stack.empty()) {
+    nb::object node = std::move(stack.back());
+    stack.pop_back();
+    auto& count = child_counts[node.ptr()];
+    if (count == 0) {
+      for (nb::handle parent : node.attr(parents_attr)) {
+        stack.push_back(nb::borrow(parent));
+      }
+    }
+    ++count;
+  }
+
+  for (nb::handle n : end_nodes) {
+    child_counts[n.ptr()] -= 1;
+  }
+
+  std::vector<nb::object> childless_nodes;
+  childless_nodes.reserve(end_nodes.size());
+  for (nb::handle n : end_nodes) {
+    if (child_counts[n.ptr()] == 0) {
+      childless_nodes.push_back(nb::borrow(n));
+    }
+  }
+
+  while (!childless_nodes.empty()) {
+    nb::object node = std::move(childless_nodes.back());
+    childless_nodes.pop_back();
+    sorted_nodes.append(node);
+    for (nb::handle parent : node.attr(parents_attr)) {
+      auto& count = child_counts[parent.ptr()];
+      if (count == 1) {
+        childless_nodes.push_back(nb::borrow(parent));
+      } else {
+        --count;
+      }
+    }
+  }
+  sorted_nodes.reverse();
+  return sorted_nodes;
+}
+
+void InstallFailureSignalHandler(bool call_previous_handler) {
+#ifndef PLATFORM_GOOGLE
+  absl::FailureSignalHandlerOptions options;
+  options.call_previous_handler = call_previous_handler;
+  absl::InstallFailureSignalHandler(options);
+#endif  // PLATFORM_GOOGLE
+}
+
+void SetMinLogLevel(int severity) {
+  absl::SetMinLogLevel(static_cast<absl::LogSeverityAtLeast>(severity));
+}
+
+void SetStderrThreshold(int severity) {
+  absl::SetStderrThreshold(static_cast<absl::LogSeverityAtLeast>(severity));
+}
+
 }  // namespace
 
 NB_MODULE(utils, m) {
   nb::object module_name = m.attr("__name__");
   m.attr("safe_map") = nb::steal<nb::object>(
       PyCFunction_NewEx(&safe_map_def, /*self=*/nullptr, module_name.ptr()));
+  m.attr("foreach") = nb::steal<nb::object>(
+      PyCFunction_NewEx(&foreach_def, /*self=*/nullptr, module_name.ptr()));
   m.attr("safe_zip") = nb::steal<nb::object>(
       PyCFunction_NewEx(&safe_zip_def, /*self=*/nullptr, module_name.ptr()));
+
+  m.def("topological_sort", &TopologicalSort, nb::arg("parents_attr"),
+        nb::arg("end_nodes"),
+        "Computes a topological sort of a graph of objects. parents_attr is "
+        "the name of the attribute on each object that contains the list of "
+        "parent objects. end_nodes is an iterable of objects from which we "
+        "should start a backwards search.");
+
+  // Abseil C++ logging functions.
+  m.def("absl_set_min_log_level", &SetMinLogLevel);
+  m.def("absl_set_vlog_level", &absl::SetVLogLevel);
+  m.def("absl_set_global_vlog_level", &absl::SetGlobalVLogLevel);
+  m.def("absl_set_stderr_threshold", &SetStderrThreshold);
+
+  // Python has no reader-writer lock in its standard library, so we expose
+  // bindings around absl::Mutex.
+  nb::class_<absl::Mutex>(m, "Mutex")
+      .def(nb::init<>())
+      .def("lock", &absl::Mutex::Lock, nb::call_guard<nb::gil_scoped_release>())
+      .def("unlock", &absl::Mutex::Unlock)
+      .def("assert_held", &absl::Mutex::AssertHeld)
+      .def("reader_lock", &absl::Mutex::ReaderLock,
+           nb::call_guard<nb::gil_scoped_release>())
+      .def("reader_unlock", &absl::Mutex::ReaderUnlock)
+      .def("assert_reader_held", &absl::Mutex::AssertReaderHeld)
+      .def("writer_lock", &absl::Mutex::WriterLock,
+           nb::call_guard<nb::gil_scoped_release>())
+      .def("writer_unlock", &absl::Mutex::WriterUnlock);
+
+  m.def("install_failure_signal_handler", &InstallFailureSignalHandler,
+        nb::arg("call_previous_handler") = true);
 }

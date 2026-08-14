@@ -27,7 +27,6 @@ from absl.testing import parameterized
 import numpy as np
 
 import jax
-import jax.ops
 from jax import lax
 from jax import numpy as jnp
 
@@ -126,6 +125,8 @@ JAX_ONE_TO_ONE_OP_RECORDS = [
     op_record("negative", 1, number_dtypes, all_shapes, jtu.rand_default, ["rev"]),
     op_record("nextafter", 2, [f for f in float_dtypes if f != jnp.bfloat16],
               all_shapes, jtu.rand_default, ["rev"], inexact=True, tolerance=0),
+    op_record("spacing", 1, float_dtypes, all_shapes, jtu.rand_default, ["rev"],
+              inexact=True, tolerance=0),
     op_record("not_equal", 2, all_dtypes, all_shapes, jtu.rand_some_equal, ["rev"]),
     op_record("array_equal", 2, number_dtypes, all_shapes, jtu.rand_some_equal, ["rev"]),
     op_record("array_equiv", 2, number_dtypes, all_shapes, jtu.rand_some_equal, ["rev"]),
@@ -211,9 +212,6 @@ JAX_COMPOUND_OP_RECORDS = [
               test_name="expm1_large", tolerance={np.float64: 1e-8}, inexact=True),
     op_record("expm1", 1, number_dtypes, all_shapes, jtu.rand_small_positive,
               [], tolerance={np.float64: 1e-8}, inexact=True),
-    op_record("fix", 1, float_dtypes, all_shapes, jtu.rand_default, []),
-    op_record("fix", 1, int_dtypes + unsigned_dtypes, all_shapes,
-              jtu.rand_default, [], check_dtypes=False),
     op_record("floor_divide", 2, default_dtypes + unsigned_dtypes,
               all_shapes, jtu.rand_nonzero, ["rev"]),
     op_record("fmin", 2, number_dtypes, all_shapes, jtu.rand_some_nan, []),
@@ -252,7 +250,7 @@ JAX_COMPOUND_OP_RECORDS = [
     op_record("polyval", 2,
               [d for d in number_dtypes if d not in (np.int8, np.uint8)],
               nonempty_nonscalar_array_shapes,
-              jtu.rand_default, [], check_dtypes=False,
+              jtu.rand_default, [], check_dtypes=True,
               tolerance={dtypes.bfloat16: 4e-2, np.float16: 2e-2,
                          np.float64: 1e-12}),
     op_record("positive", 1, number_dtypes, all_shapes, jtu.rand_default, ["rev"]),
@@ -273,9 +271,8 @@ JAX_COMPOUND_OP_RECORDS = [
               []),
     op_record("rint", 1, int_dtypes + unsigned_dtypes, all_shapes,
               jtu.rand_default, [], check_dtypes=False),
-    # numpy < 2.0.0 has a different convention for complex sign.
-    op_record("sign", 1, real_dtypes if jtu.numpy_version() < (2, 0, 0) else number_dtypes,
-              all_shapes, jtu.rand_some_inf_and_nan, []),
+    op_record("sign", 1, number_dtypes, all_shapes, jtu.rand_some_inf_and_nan,
+              []),
     # numpy 1.16 has trouble mixing uint and bfloat16, so we test these separately.
     op_record("copysign", 2, default_dtypes + unsigned_dtypes,
               all_shapes, jtu.rand_some_inf_and_nan, [], check_dtypes=False),
@@ -323,11 +320,8 @@ JAX_BITWISE_OP_RECORDS = [
               jtu.rand_fullrange, []),
     op_record("bitwise_xor", 2, int_dtypes + unsigned_dtypes, all_shapes,
               jtu.rand_fullrange, []),
+    op_record("bitwise_count", 1, int_dtypes, all_shapes, jtu.rand_fullrange, []),
 ]
-if hasattr(np, "bitwise_count"):
-  # Numpy versions after 1.26
-  JAX_BITWISE_OP_RECORDS.append(
-    op_record("bitwise_count", 1, int_dtypes, all_shapes, jtu.rand_fullrange, []))
 
 JAX_OPERATOR_OVERLOADS = [
     op_record("__add__", 2, number_dtypes, all_shapes, jtu.rand_default, []),
@@ -423,6 +417,17 @@ def _shapes_are_equal_length(shapes):
   return all(len(shape) == len(shapes[0]) for shape in shapes[1:])
 
 
+def _get_testcase_name(index, params):
+  dtypes = "_".join(str(dt.__name__) for dt in  params['dtypes'])
+  name = params['op_name'] if "op_name" in params else params["name"]
+  return f"{index}_{name}_{dtypes}"
+
+
+def _create_named_parameters(iter_params):
+  for i, params in enumerate(iter_params):
+    yield dict(params, **{'testcase_name': _get_testcase_name(i, params)})
+
+
 class JaxNumpyOperatorTests(jtu.JaxTestCase):
   """Tests for LAX-backed Numpy operators."""
 
@@ -436,7 +441,7 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
               for a in out]
     return f
 
-  @parameterized.parameters(itertools.chain.from_iterable(
+  @parameterized.named_parameters(_create_named_parameters(itertools.chain.from_iterable(
     jtu.sample_product_testcases(
       [dict(op_name=rec.name, rng_factory=rec.rng_factory,
             check_dtypes=rec.check_dtypes, tolerance=rec.tolerance,
@@ -449,7 +454,7 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
           *(_valid_dtypes_for_shape(s, rec.dtypes) for s in shapes))],
     )
     for rec in itertools.chain(JAX_ONE_TO_ONE_OP_RECORDS,
-                               JAX_COMPOUND_OP_RECORDS)))
+                              JAX_COMPOUND_OP_RECORDS))))
   @jax.numpy_rank_promotion('allow')  # This test explicitly exercises implicit rank promotion.
   def testOp(self, op_name, rng_factory, shapes, dtypes, check_dtypes,
              tolerance, inexact, kwargs, alias):
@@ -467,7 +472,7 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
         "arccosh", "arcsinh", "sinh", "cosh", "tanh", "sin", "cos", "tan",
         "log", "log1p", "log2", "log10", "exp", "expm1", "exp2", "pow",
         "power", "logaddexp", "logaddexp2", "i0", "acosh", "asinh"):
-      tol = jtu.join_tolerance(tol, 1e-4)
+      tol = jtu.join_tolerance(tol, 2e-4)
     tol = functools.reduce(jtu.join_tolerance,
                            [tolerance, tol, jtu.default_tolerance()])
 
@@ -477,7 +482,7 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
       self._CompileAndCheck(jnp_op, args_maker, check_dtypes=check_dtypes,
                             atol=tol, rtol=tol)
 
-  @parameterized.parameters(itertools.chain.from_iterable(
+  @parameterized.named_parameters(_create_named_parameters(itertools.chain.from_iterable(
     jtu.sample_product_testcases(
       [dict(name=rec.name, rng_factory=rec.rng_factory, tol=rec.tolerance)],
       [dict(shapes=shapes, dtypes=dtypes)
@@ -487,7 +492,7 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
         for dtypes in itertools.product(
           *(_valid_dtypes_for_shape(s, rec.dtypes) for s in shapes))],
     )
-    for rec in JAX_OPERATOR_OVERLOADS))
+    for rec in JAX_OPERATOR_OVERLOADS)))
   @jax.numpy_rank_promotion('allow')  # This test explicitly exercises implicit rank promotion.
   def testOperatorOverload(self, name, rng_factory, shapes, dtypes, tol):
     rng = rng_factory(self.rng())
@@ -498,7 +503,7 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
     with jtu.strict_promotion_if_dtypes_match(dtypes):
       self._CompileAndCheck(fun, args_maker, atol=tol, rtol=tol)
 
-  @parameterized.parameters(itertools.chain.from_iterable(
+  @parameterized.named_parameters(_create_named_parameters(itertools.chain.from_iterable(
     jtu.sample_product_testcases(
       [dict(name=rec.name, rng_factory=rec.rng_factory,
             op_tolerance=rec.tolerance)],
@@ -509,7 +514,7 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
         for dtypes in itertools.product(
           *(_valid_dtypes_for_shape(s, rec.dtypes) for s in shapes))],
     )
-    for rec in JAX_RIGHT_OPERATOR_OVERLOADS))
+    for rec in JAX_RIGHT_OPERATOR_OVERLOADS)))
   @jax.numpy_rank_promotion('allow')  # This test explicitly exercises implicit rank promotion.
   def testRightOperatorOverload(self, name, rng_factory, shapes, dtypes,
                                 op_tolerance):
@@ -532,10 +537,9 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
     data = [(1, 2), (2, 3)]
     arr = jnp.array(data)
     other = othertype(data)
-
-    msg = f"unsupported operand type.* 'ArrayImpl' and '{othertype.__name__}'"
-    with self.assertRaisesRegex(TypeError, msg):
-      getattr(arr, name)(other)
+    op = getattr(operator, name.strip('_'))
+    with self.assertRaisesRegex(TypeError, f".* '.*ArrayImpl' and '{othertype.__name__}'"):
+      op(arr, other)
 
   @jtu.sample_product(
     name=[rec.name for rec in JAX_RIGHT_OPERATOR_OVERLOADS if rec.nargs == 2],
@@ -547,14 +551,13 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
     data = [(1, 2), (2, 3)]
     arr = jnp.array(data)
     other = othertype(data)
-
-    msg = f"unsupported operand type.* '{othertype.__name__}' and 'ArrayImpl'"
-    with self.assertRaisesRegex(TypeError, msg):
-      getattr(arr, name)(other)
+    op = getattr(operator, name.strip('_').removeprefix('r'))
+    with self.assertRaisesRegex(TypeError, f".* '{othertype.__name__}' and '.*ArrayImpl'"):
+      op(other, arr)
 
   @jtu.sample_product(
     [dict(op_name=rec.name, rng_factory=rec.rng_factory, dtype=dtype)
-     for rec in JAX_OPERATOR_OVERLOADS if rec.nargs == 2
+     for rec in JAX_OPERATOR_OVERLOADS if rec.nargs == 2 and rec.name not in ["__eq__", "__ne__"]
      for dtype in rec.dtypes],
   )
   def testBinaryOperatorDefers(self, op_name, rng_factory, dtype):
@@ -579,7 +582,7 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
       with self.assertRaises(TypeError):
         op(arg, other)
 
-  @parameterized.parameters(itertools.chain.from_iterable(
+  @parameterized.named_parameters(_create_named_parameters(itertools.chain.from_iterable(
     jtu.sample_product_testcases(
       [dict(name=rec.name, rng_factory=rec.rng_factory, alias=rec.alias)],
       shapes=filter(
@@ -589,7 +592,7 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
         _dtypes_are_compatible_for_bitwise_ops,
         itertools.combinations_with_replacement(rec.dtypes, rec.nargs)),
     )
-    for rec in JAX_BITWISE_OP_RECORDS))
+    for rec in JAX_BITWISE_OP_RECORDS)))
   @jax.numpy_rank_promotion('allow')  # This test explicitly exercises implicit rank promotion.
   def testBitwiseOp(self, name, rng_factory, shapes, dtypes, alias):
     np_op = getattr(np, name) if hasattr(np, name) else getattr(np, alias)
@@ -605,14 +608,9 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
     dtype=int_dtypes + unsigned_dtypes,
   )
   def testBitwiseCount(self, shape, dtype):
-    # np.bitwise_count added after numpy 1.26, but
-    # np_scalar.bit_count() is available before that.
-    np_fun = getattr(
-      np, "bitwise_count",
-      np.vectorize(lambda x: np.ravel(x)[0].bit_count(), otypes=['uint8']))
     rng = jtu.rand_fullrange(self.rng())
     args_maker = lambda: [rng(shape, dtype)]
-    self._CheckAgainstNumpy(np_fun, jnp.bitwise_count, args_maker)
+    self._CheckAgainstNumpy(np.bitwise_count, jnp.bitwise_count, args_maker)
     self._CompileAndCheck(jnp.bitwise_count, args_maker)
 
   @jtu.sample_product(
@@ -642,7 +640,6 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
     # NumPy requires shifts to be non-negative and below the bit width:
     shift_rng = jtu.rand_int(self.rng(), high=max(info.bits, shift_info.bits))
     args_maker = lambda: (x_rng(shapes[0], dtype), shift_rng(shapes[1], shift_dtype))
-
     np_op = getattr(np, op.__name__)
 
     with jtu.strict_promotion_if_dtypes_match(dtypes):
@@ -656,10 +653,7 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
   )
   def testSignComplex(self, shape, dtype):
     rng = jtu.rand_default(self.rng())
-    if jtu.numpy_version() >= (2, 0, 0):
-      np_fun = np.sign
-    else:
-      np_fun = lambda x: (x / np.where(x == 0, 1, abs(x))).astype(np.result_type(x))
+    np_fun = np.sign
     jnp_fun = jnp.sign
     args_maker = lambda: [rng(shape, dtype)]
     self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker)
@@ -680,9 +674,100 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
     self.assertIsInstance(jax.jit(operator.mul)(b, a), MyArray)
 
   def testI0Grad(self):
-    # Regression test for https://github.com/google/jax/issues/11479
+    # Regression test for https://github.com/jax-ml/jax/issues/11479
     dx = jax.grad(jax.numpy.i0)(0.0)
     self.assertArraysEqual(dx, 0.0)
+
+  @jtu.sample_product(
+      shape=all_shapes,
+      dtype=default_dtypes,
+  )
+  def testSpacingIntegerInputs(self, shape, dtype):
+    rng = jtu.rand_int(self.rng(), low=-64, high=64)
+    args_maker = lambda: [rng(shape, dtype)]
+    computation_dtype = jnp.spacing(rng(shape, dtype)).dtype
+    np_func = lambda x: np.spacing(np.array(x).astype(computation_dtype))
+    self._CheckAgainstNumpy(np_func, jnp.spacing, args_maker, check_dtypes=True, tol=0)
+    self._CompileAndCheck(jnp.spacing, args_maker, tol=0)
+
+  @jtu.sample_product(dtype=float_dtypes)
+  @jtu.skip_on_devices("tpu")
+  def testSpacingSubnormals(self, dtype):
+    zero = np.array(0, dtype=dtype)
+    inf = np.array(np.inf, dtype=dtype)
+    x = [zero]
+    for i in range(5):
+      x.append(np.nextafter(x[-1], -inf))  # negative denormals
+    x = x[::-1]
+    for i in range(5):
+      x.append(np.nextafter(x[-1], inf))  # positive denormals
+    x = np.array(x, dtype=dtype)
+    args_maker = lambda: [x]
+    self._CheckAgainstNumpy(np.spacing, jnp.spacing, args_maker, check_dtypes=True, tol=0)
+    self._CompileAndCheck(jnp.spacing, args_maker, tol=0)
+
+  @jtu.sample_product(dtype=float_dtypes)
+  @jtu.ignore_warning(category=RuntimeWarning, message="divide by zero*")
+  @jtu.ignore_warning(category=RuntimeWarning, message="invalid value*")
+  def test_float_divmod_zero(self, dtype):
+    # Regression test for https://github.com/jax-ml/jax/issues/37752
+    args_maker = lambda: [np.arange(-2, 3, dtype=dtype), np.zeros(5, dtype=dtype)]
+    self._CheckAgainstNumpy(np.divmod, jnp.divmod, args_maker)
+    self._CompileAndCheck(jnp.divmod, args_maker)
+
+  @jtu.sample_product(dtype=float_dtypes)
+  @jtu.ignore_warning(category=RuntimeWarning, message="divide by zero*")
+  @jtu.ignore_warning(category=RuntimeWarning, message="invalid value*")
+  def test_float_floor_divide_zero(self, dtype):
+    # Regression test for https://github.com/jax-ml/jax/issues/37752
+    args_maker = lambda: [np.arange(-2, 3, dtype=dtype), np.zeros(5, dtype=dtype)]
+    self._CheckAgainstNumpy(np.floor_divide, jnp.floor_divide, args_maker)
+    self._CompileAndCheck(jnp.floor_divide, args_maker)
+
+  @jtu.sample_product(dtype=float_dtypes)
+  def test_heaviside_nan(self, dtype):
+    # Regression test for https://github.com/jax-ml/jax/issues/38105
+    x = np.array([np.nan, -np.inf, -1, 0, 1, np.inf], dtype=dtype)
+    args_maker = lambda: [x[:, None], x[None, :]]
+    self._CheckAgainstNumpy(np.heaviside, jnp.heaviside, args_maker)
+    self._CompileAndCheck(jnp.heaviside, args_maker)
+
+  @jtu.sample_product(dtype=[
+      dtypes.bfloat16,
+      dtypes.float8_e4m3b11fnuz,
+      dtypes.float8_e4m3fn,
+      dtypes.float8_e4m3fnuz,
+      dtypes.float8_e5m2,
+      dtypes.float8_e5m2fnuz,
+      dtypes.float8_e3m4,
+      dtypes.float8_e4m3,
+      dtypes.float8_e8m0fnu,
+      dtypes.float4_e2m1fn,
+  ])
+  def testIsinfNonstandardDtypes(self, dtype):
+    # Regression test for https://github.com/jax-ml/ml_dtypes/issues/381
+    info = dtypes.finfo(dtype)
+
+    # By convention, "fn" in the dtype name means "finite", i.e. inf not representable.
+    lacks_inf = "fn" in dtype.__name__
+
+    # When inf is not representable, it will be converted to min, max or NaN.
+    values = [jnp.nan, info.min, 0, info.max, -jnp.inf, jnp.inf]
+    arr = jnp.array(values, dtype=dtype)
+
+    if lacks_inf:
+      expected_inf = expected_neginf = expected_posinf = np.array([False] * len(values))
+    else:
+      expected_inf = np.isinf(values)
+      expected_neginf = np.isneginf(values)
+      expected_posinf = np.isposinf(values)
+
+    self.assertArraysEqual(jnp.isinf(arr), expected_inf,
+                           err_msg=f"isinf check failed for {dtype}")
+    self.assertArraysEqual(jnp.isposinf(arr), expected_posinf,
+                           err_msg=f"isposinf check failed for {dtype}")
+    self.assertArraysEqual(jnp.isneginf(arr), expected_neginf,
+                           err_msg=f"isneginf check failed for {dtype}")
 
 
 if __name__ == "__main__":

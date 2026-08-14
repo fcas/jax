@@ -12,20 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
+import functools
+import mmap
 import unittest
+import warnings
+import weakref
 
 from absl.testing import absltest
-
 import jax
+from jax._src import config
+from jax._src import dlpack as dlpack_src
+from jax._src import test_util as jtu
+from jax._src.util import cache
 import jax.dlpack
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
-from jax._src import config
-from jax._src import test_util as jtu
-
 import numpy as np
 
-numpy_version = jtu.numpy_version()
+
+def alloc_and_map(c_type, np_dtype, size):
+  device = jax.devices("tpu")[0]
+  client = device.client
+
+  element_size = ctypes.sizeof(c_type)
+  requested_bytes = size * element_size
+  size_bytes = ((requested_bytes + 4095) // 4096) * 4096
+
+  buf = mmap.mmap(-1, size_bytes)
+
+  char_arr = (ctypes.c_char * size_bytes).from_buffer(buf)
+  addr = ctypes.addressof(char_arr)
+
+  client.dma_map(addr, size_bytes)
+
+  weakref.finalize(buf, client.dma_unmap, addr)
+
+  return np.frombuffer(buf, dtype=np_dtype, count=size)
+
 
 config.parse_flags_with_absl()
 
@@ -35,25 +59,43 @@ except ImportError:
   cupy = None
 
 try:
-  import tensorflow as tf
+  # TODO(b/470156950): Remove this once a proper fix is in place
+  with warnings.catch_warnings():
+    warnings.filterwarnings("ignore",
+                            category=FutureWarning,
+                            message=".*np.object.*")
+    import tensorflow as tf
+
   tf_version = tuple(
     int(x) for x in tf.version.VERSION.split("-")[0].split("."))
 except ImportError:
   tf = None
 
 
-dlpack_dtypes = sorted(jax.dlpack.SUPPORTED_DTYPES, key=lambda x: x.__name__)
+dlpack_dtypes = sorted([dt.type for dt in  dlpack_src.SUPPORTED_DTYPES_SET],
+                       key=lambda x: x.__name__)
 
-numpy_dtypes = sorted(
-    [dt for dt in jax.dlpack.SUPPORTED_DTYPES if dt != jnp.bfloat16],
-    key=lambda x: x.__name__)
+# These dtypes are not supported by neither NumPy nor TensorFlow, therefore
+# we list them separately from ``jax.dlpack.SUPPORTED_DTYPES``.
+extra_dlpack_dtypes = [
+    jnp.float8_e4m3b11fnuz,
+    jnp.float8_e4m3fn,
+    jnp.float8_e4m3fnuz,
+    jnp.float8_e5m2,
+    jnp.float8_e5m2fnuz,
+] + [
+    dtype
+    for name in [
+        "float4_e2m1fn",
+        "float8_e3m4",
+        "float8_e4m3",
+        "float8_e8m0fnu",
+    ]
+    if (dtype := getattr(jnp, name, None))
+]
 
-# NumPy didn't support bool as a dlpack type until 1.25.
-if jtu.numpy_version() < (1, 25, 0):
-  numpy_dtypes = [dt for dt in numpy_dtypes if dt != jnp.bool_]
-
+numpy_dtypes = [dt for dt in dlpack_dtypes if dt != jnp.bfloat16]
 cuda_array_interface_dtypes = [dt for dt in dlpack_dtypes if dt != jnp.bfloat16]
-
 nonempty_nonscalar_array_shapes = [(4,), (3, 4), (2, 3, 4)]
 empty_array_shapes = []
 empty_array_shapes += [(0,), (0, 4), (3, 0),]
@@ -62,73 +104,139 @@ nonempty_nonscalar_array_shapes += [(3, 1), (1, 4), (2, 1, 4)]
 nonempty_array_shapes = [()] + nonempty_nonscalar_array_shapes
 all_shapes = nonempty_array_shapes + empty_array_shapes
 
+
+def _get_alignment(x: int):
+  """Return alignment of x.
+  """
+  return x & ((~x) + 1)
+
+
+def _get_alignment_offset(ptr: int, alignment: int):
+  """Return minimal positive offset such that
+    _get_alignment(ptr + offset) == alignment
+
+  Note that 0 <= offset < 2 * alignment.
+  """
+  if _get_alignment(ptr) == alignment:
+    return 0
+  offset = alignment - (ptr & (alignment - 1))
+  if _get_alignment(ptr + offset) == alignment:
+    return offset
+  return offset + alignment
+
+
+def _ensure_alignment(arr, desired_alignment):
+  """Return a copy of numpy array such that its data pointer has the
+  desired alignment exactly. The desired alignment must be power of
+  two.
+  """
+  assert desired_alignment > 1, desired_alignment
+  buf = np.empty(2 * desired_alignment + arr.nbytes, dtype=np.int8)
+  ptr = buf.__array_interface__['data'][0]
+  start = _get_alignment_offset(ptr, desired_alignment)
+  # if arr.nbytes == 0 and start > 0 then buf[start:start+arr.nbytes]
+  # incorrectly returns the original buffer, so we must use
+  # buf[start:][:arr.nbytes]:
+  new = buf[start:][:arr.nbytes].view(arr.dtype).reshape(arr.shape)
+  np.copyto(new, arr, casting='unsafe')
+  new_ptr = new.__array_interface__['data'][0]
+  assert new_ptr & (desired_alignment - 1) == 0  # sanity check
+  assert new_ptr & (desired_alignment * 2 - 1) != 0  # sanity check
+  return new
+
+
+def test_ensure_alignment():
+
+  def reference(ptr, alignment):
+    start = 0
+    while _get_alignment(ptr + start) != alignment:
+      start += 1
+    return start
+
+  for alignment in [2, 4, 8, 16, 32, 64, 128]:
+    max_start = 1
+    for ptr in range(1000):
+      start = _get_alignment_offset(ptr, alignment)
+      expected = reference(ptr, alignment)
+      max_start = max(max_start, start)
+      assert start == expected
+    assert max_start == alignment * 2 - 1
+
+
+@cache()
+def _get_max_align_bits(dtype, device):
+  max_align_bits = 64
+  if device.platform == "cpu":
+    from jax._src.lib import _jax
+
+    # We determine the max_align_bits value from the error that is
+    # raised by dlpack_managed_tensor_to_buffer when using a buffer
+    # with a very small data alignment (=2).
+    x_np = _ensure_alignment(np.zeros(5, dtype=dtype), desired_alignment=2)
+    try:
+      _jax.dlpack_managed_tensor_to_buffer(x_np.__dlpack__(), device, None, False)
+      raise RuntimeError("unexpected success")
+    except Exception as e:
+      msg = str(e)
+      m = "is not aligned to"
+      if m in msg:
+        i = msg.index(m) + len(m)
+        max_align_bits = int(msg[i:].split(None, 1)[0])
+      else:
+        raise
+  return max_align_bits
+
+
 class DLPackTest(jtu.JaxTestCase):
   def setUp(self):
     super().setUp()
-    if not jtu.test_device_matches(["cpu", "gpu"]):
+    if not jtu.test_device_matches(["cpu", "gpu", "tpu"]):
       self.skipTest(f"DLPack not supported on {jtu.device_under_test()}")
 
   @jtu.sample_product(
-    shape=all_shapes,
-    dtype=dlpack_dtypes,
-    copy=[False, True, None],
-    use_stream=[False, True],
+      shape=all_shapes,
+      dtype=dlpack_dtypes + extra_dlpack_dtypes,
+      copy=[False, True, None],
+      use_stream=[False, True],
   )
   @jtu.run_on_devices("gpu")
   def testJaxRoundTrip(self, shape, dtype, copy, use_stream):
     rng = jtu.rand_default(self.rng())
     np = rng(shape, dtype)
 
-    def _check_copy(x: jax.Array, y: jax.Array, expect_copy):
-      copied = x.unsafe_buffer_pointer() != y.unsafe_buffer_pointer()
-      assert copied == expect_copy, f"Expected {'a' if expect_copy else 'no'} copy"
-
+    device_type = jtu.device_under_test()
     # Check if the source device is preserved
     x = jax.device_put(np, jax.devices("cpu")[0])
-    device = jax.devices("gpu")[0]
+    device = jax.devices(device_type)[0]
     y = jax.device_put(x, device)
-    dl_device = y.__dlpack_device__()
-    if use_stream:
-      stream = tuple(y.devices())[0].get_stream_for_external_ready_events()
-      dlpack = jax.dlpack.to_dlpack(y, copy=copy, stream=stream)
-    else:
-      dlpack = jax.dlpack.to_dlpack(y, copy=copy)
-    z = jax.dlpack.from_dlpack(dlpack)
+    # TODO(parkers): Remove after setting 'stream' properly below.
+    jax.block_until_ready(y)
+    z = jax.dlpack.from_dlpack(y)
 
     self.assertEqual(z.devices(), {device})
     self.assertAllClose(np.astype(x.dtype), z)
-    self.assertRaisesRegex(RuntimeError,
-                          "DLPack tensor may be consumed at most once",
-                          lambda: jax.dlpack.from_dlpack(dlpack))
-
-    if shape in nonempty_array_shapes:
-      _check_copy(y, z, bool(copy))
-
-    # Check if the destination device can be specified
-    make_dlpack = lambda: x.__dlpack__(dl_device=dl_device, copy=copy)
-    if copy == False:
-      self.assertRaisesRegex(ValueError, "copy=False", make_dlpack)
-      return
-
-    z = jax.dlpack.from_dlpack(make_dlpack())
-    self.assertEqual(z.devices(), {device})
-    self.assertAllClose(x, z)
-
-    if shape in nonempty_array_shapes:
-      _check_copy(x, z, True)
 
   @jtu.sample_product(
-    shape=all_shapes,
-    dtype=dlpack_dtypes,
-    gpu=[False, True],
+      shape=all_shapes,
+      dtype=dlpack_dtypes,
+      device_type=[None, "cpu", "gpu"],
   )
-  def testJaxArrayRoundTrip(self, shape, dtype, gpu):
+  def testJaxArrayRoundTrip(self, shape, dtype, device_type):
     rng = jtu.rand_default(self.rng())
     np = rng(shape, dtype)
-    if gpu and jax.default_backend() == "cpu":
-      raise unittest.SkipTest("Skipping GPU test case on CPU")
-    device = jax.devices("gpu" if gpu else "cpu")[0]
+    if device_type is None:
+      device = jax.devices()[0]
+    else:
+      if device_type == "gpu" and not jtu.test_device_matches(["gpu"]):
+        raise unittest.SkipTest("GPU not available")
+      if device_type == "tpu" and not jtu.test_device_matches(["tpu"]):
+        raise unittest.SkipTest("TPU not available")
+      device = jax.devices(device_type)[0]
     x = jax.device_put(np, device)
+    if device.platform == "tpu":
+      raise unittest.SkipTest("TPU device memory not supported for DLPack")
+    # TODO(parkers): Remove after setting 'stream' properly.
+    jax.block_until_ready(x)
     y = jax.dlpack.from_dlpack(x)
     self.assertEqual(y.devices(), {device})
     self.assertAllClose(np.astype(x.dtype), y)
@@ -137,10 +245,29 @@ class DLPackTest(jtu.JaxTestCase):
     self.assertEqual(z.devices(), {device})
     self.assertAllClose(np.astype(x.dtype), z)
 
-  @jtu.sample_product(
-    shape=all_shapes,
-    dtype=dlpack_dtypes,
-  )
+  @jtu.run_on_devices("gpu", "tpu")
+  def testJaxPinnedHostRoundTrip(self):
+    device = jax.devices()[0]
+    if device.platform not in ["gpu", "tpu"]:
+      raise unittest.SkipTest("Test requires GPU or TPU")
+    try:
+      sharding = jax.sharding.SingleDeviceSharding(
+          device, memory_kind="pinned_host"
+      )
+    except ValueError:
+      raise unittest.SkipTest("pinned_host memory kind not supported")
+
+    rng = jtu.rand_default(self.rng())
+    np_arr = rng((3, 4), jnp.float32)
+    x = jax.device_put(np_arr, sharding)
+    self.assertEqual(x.sharding.memory_kind, "pinned_host")
+
+    y = jax.dlpack.from_dlpack(x)
+    self.assertEqual(y.devices(), {device})
+    self.assertEqual(y.sharding.memory_kind, "pinned_host")
+    self.assertAllClose(np_arr, y)
+
+  @jtu.sample_product(shape=all_shapes, dtype=dlpack_dtypes)
   @unittest.skipIf(not tf, "Test requires TensorFlow")
   def testTensorFlowToJax(self, shape, dtype):
     if (not config.enable_x64.value and
@@ -157,14 +284,14 @@ class DLPackTest(jtu.JaxTestCase):
     np = rng(shape, dtype)
     with tf.device("/GPU:0" if jtu.test_device_matches(["gpu"]) else "/CPU:0"):
       x = tf.identity(tf.constant(np))
-    dlpack = tf.experimental.dlpack.to_dlpack(x)
-    y = jax.dlpack.from_dlpack(dlpack)
+    y = jax.dlpack.from_dlpack(x)
     self.assertAllClose(np, y)
 
   @jtu.sample_product(
-    shape=all_shapes,
-    dtype=dlpack_dtypes,
+      shape=all_shapes,
+      dtype=dlpack_dtypes,
   )
+  @jtu.run_on_devices("cpu", "gpu")
   @unittest.skipIf(not tf, "Test requires TensorFlow")
   def testJaxToTensorFlow(self, shape, dtype):
     if (not config.enable_x64.value and
@@ -176,76 +303,134 @@ class DLPackTest(jtu.JaxTestCase):
     rng = jtu.rand_default(self.rng())
     np = rng(shape, dtype)
     x = jnp.array(np)
+    # TODO(parkers): Remove after setting 'stream' properly.
+    jax.block_until_ready(x)
     # TODO(b/171320191): this line works around a missing context initialization
     # bug in TensorFlow.
     _ = tf.add(1, 1)
-    dlpack = jax.dlpack.to_dlpack(x)
-    y = tf.experimental.dlpack.from_dlpack(dlpack)
+    y = tf.experimental.dlpack.from_dlpack(x.__dlpack__())
     self.assertAllClose(np, y.numpy())
 
   @unittest.skipIf(not tf, "Test requires TensorFlow")
   def testTensorFlowToJaxInt64(self):
-    # See https://github.com/google/jax/issues/11895
-    x = jax.dlpack.from_dlpack(
-        tf.experimental.dlpack.to_dlpack(tf.ones((2, 3), tf.int64)))
+    # See https://github.com/jax-ml/jax/issues/11895
+    x = jax.dlpack.from_dlpack(tf.ones((2, 3), tf.int64))
     dtype_expected = jnp.int64 if config.enable_x64.value else jnp.int32
     self.assertEqual(x.dtype, dtype_expected)
+
+  @unittest.skipIf(not tf, "Test requires TensorFlow")
+  def testTensorFlowToJaxNondefaultLayout(self):
+    x = tf.transpose(np.arange(4).reshape(2, 2))
+    self.assertAllClose(x.numpy(), jax.dlpack.from_dlpack(x))
 
   @jtu.sample_product(
     shape=all_shapes,
     dtype=numpy_dtypes,
-    copy=[False, True],
+    copy=[False, True, None],
+    aligned=[False, True],
   )
-  def testNumpyToJax(self, shape, dtype, copy):
+  def testNumpyToJax(self, shape, dtype, copy, aligned):
     rng = jtu.rand_default(self.rng())
     x_np = rng(shape, dtype)
     device = jax.devices()[0]
+
+    alignment = _get_max_align_bits(dtype, device) if aligned else 2
+    x_np = _ensure_alignment(x_np, desired_alignment=alignment)
+
     _from_dlpack = lambda: jnp.from_dlpack(x_np, device=device, copy=copy)
-    if jax.default_backend() == 'gpu' and not copy:
+    if copy is not None and not copy and (jax.default_backend() != "cpu"
+                                          or not aligned):
       self.assertRaisesRegex(
-        ValueError,
-        r"Specified .* which requires a copy",
-        _from_dlpack
+          ValueError, "Specified .* which requires a copy", _from_dlpack
       )
     else:
       self.assertAllClose(x_np, _from_dlpack())
 
-  @jtu.sample_product(
-    shape=all_shapes,
-    dtype=numpy_dtypes,
-  )
-  @unittest.skipIf(numpy_version < (1, 23, 0), "Requires numpy 1.23 or newer")
-  @jtu.run_on_devices("cpu") # NumPy only accepts cpu DLPacks
+  def testNumpyToJaxNondefaultLayout(self):
+    x = np.arange(4).reshape(2, 2).T
+    self.assertAllClose(x, jax.dlpack.from_dlpack(x))
+
+  @jtu.sample_product(shape=all_shapes, dtype=numpy_dtypes)
+  @jtu.run_on_devices("cpu")  # NumPy only accepts cpu DLPacks
   def testJaxToNumpy(self, shape, dtype):
     rng = jtu.rand_default(self.rng())
     x_jax = jnp.array(rng(shape, dtype))
     x_np = np.from_dlpack(x_jax)
     self.assertAllClose(x_np, x_jax)
 
-  def testNondefaultLayout(self):
-    # Generate numpy array with nonstandard layout
-    a = np.arange(4).reshape(2, 2)
-    b = a.T
-    with self.assertRaisesRegex(
-        RuntimeError,
-        r"from_dlpack got array with non-default layout with minor-to-major "
-        r"dimensions \(0,1\), expected \(1,0\)"):
-      b_jax = jax.dlpack.from_dlpack(b.__dlpack__())
+  @jtu.run_on_devices("tpu")
+  def testTpuHostBufferDmaMap(self):
+    from jax._src.typing import DLDeviceType
+
+    device = jax.devices("tpu")[0]
+
+    try:
+      np_array = alloc_and_map(ctypes.c_uint32, np.uint32, 1024)
+    except RuntimeError as e:
+      self.skipTest(str(e))
+
+    np_array[:] = 0
+
+    class DLPackWrapper:
+
+      def __init__(self, arr, device_type, device_id=0):
+        self.arr = arr
+        self.device_type = device_type
+        self.device_id = device_id
+
+      def __dlpack_device__(self):
+        return (self.device_type, self.device_id)
+
+      def __dlpack__(self, stream=None):
+        return self.arr.__dlpack__(stream=stream)
+
+    dev_id = device.local_hardware_id
+    if dev_id is None:
+      dev_id = 0
+
+    wrapper = DLPackWrapper(np_array, DLDeviceType.kDLTPUHost, dev_id)
+
+    jax_arr = jax.dlpack.from_dlpack(wrapper, device=device, copy=False)
+    jax.block_until_ready(jax_arr)
+
+    self.assertEqual(jax_arr.device, device)
+    self.assertEqual(jax_arr.sharding.memory_kind, "pinned_host")
+
+    # Fill data *after* import to verify zero-copy
+    np_array[:] = np.arange(1024, dtype=np.uint32)
+
+    host_sharding = jax.sharding.SingleDeviceSharding(
+        device, memory_kind="pinned_host"
+    )
+    device_sharding = jax.sharding.SingleDeviceSharding(
+        device, memory_kind="device"
+    )
+
+    @functools.partial(
+        jax.jit, in_shardings=host_sharding, out_shardings=device_sharding
+    )
+    def add_one(x):
+      return jax.device_put(x, device_sharding) + 1
+
+    result = add_one(jax_arr)
+    result_np = np.asarray(result)
+    expected = np.arange(1024, dtype=np.uint32) + 1
+    self.assertAllClose(result_np, expected)
 
 
 class CudaArrayInterfaceTest(jtu.JaxTestCase):
 
-  @jtu.skip_on_devices("cuda")
+  @jtu.skip_on_devices("cuda", "rocm")
   def testCudaArrayInterfaceOnNonCudaFails(self):
     x = jnp.arange(5)
     self.assertFalse(hasattr(x, "__cuda_array_interface__"))
     with self.assertRaisesRegex(
         AttributeError,
-        "__cuda_array_interface__ is only defined for NVidia GPU buffers.",
+        "__cuda_array_interface__ is only defined for .*GPU buffers.",
     ):
       _ = x.__cuda_array_interface__
 
-  @jtu.run_on_devices("cuda")
+  @jtu.run_on_devices("gpu")
   def testCudaArrayInterfaceOnShardedArrayFails(self):
     devices = jax.local_devices()
     if len(devices) <= 1:
@@ -266,7 +451,8 @@ class CudaArrayInterfaceTest(jtu.JaxTestCase):
     shape=all_shapes,
     dtype=cuda_array_interface_dtypes,
   )
-  @jtu.run_on_devices("cuda")
+  @jtu.run_on_devices("gpu")
+  @jtu.skip_on_devices("oneapi") # OneAPI does not support `__cuda_array_interface__`
   def testCudaArrayInterfaceWorks(self, shape, dtype):
     rng = jtu.rand_default(self.rng())
     x = rng(shape, dtype)
@@ -276,7 +462,8 @@ class CudaArrayInterfaceTest(jtu.JaxTestCase):
     self.assertEqual(shape, a["shape"])
     self.assertEqual(z.__array_interface__["typestr"], a["typestr"])
 
-  @jtu.run_on_devices("cuda")
+  @jtu.run_on_devices("gpu")
+  @jtu.skip_on_devices("oneapi") # OneAPI does not support `__cuda_array_interface__`
   def testCudaArrayInterfaceBfloat16Fails(self):
     rng = jtu.rand_default(self.rng())
     x = rng((2, 2), jnp.bfloat16)
@@ -294,6 +481,8 @@ class CudaArrayInterfaceTest(jtu.JaxTestCase):
     rng = jtu.rand_default(self.rng())
     x = rng(shape, dtype)
     y = jnp.array(x)
+    # TODO(parkers): Remove after setting 'stream' properly.
+    jax.block_until_ready(y)
     z = cupy.asarray(y)
     self.assertEqual(y.__cuda_array_interface__["data"][0],
                      z.__cuda_array_interface__["data"][0])
@@ -319,16 +508,21 @@ class CudaArrayInterfaceTest(jtu.JaxTestCase):
     shape=all_shapes,
     dtype=jtu.dtypes.supported(cuda_array_interface_dtypes),
   )
-  @jtu.run_on_devices("cuda")
+  @jtu.run_on_devices("gpu")
+  @jtu.skip_on_devices("oneapi") # OneAPI does not support `__cuda_array_interface__`
   def testCaiToJax(self, shape, dtype):
+    dtype = np.dtype(dtype)
+
     rng = jtu.rand_default(self.rng())
     x = rng(shape, dtype)
 
     # using device with highest device_id for testing the correctness
     # of detecting the device id from a pointer value
-    device = jax.devices('cuda')[-1]
+    device = jax.devices('gpu')[-1]
     with jax.default_device(device):
       y = jnp.array(x, dtype=dtype)
+      # TODO(parkers): Remove after setting 'stream' properly below.
+      jax.block_until_ready(y)
     self.assertEqual(y.dtype, dtype)
 
     # Using a jax array CAI provider support to construct an object
@@ -352,7 +546,7 @@ class CudaArrayInterfaceTest(jtu.JaxTestCase):
     class CAIWithStrides:
       __cuda_array_interface__ = cai.copy()
       __cuda_array_interface__["version"] = 3
-      strides = (dtype.dtype.itemsize,) if shape else ()
+      strides = (dtype.itemsize,) if shape else ()
       for s in reversed(shape[1:]):
         strides = (strides[0] * s, *strides)
       __cuda_array_interface__['strides'] = strides

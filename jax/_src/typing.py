@@ -21,29 +21,46 @@ exported at `jax.typing`. Until then, the contents here should be considered uns
 and may change without notice.
 
 To see the proposal that led to the development of these tools, see
-https://github.com/google/jax/pull/11859/.
+https://github.com/jax-ml/jax/pull/11859/.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, Protocol, Union
-import numpy as np
 import enum
+import typing
+from types import EllipsisType
+from typing import Any, Protocol
 
 from jax._src.basearray import (
-    Array as Array,
     ArrayLike as ArrayLike,
+    Array as Array,
+    StaticScalar as StaticScalar,
 )
+import numpy as np
 
 DType = np.dtype
 
 # TODO(jakevdp, froystig): make ExtendedDType a protocol
 ExtendedDType = Any
 
+
+@typing.runtime_checkable
 class SupportsDType(Protocol):
   @property
-  def dtype(self) -> DType: ...
+  def dtype(self, /) -> DType: ...
+
+class SupportsShape(Protocol):
+  @property
+  def shape(self, /) -> tuple[int, ...]: ...
+
+class SupportsSize(Protocol):
+  @property
+  def size(self, /) -> int: ...
+
+class SupportsNdim(Protocol):
+  @property
+  def ndim(self, /) -> int: ...
 
 # DTypeLike is meant to annotate inputs to np.dtype that return
 # a valid JAX dtype. It's different than numpy.typing.DTypeLike
@@ -51,17 +68,17 @@ class SupportsDType(Protocol):
 # Unlike np.typing.DTypeLike, we exclude None, and instead require
 # explicit annotations when None is acceptable.
 # TODO(jakevdp): consider whether to add ExtendedDtype to the union.
-DTypeLike = Union[
-  str,            # like 'float32', 'int32'
-  type[Any],      # like np.float32, np.int32, float, int
-  np.dtype,       # like np.dtype('float32'), np.dtype('int32')
-  SupportsDType,  # like jnp.float32, jnp.int32
-]
+DTypeLike = (
+  str            # like 'float32', 'int32'
+  | type[Any]    # like np.float32, np.int32, float, int
+  | np.dtype     # like np.dtype('float32'), np.dtype('int32')
+  | SupportsDType  # like jnp.float32, jnp.int32
+)
 
 # Shapes are tuples of dimension sizes, which are normally integers. We allow
 # modules to extend the set of dimension sizes to contain other types, e.g.,
 # symbolic dimensions in export.DimExpr.
-DimSize = Union[int, Any]  # extensible
+DimSize = int | Any  # extensible
 Shape = Sequence[DimSize]
 
 class DuckTypedArray(Protocol):
@@ -89,4 +106,12 @@ class DeprecatedArg:
 class DLDeviceType(enum.IntEnum):
   kDLCPU = 1
   kDLCUDA = 2
+  kDLCUDAHost = 3
   kDLROCM = 10
+  kDLROCMHost = 11
+  kDLTPUHost = 20
+  kDLOneAPI = 14
+
+AnyInt = int | np.integer
+StaticIndex = AnyInt | slice | EllipsisType
+Index = StaticIndex | None | Sequence[AnyInt] | Array | np.ndarray

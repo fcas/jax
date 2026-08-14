@@ -1,0 +1,772 @@
+# Copyright 2025 The JAX Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import dataclasses
+import functools
+
+from absl.testing import absltest
+import jax
+from jax import lax
+from jax._src import core as jax_core
+from jax._src import hijax
+from jax._src import test_util as jtu
+from jax._src.pallas.fuser import fusible_dtype
+from jax.experimental.pallas import fuser
+import jax.numpy as jnp
+import numpy as np
+
+jax.config.parse_flags_with_absl()
+
+
+class FusionTest(jtu.JaxTestCase):
+
+  def test_basic_fusion(self):
+
+    @jax.jit
+    @fuser.fuse
+    @fuser.fusible
+    def f(x_fn, y_fn):
+      x = x_fn()
+      if y_fn is None:
+        y_fn = lambda x: x
+      return y_fn(x)
+
+    x = jax.random.normal(jax.random.key(0), (128, 128), dtype=jnp.float32)
+    np.testing.assert_array_equal(f(x), x)
+
+  def test_separate_output_fusions_trivial(self):
+
+    @fuser.fusible(output_fusion_prefix=(True, True))
+    def f(x_fn, y_fn, z_fns):
+      x = x_fn()
+      y = y_fn()
+      z_fn1, z_fn2 = z_fns
+      if z_fn1 is None:
+        z_fn1 = lambda x: x
+      if z_fn2 is None:
+        z_fn2 = lambda x: x
+      return z_fn1(x), z_fn2(y)
+
+    @jax.jit
+    @fuser.fuse
+    def g(x, y):
+      x, y = f(x, y)
+      return x, y * 2
+
+    x = jax.random.normal(jax.random.key(0), (128, 128), dtype=jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (1, 128), dtype=jnp.float32)
+    x_out, y_out = g(x, y)
+    np.testing.assert_array_equal(x_out, x)
+    np.testing.assert_array_equal(y_out, y * 2)
+
+  def test_output_fusions_are_actually_trivial(self):
+
+    @fuser.fusible(output_fusion_prefix=(True, True))
+    def f(x_fn, y_fn, z_fns):
+      x = x_fn()
+      y = y_fn()
+      z_fn1, z_fn2 = z_fns
+      self.assertIsNone(z_fn1)
+      self.assertIsNone(z_fn2)
+      if z_fn1 is None:
+        z_fn1 = lambda x: x
+      if z_fn2 is None:
+        z_fn2 = lambda x: x
+      return z_fn1(x), z_fn2(y)
+
+    @jax.jit
+    @fuser.fuse
+    def g(x, y):
+      x, y = f(x, y)
+      return x, y
+
+    x = jax.random.normal(jax.random.key(0), (128, 128), dtype=jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (1, 128), dtype=jnp.float32)
+    x_out, y_out = g(x, y)
+    np.testing.assert_array_equal(x_out, x)
+    np.testing.assert_array_equal(y_out, y)
+
+  def test_custom_fusion(self):
+    const = jnp.array(1.0, dtype=jnp.float32)
+    const2 = jnp.array(2.0, dtype=jnp.float32)
+    const3 = jnp.array(3.0, dtype=jnp.float32)
+
+    @fuser.custom_fusion
+    def c(x, y):
+      return x + y + const
+
+    c.def_pull_block_spec(lambda bss: (bss[0], bss[0]))
+    c.def_push_block_spec(lambda bss: (bss[0],))
+    c.def_eval_rule(lambda _, x, y: (c(x, y),))
+    c.def_pallas_impl(lambda x, y: x + y + const2 + const3)
+
+    @fuser.fusible(output_fusion_prefix=(True, True))
+    def f(x_fn, y_fn, z_fns):
+      x = x_fn()
+      y = y_fn()
+      z_fn1, z_fn2 = z_fns
+      if z_fn1 is None:
+        z_fn1 = lambda x: x
+      if z_fn2 is None:
+        z_fn2 = lambda x: x
+      return z_fn1(x), z_fn2(y)
+
+    def g(x, y, z):
+      x, y = f(x, c(y, z))
+      return c(x, z), y * 2
+
+    x = jax.random.normal(jax.random.key(0), (4, 4), dtype=jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (1, 4), dtype=jnp.float32)
+    z = jax.random.normal(jax.random.key(2), (1, 4), dtype=jnp.float32)
+    x_out, y_out = g(x, y, z)
+    np.testing.assert_array_equal(x_out, (x + z + 1.0))
+    np.testing.assert_array_equal(y_out, (y + z + 1.0) * 2)
+
+    g_fused = jax.jit(fuser.fuse(g))
+    x_out, y_out = g_fused(x, y, z)
+    np.testing.assert_allclose(x_out, (x + z + 1.0))
+    np.testing.assert_allclose(y_out, (y + z + 1.0) * 2)
+
+  def test_separate_output_fusions_should_error_if_not_disjoint(self):
+
+    @fuser.fusible(output_fusion_prefix=(True, True))
+    def f(x_fn, y_fn, z_fns):
+      x = x_fn()
+      y = y_fn()
+      z_fn1, z_fn2 = z_fns
+      if z_fn1 is None:
+        z_fn1 = lambda x: x
+      if z_fn2 is None:
+        z_fn2 = lambda x: x
+      return z_fn1(x), z_fn2(y)
+
+    @jax.jit
+    @fuser.fuse
+    def g(x, y):
+      x_res, y_res = f(x, y)
+      return x_res + y_res
+
+    x = jax.random.normal(jax.random.key(0), (128, 128), dtype=jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (128, 128), dtype=jnp.float32)
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "Outputs must be disjoint in order to use separate output fusions",
+    ):
+      g(x, y)
+
+  def test_separate_output_fusions_allows_permute(self):
+
+    @fuser.fusible(output_fusion_prefix=(True, True))
+    def f(x_fn, y_fn, z_fns):
+      x = x_fn()
+      y = y_fn()
+      z_fn1, z_fn2 = z_fns
+      if z_fn1 is None:
+        z_fn1 = lambda x: x
+      if z_fn2 is None:
+        z_fn2 = lambda x: x
+      return z_fn1(x), z_fn2(y)
+
+    @jax.jit
+    @fuser.fuse
+    def g(x, y):
+      x_res, y_res = f(x, y)
+      return y_res * 2, x_res
+
+    x = jax.random.normal(jax.random.key(0), (128, 128), dtype=jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (1, 128), dtype=jnp.float32)
+    y_out, x_out = g(x, y)
+    np.testing.assert_array_equal(x_out, x)
+    np.testing.assert_array_equal(y_out, y * 2)
+
+  def test_separate_output_fusions_with_nesting(self):
+
+    @fuser.fusible(output_fusion_prefix=(True, True))
+    def f(x_fn, y_fn, z_fns):
+      x = x_fn()
+      y = y_fn()
+      z_fn1, z_fn2 = z_fns
+      if z_fn1 is None:
+        z_fn1 = lambda x: x
+      if z_fn2 is None:
+        z_fn2 = lambda x: x
+      return z_fn1(x), z_fn2(y)
+
+    @jax.jit
+    @fuser.fuse
+    def g(x, y):
+      x_res, y_res = f(x, y)
+      return (x_res * 2, x_res + x_res), y_res
+
+    x = jax.random.normal(jax.random.key(0), (128, 128), dtype=jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (1, 128), dtype=jnp.float32)
+    (x1_out, x2_out), y_out = g(x, y)
+    np.testing.assert_array_equal(x1_out, x * 2)
+    np.testing.assert_array_equal(x2_out, x + x)
+    np.testing.assert_array_equal(y_out, y)
+
+  def test_separate_output_fusions_with_nesting_and_permutation(self):
+
+    @fuser.fusible(output_fusion_prefix=(True, True))
+    def f(x_fn, y_fn, z_fns):
+      x = x_fn()
+      y = y_fn()
+      z_fn1, z_fn2 = z_fns
+      if z_fn1 is None:
+        z_fn1 = lambda x: x
+      if z_fn2 is None:
+        z_fn2 = lambda x: x
+      return z_fn1(x), z_fn2(y)
+
+    @jax.jit
+    @fuser.fuse
+    def g(x, y):
+      x_res, y_res = f(x, y)
+      return y_res, (x_res * 2, x_res + x_res)
+
+    x = jax.random.normal(jax.random.key(0), (128, 128), dtype=jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (1, 128), dtype=jnp.float32)
+    y_out, (x1_out, x2_out) = g(x, y)
+    np.testing.assert_array_equal(x1_out, x * 2)
+    np.testing.assert_array_equal(x2_out, x + x)
+    np.testing.assert_array_equal(y_out, y)
+
+  def test_separate_output_fusions_with_deep_output_mask(self):
+
+    @fuser.fusible(output_fusion_prefix=(True, (True, True)))
+    def f(x_fn, y_fn, z_fn, o_fns):
+      x = x_fn()
+      y = y_fn()
+      z = z_fn()
+      o_fn1, (o_fn2, o_fn3) = o_fns
+      if o_fn1 is None:
+        o_fn1 = lambda x: x
+      if o_fn2 is None:
+        o_fn2 = lambda x: x
+      if o_fn3 is None:
+        o_fn3 = lambda x: x
+      return o_fn1(x), (o_fn2(y), o_fn3(z))
+
+    @jax.jit
+    @fuser.fuse
+    def g(x, y, z):
+      x_res, (y_res, z_res) = f(x, y, z)
+      return (x_res * 2, (y_res, z_res + z_res))
+
+    x = jax.random.normal(jax.random.key(0), (128, 128), dtype=jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (1, 128), dtype=jnp.float32)
+    z = jax.random.normal(jax.random.key(1), (128, 1), dtype=jnp.float32)
+    x_out, (y_out, z_out) = g(x, y, z)
+    np.testing.assert_array_equal(x_out, x * 2)
+    np.testing.assert_array_equal(y_out, y)
+    np.testing.assert_array_equal(z_out, z + z)
+
+  def test_separate_output_fusions_with_reused_value(self):
+
+    @fuser.fusible(output_fusion_prefix=(True, True))
+    def f(x_fn, y_fn, z_fns):
+      x = x_fn()
+      y = y_fn()
+      z_fn1, z_fn2 = z_fns
+      if z_fn1 is None:
+        z_fn1 = lambda x: x
+      if z_fn2 is None:
+        z_fn2 = lambda x: x
+      return z_fn1(x), z_fn2(y)
+
+    @jax.jit
+    @fuser.fuse
+    def g(x, y, a):
+      x_res, y_res = f(x, y)
+      return y_res + a, (x_res * 2, x_res + x_res + a)
+
+    x = jax.random.normal(jax.random.key(0), (128, 128), dtype=jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (1, 128), dtype=jnp.float32)
+    a = jax.random.normal(jax.random.key(1), (1, 128), dtype=jnp.float32)
+    y_out, (x1_out, x2_out) = g(x, y, a)
+    np.testing.assert_array_equal(x1_out, x * 2)
+    np.testing.assert_array_equal(x2_out, x + x + a)
+    np.testing.assert_array_equal(y_out, y + a)
+
+  def test_empty_fusion(self):
+
+    @fuser.fusible
+    def f(x_fn, y_fn):
+      x = x_fn()
+      if y_fn is None:
+        y_fn = lambda x: x
+      return y_fn(x)
+
+    @jax.jit
+    @fuser.fuse
+    def g(x, a):
+      _ = lax.dce_sink(f(x))
+      return a
+
+    x = jax.random.normal(jax.random.key(0), (128, 128), dtype=jnp.float32)
+    a = jax.random.normal(jax.random.key(1), (128, 128), dtype=jnp.float32)
+    y_out = g(x, a)
+    np.testing.assert_array_equal(y_out, a)
+
+  def test_vjp_support(self):
+    @fuser.fusible
+    def f(x_fn, y_fn, z_fn):
+      x = x_fn()
+      y = y_fn()
+      z = x * y
+      if z_fn is None:
+        z_fn = lambda x: x
+      return z_fn(z)
+
+    x, y = jnp.array(2.0), jnp.array(3.0)
+    val, vjp_fun = jax.vjp(f, x, y)
+    np.testing.assert_allclose(val, 6.0)
+
+    grads = vjp_fun(jnp.array(1.0))
+    np.testing.assert_allclose(grads, (3.0, 2.0))
+
+  def test_vmap_support(self):
+    @fuser.fusible
+    def f(x_fn, y_fn, out_fn):
+      x = x_fn()
+      y = y_fn()
+      if out_fn is None:
+        out_fn = lambda x: x
+      return out_fn(x * y)
+
+    x = jnp.array([2.0])
+    y = jnp.array(4.0)
+
+    val = jax.vmap(f, in_axes=(0, None))(x, y)
+    np.testing.assert_allclose(val, jnp.array([8.0]))
+
+  def test_effect_support(self):
+    ref = jax.new_ref(jnp.array(0.0))
+
+    @fuser.fusible
+    def f(x_fn, y_fn, out_fn):
+      x = x_fn()
+      y = y_fn()
+      ref[...] = x + y
+      if out_fn is None:
+        out_fn = lambda x: x
+      return out_fn(x * y)
+
+    x, y = jnp.array(2.0), jnp.array(3.0)
+    closed_jaxpr = jax.make_jaxpr(f)(x, y)
+    self.assertLen(closed_jaxpr.effects, 1)
+
+    jax.core.eval_jaxpr(closed_jaxpr, closed_jaxpr.consts, x, y)
+
+    np.testing.assert_allclose(ref[...], 5.0)
+
+  def test_physicalize_fusible(self):
+
+    @fuser.fusible
+    def f(x_fn, out_fn):
+      x = x_fn()
+      if out_fn is None:
+        out_fn = lambda x: x
+      return out_fn(x + 1.0)
+
+    x = jnp.array(1.0)
+    y = fusible_dtype.physicalize(f)(x)
+    np.testing.assert_allclose(y, 2.0)
+
+  def test_fusible_outside_fuse(self):
+    @fuser.fusible
+    def f(x_fn, out_fn):
+      if out_fn is None:
+        out_fn = lambda x: x
+      return out_fn(x_fn() + 1.0)
+
+    mesh = jax.sharding.Mesh(jax.devices()[:1], ('x',))
+    P = jax.sharding.PartitionSpec
+
+    @jax.custom_vjp
+    def g(x):
+      return f(x)
+
+    def g_fwd(x):
+      y = f(x)
+      return y, x
+
+    def g_bwd(_, grad):
+      return (grad,)
+
+    g.defvjp(g_fwd, g_bwd)
+
+    def body(x):
+      return g(x)
+
+    @jax.jit
+    def run(x):
+      return jax.shard_map(body, mesh=mesh, in_specs=P(), out_specs=P())(x)
+
+    x = jnp.ones((128, 128))
+    y = run(x)
+    np.testing.assert_allclose(y, jnp.full((128, 128), 2.0))
+
+  def test_fusible_jit(self):
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      return x * 2.0
+
+    x = jnp.ones((128, 128))
+    result = jax.jit(quantize)(x)
+    np.testing.assert_allclose(result, x * 2.0)
+
+  def test_fusible_jit_grad(self):
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      return jnp.sum(x * 2.0)
+
+    x = jnp.ones((128, 128))
+    result = jax.jit(jax.grad(quantize))(x)
+    np.testing.assert_allclose(result, jnp.full_like(x, 2.0))
+
+  def test_fusible_shard_map_jit(self):
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      return x * 2.0
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),), out_specs=jax.P('data'), mesh=mesh
+    )
+    def f(x):
+      return quantize(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+    result = jax.jit(f)(x)
+    np.testing.assert_allclose(result, x * 2.0)
+
+  def test_fusible_shard_map_jit_grad(self):
+
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      return jax.lax.psum(jnp.sum(x * 2.0), axis_name='data')
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),), out_specs=jax.P(), mesh=mesh, check_vma=False
+    )
+    def f(x):
+      return quantize(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+    result = jax.jit(jax.grad(f))(x)
+    np.testing.assert_allclose(result, jnp.full_like(x, 2.0))
+
+  def test_fusible_shard_map_mlir_compilation(self):
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      return jnp.sum(x * 2.0)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),), out_specs=jax.P(), mesh=mesh, check_vma=False
+    )
+    def f(x):
+      return quantize(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    lowered = jax.jit(jax.grad(f)).lower(x)
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_custom_vjp_shard_map_grad(self):
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      if out_fn is None:
+        out_fn = lambda x: x
+      return out_fn(x * 2.0)
+
+    @fuser.fuse
+    def backward_fusion(grad):
+      return quantize(grad) * 2.0
+
+    @functools.partial(jax.custom_vjp, nondiff_argnums=())
+    def wrapped_fun(x):
+      return x * 2.0
+
+    def wrapped_fun_fwd(x):
+      return wrapped_fun(x), None
+
+    def wrapped_fun_bwd(res, grad):
+      del res
+      return (backward_fusion(grad),)
+
+    wrapped_fun.defvjp(wrapped_fun_fwd, wrapped_fun_bwd)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh,
+        check_vma=False,
+    )
+    def f(x):
+      return wrapped_fun(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    lowered = jax.jit(jax.grad(lambda x: jnp.sum(jax.checkpoint(f)(x)))).lower(
+        x
+    )
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_remat_lower(self):
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      return x * 2.0
+
+    @jax.checkpoint
+    def f(x):
+      return quantize(x)
+
+    x = jnp.ones(128)
+    lowered = jax.jit(f).lower(x)
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_shard_map_checkpoint_grad(self):
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      del out_fn
+      x = x_fn()
+      return x * 2.0
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.checkpoint
+    @functools.partial(
+        jax.shard_map,
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh,
+        check_vma=False,
+    )
+    def f(x):
+      return quantize(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    def loss(x):
+      return jnp.sum(f(x))
+
+    lowered = jax.jit(jax.grad(loss)).lower(x)
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_custom_gradient_shard_map_grad(self):
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      del out_fn
+      x = x_fn()
+      return x * 2.0
+
+    @fuser.fuse
+    def backward_fusion(grad):
+      return quantize(grad) * 2.0
+
+    @jax.custom_gradient
+    def wrapped_fun(x):
+      return x * 2.0, lambda grad: (backward_fusion(grad),)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh,
+        check_vma=False,
+    )
+    def f(x):
+      return wrapped_fun(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    lowered = jax.jit(jax.grad(lambda x: jnp.sum(jax.checkpoint(f)(x)))).lower(
+        x
+    )
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_custom_gradient_shard_map_grad_no_fuse(self):
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      del out_fn
+      x = x_fn()
+      return x * 2.0
+
+    def backward_fusion(grad):
+      return quantize(grad) * 2.0
+
+    @jax.custom_gradient
+    def wrapped_fun(x):
+      return x * 2.0, lambda grad: (backward_fusion(grad),)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh,
+        check_vma=False,
+    )
+    def f(x):
+      return jax.checkpoint(wrapped_fun)(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    lowered = jax.jit(jax.grad(lambda x: jnp.sum(f(x)))).lower(x)
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_custom_gradient_forward_shard_map_grad(self):
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      del out_fn
+      x = x_fn()
+      return x * 2.0
+
+    @jax.custom_gradient
+    def wrapped_fun(x):
+      res = quantize(x)
+      return res, lambda grad: (grad * 2.0,)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh,
+        check_vma=False,
+    )
+    def f(x):
+      return wrapped_fun(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    lowered = jax.jit(jax.grad(lambda x: jnp.sum(jax.checkpoint(f)(x)))).lower(
+        x
+    )
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_nested_custom_derivatives(self):
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      del out_fn
+      x = x_fn()
+      return x * 2.0
+
+    @jax.custom_gradient
+    def inner_fun(x):
+      res = quantize(x)
+      return res, lambda grad: (grad * 2.0,)
+
+    @jax.custom_vjp
+    def outer_fun(x):
+      return inner_fun(x)
+
+    def outer_fun_fwd(x):
+      return inner_fun(x), None
+
+    def outer_fun_bwd(res, grad):
+      del res
+      return (grad,)
+
+    outer_fun.defvjp(outer_fun_fwd, outer_fun_bwd)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh,
+        check_vma=False,
+    )
+    def f(x):
+      return outer_fun(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    lowered = jax.jit(f).lower(x)
+    self.assertIsNotNone(lowered)
+
+
+@dataclasses.dataclass(frozen=True)
+class ArrayTuple:
+  x0: jax.Array
+  x1: jax.Array
+
+
+@dataclasses.dataclass(frozen=True)
+class ArrayTupleTy(hijax.HiType):
+  x0: jax_core.ShapedArray
+  x1: jax_core.ShapedArray
+
+  def lo_ty(self) -> list[jax_core.ShapedArray]:
+    return [self.x0, self.x1]
+
+  def lower_val(self, hi_val: ArrayTuple) -> list[jax.Array]:
+    return [hi_val.x0, hi_val.x1]
+
+  def raise_val(self, x0, x1) -> ArrayTuple:
+    return ArrayTuple(x0, x1)
+
+
+hijax.register_hitype(
+    ArrayTuple, lambda t: ArrayTupleTy(jax.typeof(t.x0), jax.typeof(t.x1))
+)
+
+
+class FusionHijaxTest(jtu.JaxTestCase):
+
+  def test_basic_fusion(self):
+
+    @jax.jit
+    @fuser.fuse
+    @fuser.fusible
+    def f(x_fn, y_fn):
+      x = x_fn()
+      if y_fn is None:
+        y_fn = lambda x: x
+      return y_fn(x)
+
+    xt = ArrayTuple(x0=jnp.ones((8, 8)), x1=jnp.zeros(4))
+    ot = f(xt)
+    np.testing.assert_array_equal(ot.x0, xt.x0)
+    np.testing.assert_array_equal(ot.x1, xt.x1)
+
+
+if __name__ == "__main__":
+  absltest.main(testLoader=jtu.JaxTestLoader())

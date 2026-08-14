@@ -5,7 +5,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.16.1
+    jupytext_version: 1.16.4
 kernelspec:
   display_name: Python 3
   language: python
@@ -13,51 +13,11 @@ kernelspec:
 ---
 
 (key-concepts)=
-# Key Concepts
+# Key concepts
+
+<!--* freshness: { reviewed: '2024-05-03' } *-->
 
 This section briefly introduces some key concepts of the JAX package.
-
-(key-concepts-jax-arrays)=
-## JAX arrays ({class}`jax.Array`)
-
-The default array implementation in JAX is {class}`jax.Array`. In many ways it is similar to
-the {class}`numpy.ndarray` type that you may be familar with from the NumPy package, but it
-has some important differences.
-
-### Array creation
-
-We typically don't call the {class}`jax.Array` constructor directly, but rather create arrays via JAX API functions.
-For example, {mod}`jax.numpy` provides familar NumPy-style array construction functionality
-such as {func}`jax.numpy.zeros`, {func}`jax.numpy.linspace`, {func}`jax.numpy.arange`, etc.
-
-```{code-cell}
-import jax
-import jax.numpy as jnp
-
-x = jnp.arange(5)
-isinstance(x, jax.Array)
-```
-
-If you use Python type annotations in your code, {class}`jax.Array` is the appropriate
-annotation for jax array objects (see {mod}`jax.typing` for more discussion).
-
-### Array devices and sharding
-
-JAX Array objects have a `devices` method that lets you inspect where the contents of the array are stored. In the simplest cases, this will be a single CPU device:
-
-```{code-cell}
-x.devices()
-```
-
-In general, an array may be *sharded* across multiple devices, in a manner that can be inspected via the `sharding` attribute:
-
-```{code-cell}
-x.sharding
-```
-
-Here the array is on a single device, but in general a JAX array can be
-sharded across multiple devices, or even multiple hosts.
-To read more about sharded arrays and parallel computation, refer to {ref}`sharded-computation`
 
 (key-concepts-transformations)=
 ## Transformations
@@ -72,6 +32,9 @@ as well as several others. Transformations accept a function as an argument, and
 new transformed function. For example, here's how you might JIT-compile a simple SELU function:
 
 ```{code-cell}
+import jax
+import jax.numpy as jnp
+
 def selu(x, alpha=1.67, lambda_=1.05):
   return lambda_ * jnp.where(x > 0, x, alpha * jnp.exp(x) - alpha)
 
@@ -86,9 +49,6 @@ Often you'll see transformations applied using Python's decorator syntax for con
 def selu(x, alpha=1.67, lambda_=1.05):
   return lambda_ * jnp.where(x > 0, x, alpha * jnp.exp(x) - alpha)
 ```
-
-Transformations like {func}`~jax.jit`, {func}`~jax.vmap`, {func}`~jax.grad`, and others are
-key to using JAX effectively, and we'll cover them in detail in later sections.
 
 (key-concepts-tracing)=
 ## Tracing
@@ -115,6 +75,12 @@ the function with traced values, JAX can determine the sequence of operations en
 by the function before those operations are actually executed: transformations like
 {func}`~jax.jit`, {func}`~jax.vmap`, and {func}`~jax.grad` can then map this sequence
 of input operations to a transformed sequence of operations.
+
+**Static vs traced operations**: Just as values can be either static or traced,
+operations can be static or traced. Static operations are evaluated at compile-time
+in Python; traced operations are compiled & evaluated at run-time in XLA.
+
+For more details, see [Tracing](tracing-tutorial).
 
 (key-concepts-jaxprs)=
 ## Jaxprs
@@ -145,10 +111,10 @@ jaxprs later in {ref}`jax-internals-jaxpr`.
 ## Pytrees
 
 JAX functions and transformations fundamentally operate on arrays, but in practice it is
-convenient to write code that work with collections of arrays: for example, a neural
+convenient to write code that works with collection of arrays: for example, a neural
 network might organize its parameters in a dictionary of arrays with meaningful keys.
 Rather than handle such structures on a case-by-case basis, JAX relies on the {term}`pytree`
-abstraction to treat such collections in a uniform matter.
+abstraction to treat such collections in a uniform manner.
 
 Here are some examples of objects that can be treated as pytrees:
 
@@ -187,3 +153,54 @@ tree, and {func}`jax.tree.reduce` can be used to apply a reduction across the le
 in a tree.
 
 You can learn more in the {ref}`working-with-pytrees` tutorial.
+
+## JAX API layering: NumPy, lax & XLA
+
+All JAX operations are implemented in terms of operations in [XLA](https://www.openxla.org/xla/) – the Accelerated Linear Algebra compiler. If you look at the source of `jax.numpy`, you'll see that all the operations are eventually expressed in terms of functions defined in {mod}`jax.lax`. While `jax.numpy` is a high-level wrapper that provides a familiar interface, you can think of `jax.lax` as a stricter, but often more powerful, lower-level API for working with multi-dimensional arrays.
+
+For example, while `jax.numpy` will implicitly promote arguments to allow operations between mixed data types, `jax.lax` will not:
+
+```{code-cell}
+import jax.numpy as jnp
+jnp.add(1, 1.0)  # jax.numpy API implicitly promotes mixed types.
+```
+
+```{code-cell}
+:tags: [raises-exception]
+
+from jax import lax
+lax.add(1, 1.0)  # jax.lax API requires explicit type promotion.
+```
+
+If using `jax.lax` directly, you'll have to do type promotion explicitly in such cases:
+
+```{code-cell}
+lax.add(jnp.float32(1), 1.0)
+```
+
+Along with this strictness, `jax.lax` also provides efficient APIs for some more general operations than are supported by NumPy.
+
+For example, consider a 1D convolution, which can be expressed in NumPy this way:
+
+```{code-cell}
+x = jnp.array([1, 2, 1])
+y = jnp.ones(10)
+jnp.convolve(x, y)
+```
+
+Under the hood, this NumPy operation is translated to a much more general convolution implemented by [`lax.conv_general_dilated`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.conv_general_dilated.html):
+
+```{code-cell}
+from jax import lax
+result = lax.conv_general_dilated(
+    x.reshape(1, 1, 3).astype(float),  # note: explicit promotion
+    y.reshape(1, 1, 10),
+    window_strides=(1,),
+    padding=[(len(y) - 1, len(y) - 1)])  # equivalent of padding='full' in NumPy
+result[0, 0]
+```
+
+This is a batched convolution operation designed to be efficient for the types of convolutions often used in deep neural nets. It requires much more boilerplate, but is far more flexible and scalable than the convolution provided by NumPy (See [Convolutions in JAX](https://docs.jax.dev/en/latest/notebooks/convolutions.html) for more detail on JAX convolutions).
+
+At their heart, all `jax.lax` operations are Python wrappers for operations in XLA; here, for example, the convolution implementation is provided by [XLA:ConvWithGeneralPadding](https://www.openxla.org/xla/operation_semantics#convwithgeneralpadding_convolution).
+Every JAX operation is eventually expressed in terms of these fundamental XLA operations, which is what enables just-in-time (JIT) compilation.

@@ -13,25 +13,40 @@ List of Functions
 
    Partial
    all_leaves
-   build_tree
+   flatten_one_level
+   flatten_one_level_with_keys
+   is_tree_node
    register_dataclass
    register_pytree_node
    register_pytree_node_class
    register_pytree_with_keys
    register_pytree_with_keys_class
-   tree_all
-   tree_flatten
+   register_static
    tree_flatten_with_path
-   tree_leaves
    tree_leaves_with_path
-   tree_map
    tree_map_with_path
-   tree_reduce
-   tree_structure
-   tree_transpose
-   tree_unflatten
    treedef_children
    treedef_is_leaf
    treedef_tuple
+   KeyEntry
+   KeyPath
    keystr
+
+Legacy APIs
+-----------
+These APIs are now accessed via :mod:`jax.tree`.
+
+.. autosummary::
+   :toctree: _autosummary
+
+   tree_all
+   tree_broadcast
+   tree_flatten
+   tree_leaves
+   tree_map
+   tree_reduce
+   tree_reduce_associative
+   tree_structure
+   tree_transpose
+   tree_unflatten
 

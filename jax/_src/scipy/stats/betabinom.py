@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License
 
-from jax import lax
-import jax.numpy as jnp
+import numpy as np
+
+from jax._src import api
+from jax._src import lax
+from jax._src import numpy as jnp
 from jax._src.lax.lax import _const as _lax_const
 from jax._src.numpy.util import promote_args_inexact
 from jax._src.scipy.special import betaln
 from jax._src.typing import Array, ArrayLike
 
 
+@api.jit
 def logpmf(k: ArrayLike, n: ArrayLike, a: ArrayLike, b: ArrayLike,
            loc: ArrayLike = 0) -> Array:
   r"""Beta-binomial log probability mass function.
@@ -30,7 +34,7 @@ def logpmf(k: ArrayLike, n: ArrayLike, a: ArrayLike, b: ArrayLike,
 
   .. math::
 
-     f(k, n, a, b) = {n \choose k}\frac{B(k+a,n-k-b)}{B(a,b)}
+     f(k, n, a, b) = {n \choose k}\frac{B(k+a,n-k+b)}{B(a,b)}
 
   where :math:`B(a, b)` is the :func:`~jax.scipy.special.beta` function. It is
   defined for :math:`n\ge 0`, :math:`a>0`, :math:`b>0`, and non-negative integers `k`.
@@ -55,10 +59,12 @@ def logpmf(k: ArrayLike, n: ArrayLike, a: ArrayLike, b: ArrayLike,
   combiln = lax.neg(lax.add(lax.log1p(n), betaln(lax.add(lax.sub(n,y), one), lax.add(y,one))))
   beta_lns = lax.sub(betaln(lax.add(y,a), lax.add(lax.sub(n,y),b)), betaln(a,b))
   log_probs = lax.add(combiln, beta_lns)
-  y_cond = jnp.logical_or(lax.lt(y, lax.neg(loc)), lax.gt(y, lax.sub(n, loc)))
-  log_probs = jnp.where(y_cond, -jnp.inf, log_probs)
-  n_a_b_cond = jnp.logical_or(jnp.logical_or(lax.lt(n, one), lax.lt(a, zero)), lax.lt(b, zero))
-  return jnp.where(n_a_b_cond, jnp.nan, log_probs)
+  log_probs = jnp.where(jnp.logical_and(lax.eq(y, zero), lax.eq(n, zero)), 0., log_probs)
+  y_cond = jnp.logical_or(jnp.logical_or(lax.lt(y, lax.neg(loc)), lax.gt(y, n)),
+                          lax.le(lax.add(y, a), zero))
+  log_probs = jnp.where(y_cond, -np.inf, log_probs)
+  n_a_b_cond = jnp.logical_or(jnp.logical_or(lax.lt(n, zero), lax.le(a, zero)), lax.le(b, zero))
+  return jnp.where(n_a_b_cond, np.nan, log_probs)
 
 
 def pmf(k: ArrayLike, n: ArrayLike, a: ArrayLike, b: ArrayLike,
@@ -71,7 +77,7 @@ def pmf(k: ArrayLike, n: ArrayLike, a: ArrayLike, b: ArrayLike,
 
   .. math::
 
-     f(k, n, a, b) = {n \choose k}\frac{B(k+a,n-k-b)}{B(a,b)}
+     f(k, n, a, b) = {n \choose k}\frac{B(k+a,n-k+b)}{B(a,b)}
 
   where :math:`B(a, b)` is the :func:`~jax.scipy.special.beta` function. It is
   defined for :math:`n\ge 0`, :math:`a>0`, :math:`b>0`, and non-negative integers `k`.

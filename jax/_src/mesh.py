@@ -11,32 +11,35 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Definitions of Mesh and ResourceEnv."""
+"""Definitions of Mesh and AbstractMesh"""
 
 from __future__ import annotations
 
 import collections
 from collections.abc import Hashable, Sequence
 import contextlib
+import dataclasses
+import enum
 import functools
 import math
 import threading
 from typing import Any, NamedTuple
+import warnings
 
 import numpy as np
 
 from jax._src import config as jax_config
 from jax._src import xla_bridge as xb
-from jax._src import util
+from jax._src.util import (safe_zip, cache, tuple_delete, weak_value_interner,
+                           immutable)
+from jax._src.lib import _jax
 from jax._src.lib import xla_client as xc
 
+zip, unsafe_zip = safe_zip, zip
+config_ext = _jax.config
 
 MeshAxisName = Any
 ResourceAxisName = Hashable
-
-class Loop(NamedTuple):
-  name: ResourceAxisName
-  length: int
 
 
 def show_axes(axes):
@@ -45,7 +48,6 @@ def show_axes(axes):
 
 class ResourceEnv(NamedTuple):
   physical_mesh: Mesh
-  loops: tuple[Loop, ...]
 
   def with_mesh(self, mesh: Mesh):
     overlap = set(mesh.axis_names) & (self.resource_axes - set(self.physical_mesh.axis_names))
@@ -55,52 +57,38 @@ class ResourceEnv(NamedTuple):
                        f"{show_axes(overlap)}")
     return self._replace(physical_mesh=mesh)
 
-  def with_extra_loop(self, loop: Loop):
-    if loop.name in self.resource_axes:
-      raise ValueError(f"Cannot extend the resource environment with loop named "
-                       f"`{loop.name}`. An axis of this name is already defined!")
-    return self._replace(loops=self.loops + (loop,))
-
   @property
   def physical_resource_axes(self) -> set[ResourceAxisName]:
     return set(self.physical_mesh.axis_names)
 
   @property
-  def loop_resource_axes(self) -> set[ResourceAxisName]:
-    return {loop.name for loop in self.loops}
-
-  @property
   def resource_axes(self) -> set[ResourceAxisName]:
-    return self.physical_resource_axes | self.loop_resource_axes
+    return self.physical_resource_axes
 
   @property
   def shape(self):
-    shape = self.physical_mesh.shape
-    shape.update(self.loops)
-    return shape
+    return self.physical_mesh.shape
 
   @property
   def local_shape(self):
-    shape = self.physical_mesh.local_mesh.shape
-    shape.update(self.loops)
-    return shape
+    return self.physical_mesh.local_mesh.shape
 
   def __repr__(self):
     mesh_repr = ", ".join(
         f"'{k}': {v}" for k, v in self.physical_mesh.shape.items())
-    return f"ResourceEnv(mesh=Mesh({mesh_repr}), {self.loops!r})"
+    return f"ResourceEnv(mesh=Mesh({mesh_repr}))"
 
 
-@functools.lru_cache(maxsize=128)
+@cache(max_size=128, trace_context_in_key=False)
 def _get_local_mesh(global_mesh: Mesh, process_index: int) -> Mesh:
   if global_mesh.empty:
-      return global_mesh
+    return global_mesh
   is_local_device = np.vectorize(
       lambda d: d.process_index == process_index, otypes=[bool])(global_mesh.devices)
   subcube_indices = []
   # We take the smallest slice of each dimension that doesn't skip any local device.
   for axis in range(global_mesh.devices.ndim):
-    other_axes = util.tuple_delete(tuple(range(global_mesh.devices.ndim)), axis)
+    other_axes = tuple_delete(tuple(range(global_mesh.devices.ndim)), axis)
     # NOTE: This re-reduces over many axes multiple times, so we could definitely
     #       optimize it, but I hope it won't be a bottleneck anytime soon.
     local_slices = is_local_device.any(other_axes, keepdims=False)
@@ -114,28 +102,123 @@ def _get_local_mesh(global_mesh: Mesh, process_index: int) -> Mesh:
   # subcube that hull will contain non-local devices.
   if not is_local_device[subcube_indices_tuple].all():
     raise ValueError(
-        "When passing host local inputs to pjit or xmap, devices "
-        "connected to a single host must form a contiguous subcube of the "
-        "global device mesh")
+        "When passing host local inputs to pjit, devices connected to a single"
+        " host must form a contiguous subcube of the global device mesh"
+    )
   return Mesh(global_mesh.devices[subcube_indices_tuple], global_mesh.axis_names)
 
 
-_mesh_object_dict = {}  # type: ignore
+class AxisType(enum.Enum):
+  Auto = enum.auto()
+  Explicit = enum.auto()
+  Manual = enum.auto()
+
+  def __repr__(self):
+    return self.name
+
+def _normalize_axis_types(axis_names, axis_types, name, default_axis_type):
+  axis_types = ((default_axis_type,) * len(axis_names)
+                if axis_types is None else axis_types)
+  if not isinstance(axis_types, tuple):
+    axis_types = (axis_types,)
+
+  if not all(isinstance(a, AxisType) for a in axis_types):
+    raise TypeError(
+        f"axis_types passed to {name} must be of type `jax.sharding.AxisType`."
+        f" Got {axis_types} of type {tuple(type(a) for a in axis_types)}")
+  if len(axis_names) != len(axis_types):
+    raise ValueError(
+        "Number of axis names should match the number of axis_types. Got"
+        f" axis_names={axis_names} and axis_types={axis_types}")
+  return axis_types
+
+def all_axis_types_match(axis_types, ty: AxisType) -> bool:
+  if not axis_types:
+    return False
+  return all(t == ty for t in axis_types)
+
+def any_axis_types_match(axis_types, ty: AxisType) -> bool:
+  if not axis_types:
+    return False
+  return any(t == ty for t in axis_types)
 
 
-class Mesh(contextlib.ContextDecorator):
+class BaseMesh:
+  axis_names: tuple[MeshAxisName, ...]
+  shape_tuple: tuple[tuple[str, int], ...]
+  axis_types: tuple[AxisType, ...]
+
+  @functools.cached_property
+  def are_all_axes_manual(self) -> bool:
+    return all_axis_types_match(self.axis_types, AxisType.Manual)
+
+  @functools.cached_property
+  def are_all_axes_auto(self) -> bool:
+    return all_axis_types_match(self.axis_types, AxisType.Auto)
+
+  @functools.cached_property
+  def are_all_axes_explicit(self) -> bool:
+    return all_axis_types_match(self.axis_types, AxisType.Explicit)
+
+  @functools.cached_property
+  def _are_all_axes_auto_or_manual(self) -> bool:
+    if not self.axis_types:
+      return False
+    return all(t == AxisType.Auto or t == AxisType.Manual
+               for t in self.axis_types)
+
+  @functools.cached_property
+  def _are_all_axes_explicit_or_manual(self) -> bool:
+    if not self.axis_types:
+      return False
+    return all(t == AxisType.Explicit or t == AxisType.Manual
+               for t in self.axis_types)
+
+  @functools.cached_property
+  def _any_axis_manual(self) -> bool:
+    return any_axis_types_match(self.axis_types, AxisType.Manual)
+
+  @functools.cached_property
+  def _any_axis_auto(self) -> bool:
+    return any_axis_types_match(self.axis_types, AxisType.Auto)
+
+  @functools.cached_property
+  def _any_axis_explicit(self) -> bool:
+    return any_axis_types_match(self.axis_types, AxisType.Explicit)
+
+  @functools.cached_property
+  def _any_axis_auto_or_manual(self) -> bool:
+    if not self.axis_types:
+      return False
+    return any(t == AxisType.Auto or t == AxisType.Manual
+               for t in self.axis_types)
+
+  @functools.cached_property
+  def auto_axes(self):
+    return tuple(n for n, t in safe_zip(self.axis_names, self.axis_types)
+                 if t == AxisType.Auto)
+
+  @functools.cached_property
+  def explicit_axes(self):
+    return tuple(n for n, t in safe_zip(self.axis_names, self.axis_types)
+                 if t == AxisType.Explicit)
+
+  @functools.cached_property
+  def manual_axes(self):
+    return tuple(n for n, t in safe_zip(self.axis_names, self.axis_types)
+                 if t == AxisType.Manual)
+
+  @functools.cached_property
+  def _name_to_type(self):
+    return dict(safe_zip(self.axis_names, self.axis_types))
+
+
+@immutable
+class Mesh(BaseMesh, contextlib.ContextDecorator):
   """Declare the hardware resources available in the scope of this manager.
 
-  In particular, all ``axis_names`` become valid resource names inside the
-  managed block and can be used e.g. in the ``in_axis_resources`` argument of
-  :py:func:`jax.experimental.pjit.pjit`. Also see JAX's multi-process programming
-  model (https://jax.readthedocs.io/en/latest/multi_process.html)
-  and the Distributed arrays and automatic parallelization tutorial
-  (https://jax.readthedocs.io/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html)
-
-  If you are compiling in multiple threads, make sure that the
-  ``with Mesh`` context manager is inside the function that the threads will
-  execute.
+  See `Distributed arrays and automatic parallelization`_ and
+  `Explicit Sharding`_ tutorials.
 
   Args:
     devices: A NumPy ndarray object containing JAX device objects (as
@@ -143,48 +226,53 @@ class Mesh(contextlib.ContextDecorator):
     axis_names: A sequence of resource axis names to be assigned to the
       dimensions of the ``devices`` argument. Its length should match the
       rank of ``devices``.
+    axis_types: and optional tuple of :class:`jax.sharding.AxisType` entries corresponding to
+      the ``axis_names``. See `Explicit Sharding`_ for more information.
 
-  Example:
+  Examples:
 
-    >>> from jax.experimental.pjit import pjit
     >>> from jax.sharding import Mesh
-    >>> from jax.sharding import PartitionSpec as P
+    >>> from jax.sharding import PartitionSpec as P, NamedSharding
     >>> import numpy as np
     ...
-    >>> inp = np.arange(16).reshape((8, 2))
-    >>> devices = np.array(jax.devices()).reshape(4, 2)
-    ...
     >>> # Declare a 2D mesh with axes `x` and `y`.
-    >>> global_mesh = Mesh(devices, ('x', 'y'))
-    >>> # Use the mesh object directly as a context manager.
-    >>> with global_mesh:
-    ...   out = pjit(lambda x: x, in_shardings=None, out_shardings=None)(inp)
+    >>> devices = np.array(jax.devices()).reshape(4, 2)
+    >>> mesh = Mesh(devices, ('x', 'y'))
+    >>> inp = np.arange(16).reshape(8, 2)
+    >>> arr = jax.device_put(inp, NamedSharding(mesh, P('x', 'y')))
+    >>> out = jax.jit(lambda x: x * 2)(arr)
+    >>> assert out.sharding == NamedSharding(mesh, P('x', 'y'))
 
-    >>> # Initialize the Mesh and use the mesh as the context manager.
-    >>> with Mesh(devices, ('x', 'y')) as global_mesh:
-    ...   out = pjit(lambda x: x, in_shardings=None, out_shardings=None)(inp)
-
-    >>> # Also you can use it as `with ... as ...`.
-    >>> global_mesh = Mesh(devices, ('x', 'y'))
-    >>> with global_mesh as m:
-    ...   out = pjit(lambda x: x, in_shardings=None, out_shardings=None)(inp)
-
-    >>> # You can also use it as `with Mesh(...)`.
-    >>> with Mesh(devices, ('x', 'y')):
-    ...   out = pjit(lambda x: x, in_shardings=None, out_shardings=None)(inp)
+  .. _Distributed arrays and automatic parallelization: https://docs.jax.dev/en/latest/parallel.html
+  .. _Explicit Sharding:  https://docs.jax.dev/en/latest/parallel.html
   """
 
   devices: np.ndarray
   axis_names: tuple[MeshAxisName, ...]
+  size: int
+
+  @staticmethod
+  @weak_value_interner
+  def _create(flat_devices_tuple, device_shape, axis_names, axis_types, size):
+    devices = np.array(flat_devices_tuple).reshape(device_shape)
+    devices.flags.writeable = False
+    obj = object.__new__(Mesh)
+    object.__setattr__(obj, 'devices', devices)
+    object.__setattr__(obj, 'axis_names', axis_names)
+    object.__setattr__(obj, 'axis_types', axis_types)
+    object.__setattr__(obj, 'size', size)
+    return obj
 
   def __new__(cls, devices: np.ndarray | Sequence[xc.Device],
-              axis_names: str | Sequence[MeshAxisName]):
+              axis_names: str | Sequence[MeshAxisName],
+              axis_types: tuple[AxisType, ...] | None = None):
     if not isinstance(devices, np.ndarray):
       devices = np.array(devices)
     if isinstance(axis_names, str):
       axis_names = (axis_names,)
     axis_names = tuple(axis_names)
-
+    if any(i is None for i in axis_names):
+      raise ValueError(f"Mesh axis names cannot be None. Got: {axis_names}")
     if devices.ndim != len(axis_names):
       raise ValueError(
           "Mesh requires the ndim of its first argument (`devices`) to equal "
@@ -192,79 +280,74 @@ class Mesh(contextlib.ContextDecorator):
           f"devices.ndim == {devices.ndim} and "
           f"len(axis_names) == {len(axis_names)}.")
 
-    key = (axis_names, devices.shape, tuple(devices.flat))
-    val = _mesh_object_dict.get(key, None)
-    if val is not None:
-      return val
+    devices_flat = tuple(devices.flat)
+    axis_types = _normalize_axis_types(axis_names, axis_types, 'Mesh',
+                                       AxisType.Auto)
+    empty = not axis_names and devices_flat[0] is None
+    size = 0 if empty else math.prod(devices.shape)
+    return cls._create(devices_flat, devices.shape, axis_names,
+                       axis_types, size)
 
-    self = super().__new__(cls)
-    self.devices = devices.copy()
-    self.devices.flags.writeable = False
-    self.axis_names = axis_names
-    _mesh_object_dict[key] = self
-    return self
+  # No __eq__ or __hash__: interned classes use object identity.
 
-  def __reduce__(self):
-    return (type(self), (self.devices, self.axis_names))
+  @property
+  def is_scalar(self):
+    return self.size == 1 and not self.axis_names
 
-  def __eq__(self, other):
-    if not isinstance(other, Mesh):
-      return False
-    # This is a performance optimization. Comparing thousands of devices
-    # can be expensive.
-    if id(self) == id(other):
-      return True
-    return (self.axis_names == other.axis_names and
-            self.devices.shape == other.devices.shape and
-            self._internal_device_list == other._internal_device_list)
-
-  def __hash__(self):
-    if not hasattr(self, '_hash'):
-      self._hash = hash(
-          (self.axis_names, self._internal_device_list, self.devices.shape))
-    return self._hash
-
-  def __setattr__(self, name, value):
-    if hasattr(self, name):
-      if getattr(self, name) == value:
-        # This can to happen if two threads race, for example if two threads
-        # are trying to hash the same Mesh instance.
-        return
-      raise RuntimeError(
-          f"Cannot reassign attributes ({name}) of immutable mesh objects"
-      )
-    super().__setattr__(name, value)
+  def __getnewargs_ex__(self):
+    return (self.devices, self.axis_names, self.axis_types), {}
 
   def __enter__(self):
+    if jax_config.disallow_mesh_context_manager.value:
+      raise RuntimeError("Mesh context manager is disabled.")
+    warnings.warn(
+        "`with mesh:` context manager has been deprecated. Please use `with"
+        " jax.set_mesh(mesh):` instead.",
+        category=DeprecationWarning, stacklevel=2)
     new_env = thread_resources.stack[-1].with_mesh(self)
     thread_resources.stack.append(new_env)
     thread_resources.env = new_env
-    jax_config.update_thread_local_jit_state(
-        mesh_context_manager=tuple(t.physical_mesh for t in thread_resources.stack
-                                   if not t.physical_mesh.empty))
+    jax_config.mesh_context_manager.set_local(
+        tuple(t.physical_mesh for t in thread_resources.stack
+              if not t.physical_mesh.empty))
     return self
 
   def __exit__(self, exc_type, exc_value, traceback):
     thread_resources.stack.pop()
     thread_resources.env = thread_resources.stack[-1]
-    jax_config.update_thread_local_jit_state(
-        mesh_context_manager=tuple(t.physical_mesh for t in thread_resources.stack
-                                   if not t.physical_mesh.empty))
+    jax_config.mesh_context_manager.set_local(
+        tuple(t.physical_mesh for t in thread_resources.stack
+              if not t.physical_mesh.empty))
     return False
 
-  @property
+  def update(self, devices=None, axis_names=None, axis_types=None):
+    if devices is None:
+      devices = self.devices
+    if axis_names is None:
+      axis_names = self.axis_names
+    if axis_types is None:
+      axis_types = self.axis_types
+    return Mesh(devices, axis_names, axis_types)
+
+  @functools.cached_property
   def shape(self):
     return collections.OrderedDict(
         (name, size)
-        for name, size in util.safe_zip(self.axis_names, self.devices.shape))
+        for name, size in safe_zip(self.axis_names, self.devices.shape))
+
+  @functools.cached_property
+  def shape_tuple(self):  # pyrefly: ignore[bad-override]
+    return tuple(
+        (name, size)
+        for name, size in safe_zip(self.axis_names, self.devices.shape))
 
   @property
-  def size(self):
-    return math.prod(self.shape.values())
+  def axis_sizes(self) -> tuple[int, ...]:
+    return self.devices.shape
 
   @property
   def empty(self):
-    return self.devices.ndim == 0
+    return self.size == 0
 
   @functools.cached_property
   def is_multi_process(self):
@@ -299,14 +382,19 @@ class Mesh(contextlib.ContextDecorator):
     return set(self.devices.flat)
 
   def __str__(self):
+    if self.empty:
+      return "Mesh()"
     mesh_str = ", ".join(f"'{k}': {v}" for k, v in self.shape.items())
-    return f"Mesh({mesh_str})"
+    atr = f", axis_types={self.axis_types}"
+    return f"Mesh({mesh_str}{atr})"
 
   @functools.cached_property
   def _repr(self):
     if self.empty:
-      return "Mesh(device_ids=[], axis_names=())"
-    return f"Mesh(device_ids={self.device_ids!r}, axis_names={self.axis_names!r})"
+      return "Mesh(axis_sizes=(), axis_names=())"
+    atr = f", axis_types={self.axis_types}"
+    return (f"Mesh(axis_sizes={self.device_ids.shape}, "
+            f"axis_names={self.axis_names!r}{atr})")
 
   def __repr__(self):
     return self._repr
@@ -316,8 +404,16 @@ class Mesh(contextlib.ContextDecorator):
     return [d for d in self.devices.flat
             if d.process_index == d.client.process_index()]
 
+  @functools.cached_property
+  def abstract_mesh(self):
+    if len(self.axis_names) == 0:
+      return empty_abstract_mesh
+    return AbstractMesh(
+        self.axis_sizes, self.axis_names, axis_types=self.axis_types,
+        abstract_device=abstract_device_from(self.devices.flat[0]))
 
-EMPTY_ENV = ResourceEnv(Mesh(np.empty((), dtype=object), ()), ())
+
+EMPTY_ENV = ResourceEnv(Mesh(np.empty((), dtype=object), ()))
 
 class _ThreadResourcesLocalState(threading.local):
 
@@ -326,3 +422,219 @@ class _ThreadResourcesLocalState(threading.local):
     self.env = self.stack[-1]
 
 thread_resources = _ThreadResourcesLocalState()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class AbstractDevice:
+  device_kind: str
+  num_cores: int | None
+  platform: str
+
+  def __repr__(self):
+    return (f"AbstractDevice({self._repr()})")
+
+  def _repr(self):
+    return (f"device_kind={self.device_kind}, num_cores={self.num_cores}, "
+            f"platform={self.platform}")
+
+
+def abstract_device_from(d) -> AbstractDevice | None:
+  if d is None:
+    return None
+  if d.platform == 'tpu':
+    num_cores = getattr(d, 'num_cores', None)
+  elif d.platform == 'gpu':
+    num_cores = getattr(d, 'core_count', None)
+  else:
+    num_cores = None
+  return AbstractDevice(device_kind=d.device_kind, num_cores=num_cores,
+                        platform=d.platform)
+
+
+@immutable
+class AbstractMesh(BaseMesh):
+  """AbstractMesh contains only axis names and axis sizes.
+
+  It does not contain concrete devices compared to `jax.sharding.Mesh`. You
+  should use this as an input to the sharding passed to with_sharding_constraint
+  and mesh passed to shard_map to avoid tracing and lowering cache misses when
+  your mesh shape and axis names stay the same but the devices change.
+  See the description of https://github.com/jax-ml/jax/pull/23022 for more
+  details.
+
+  Args:
+    axis_sizes: A tuple of integers specifying the size of each resource axis.
+    axis_names: A tuple of resource axis names to be assigned to the
+      dimensions of the ``devices`` argument. Its length should match the
+      rank of ``devices``.
+    axis_types: and optional tuple of :class:`jax.sharding.AxisType` entries corresponding to
+      the ``axis_names``. See `Explicit Sharding`_ for more information.
+
+  .. _Explicit Sharding:  https://docs.jax.dev/en/latest/parallel.html
+  """
+  axis_sizes: Any
+  abstract_device: Any
+  size: Any
+
+  @staticmethod
+  @weak_value_interner
+  def _create(axis_sizes, axis_names, axis_types, abstract_device):
+    obj = object.__new__(AbstractMesh)
+    object.__setattr__(obj, 'axis_sizes', axis_sizes)
+    object.__setattr__(obj, 'axis_names', axis_names)
+    object.__setattr__(obj, 'axis_types', axis_types)
+    object.__setattr__(obj, 'abstract_device', abstract_device)
+    object.__setattr__(obj, 'size', math.prod(axis_sizes) if axis_sizes else 0)
+    return obj
+
+  def __new__(cls, axis_sizes: tuple[int, ...], axis_names: tuple[str, ...],
+               axis_types: AxisType | tuple[AxisType, ...] | None = None,
+               *, abstract_device=None):
+    axis_types = _normalize_axis_types(axis_names, axis_types, 'AbstractMesh',
+                                       AxisType.Explicit)
+    return AbstractMesh._create(axis_sizes, axis_names, axis_types, abstract_device)
+
+  # No __eq__ or __hash__: interned classes use object identity.
+
+  def __getnewargs_ex__(self):
+    return ((self.axis_sizes, self.axis_names, self.axis_types),
+            {'abstract_device': self.abstract_device})
+
+  def __repr__(self):
+    mesh_repr = (", ".join(f"'{n}': {v}" for n, v in self.shape_tuple)
+                 if self.shape_tuple else "()")
+    atr = f", axis_types={self.axis_types}"
+    ad = ("" if self.abstract_device is None else
+          f", {self.abstract_device._repr()}")
+    return f"AbstractMesh({mesh_repr}{atr}{ad})"
+
+  def update(self, axis_sizes=None, axis_names=None, axis_types=None, **kwargs):
+    if axis_sizes is None:
+      axis_sizes = self.axis_sizes
+    if axis_names is None:
+      axis_names = self.axis_names
+    if axis_types is None:
+      axis_types = self.axis_types
+    if 'abstract_device' not in kwargs:
+      kwargs['abstract_device'] = self.abstract_device
+    return AbstractMesh(axis_sizes, axis_names, axis_types, **kwargs)
+
+  @functools.cached_property
+  def shape(self):
+    return collections.OrderedDict(self.shape_tuple)
+
+  @functools.cached_property
+  def shape_tuple(self):  # pyrefly: ignore[bad-override]
+    return tuple(
+        (name, size)
+        for name, size in safe_zip(self.axis_names, self.axis_sizes))
+
+  @property
+  def _internal_device_list(self):
+    return None
+
+  @property
+  def empty(self):
+    return self.size == 0
+
+  @property
+  def abstract_mesh(self):
+    return self
+
+  def update_axis_types(self, name_to_type: dict[MeshAxisName, AxisType]):
+    new_axis_types = tuple(name_to_type[n] if n in name_to_type else a
+                           for n, a in zip(self.axis_names, self.axis_types))
+    return self.update(axis_types=new_axis_types)
+
+  @property
+  def devices(self):
+    _raise_value_error("devices")
+
+  @property
+  def device_ids(self):
+    _raise_value_error("device_ids")
+
+  @property
+  def is_multi_process(self):
+    _raise_value_error("is_multi_process")
+
+  @property
+  def local_devices(self):
+    _raise_value_error("local_devices")
+
+  @property
+  def local_mesh(self):
+    _raise_value_error("local_mesh")
+
+  def __enter__(self):
+    _raise_value_error("__enter__")
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    _raise_value_error("__exit__")
+
+
+# Create this indirection because pytype fails to recognize a property if a
+# property raises an exception unconditionally. Remove this once that is fixed.
+def _raise_value_error(name):
+  raise ValueError(f"AbstractMesh does not implement {name}")
+
+empty_abstract_mesh = AbstractMesh((), ())
+empty_concrete_mesh = Mesh(np.empty((), dtype=object), ())
+
+class use_abstract_mesh:
+  """Sets a abstract mesh in a thread-local context.
+
+  ``jax.sharding.use_abstract_mesh`` can be used as a context manager.
+
+  For example::
+
+    abstract_device = jax.sharding.AbstractDevice(
+        device_kind='TPU v6 lite', num_cores=1, platform='tpu')
+    abstract_mesh = jax.sharding.AbstractMesh((2,), ('x',), (AxisType.Explicit,),
+                                               abstract_device=abstract_device)
+
+    @jax.jit
+    def f(x):
+      return x * 2
+
+    with jax.sharding.use_abstract_mesh(abstract_mesh):
+      # Note: `f` will be traced and lowered for TPU platform.
+      f.trace(inp).lower()
+      # Note: `f` will be traced for TPU and lowered for CPU.
+      f.trace(inp).lower(lowering_platforms=('cpu',))
+
+  Note: In the example above, setting the abstract mesh at the top level only
+        takes effect if all mesh axes are Explicit. This is temporary until we
+        fix the underlying issues.
+  """
+  __slots__ = ['mesh', 'prev']
+
+  def __init__(self, mesh: AbstractMesh):
+    if not isinstance(mesh, AbstractMesh):
+      raise ValueError(
+          "Expected mesh of type `jax.sharding.AbstractMesh`. Got type:"
+          f" {type(mesh)}")
+    self.mesh = mesh
+
+  def __enter__(self):
+    self.prev = jax_config.abstract_mesh_context_manager.swap_local(self.mesh)
+    if (self.prev is not config_ext.unset and
+        not self.prev.empty and not self.mesh.empty and
+        self.prev.size != self.mesh.size):
+      jax_config.abstract_mesh_context_manager.set_local(self.prev)
+      raise ValueError(
+          "use_abstract_mesh cannot change the size of the mesh. Got new mesh:"
+          f" {self.mesh} with size={self.mesh.size} and prev mesh:"
+          f" {self.prev} with size={self.prev.size}")
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    jax_config.abstract_mesh_context_manager.set_local(self.prev)
+
+
+def get_abstract_mesh() -> AbstractMesh:
+  val = jax_config.abstract_mesh_context_manager.value
+  return empty_abstract_mesh if val is None else val
+
+def get_concrete_mesh() -> Mesh:
+  val = jax_config.device_context.value
+  return empty_concrete_mesh if val is None else val

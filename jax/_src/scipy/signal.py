@@ -14,31 +14,37 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import partial
 import math
 import operator
-from typing import Callable
+from typing import Any, Literal
 import warnings
 
 import numpy as np
 
-import jax
-import jax.numpy.fft
-import jax.numpy as jnp
-from jax import lax
-from jax._src.api_util import _ensure_index_tuple
+from jax._src import api
+from jax._src import core
 from jax._src import dtypes
+from jax._src import lax
+from jax._src import numpy as jnp
+from jax._src.api_util import _ensure_index_tuple
 from jax._src.lax.lax import PrecisionLike
+from jax._src.numpy import fft as jnp_fft
 from jax._src.numpy import linalg
 from jax._src.numpy.util import (
-    check_arraylike, promote_dtypes_inexact, promote_dtypes_complex)
+    check_arraylike,
+    ensure_arraylike,
+    promote_dtypes_complex,
+    promote_dtypes_inexact,
+)
 from jax._src.third_party.scipy import signal_helper
 from jax._src.typing import Array, ArrayLike
 from jax._src.util import canonicalize_axis, tuple_delete, tuple_insert
 
+ModeString = Literal["full", "same", "valid"]
 
-def fftconvolve(in1: ArrayLike, in2: ArrayLike, mode: str = "full",
+def fftconvolve(in1: ArrayLike, in2: ArrayLike, mode: ModeString = "full",
                 axes: Sequence[int] | None = None) -> Array:
   """
   Convolve two N-dimensional arrays using Fast Fourier Transform (FFT).
@@ -107,7 +113,7 @@ def fftconvolve(in1: ArrayLike, in2: ArrayLike, mode: str = "full",
   if any(in1.shape[i] != in2.shape[i] for i in mapped_axes):
     raise ValueError(f"mapped axes must have same shape; got {in1.shape=} {in2.shape=} {axes=}")
   for ax in sorted(mapped_axes):
-    _fftconvolve = jax.vmap(_fftconvolve, in_axes=ax, out_axes=ax)
+    _fftconvolve = api.vmap(_fftconvolve, in_axes=ax, out_axes=ax)
   return _fftconvolve(in1, in2)
 
 def _fftconvolve_unbatched(in1: Array, in2: Array, mode: str) -> Array:
@@ -125,13 +131,16 @@ def _fftconvolve_unbatched(in1: Array, in2: Array, mode: str) -> Array:
     if swap:
       in1, in2 = in2, in1
 
-  if jnp.iscomplexobj(in1):
-    fft, ifft = jnp.fft.fftn, jnp.fft.ifftn
+  if (all(s1 == 1 or s2 == 1 for s1, s2 in zip(in1.shape, in2.shape))):
+    conv = in1 * in2
   else:
-    fft, ifft = jnp.fft.rfftn, jnp.fft.irfftn
-  sp1 = fft(in1, fft_shape)
-  sp2 = fft(in2, fft_shape)
-  conv = ifft(sp1 * sp2, fft_shape)
+    if jnp.iscomplexobj(in1):
+      fft, ifft = jnp.fft.fftn, jnp.fft.ifftn
+    else:
+      fft, ifft = jnp.fft.rfftn, jnp.fft.irfftn
+    sp1 = fft(in1, fft_shape)
+    sp2 = fft(in2, fft_shape)
+    conv = ifft(sp1 * sp2, fft_shape)
 
   if mode == "full":
     out_shape = full_shape
@@ -147,10 +156,10 @@ def _fftconvolve_unbatched(in1: Array, in2: Array, mode: str) -> Array:
   return lax.dynamic_slice(conv, start_indices, out_shape)
 
 
-# Note: we do not re-use the code from jax.numpy.convolve here, because the handling
+# Note: we do not reuse the code from jax.numpy.convolve here, because the handling
 # of padding differs slightly between the two implementations (particularly for
 # mode='same').
-def _convolve_nd(in1: Array, in2: Array, mode: str, *, precision: PrecisionLike) -> Array:
+def _convolve_nd(in1: Array, in2: Array, mode: ModeString, *, precision: PrecisionLike) -> Array:
   if mode not in ["full", "same", "valid"]:
     raise ValueError("mode must be one of ['full', 'same', 'valid']")
   if in1.ndim != in2.ndim:
@@ -177,6 +186,8 @@ def _convolve_nd(in1: Array, in2: Array, mode: str, *, precision: PrecisionLike)
                for (s, s_o) in zip(shape, shape_o)]
   elif mode == 'full':
     padding = [(s - 1, s - 1) for s in shape]
+  else:
+    raise ValueError(f'unsupported mode: {mode}')
 
   strides = tuple(1 for s in shape)
   result = lax.conv_general_dilated(in1[None, None], in2[None, None], strides,
@@ -184,11 +195,11 @@ def _convolve_nd(in1: Array, in2: Array, mode: str, *, precision: PrecisionLike)
   return result[0, 0]
 
 
-def convolve(in1: Array, in2: Array, mode: str = 'full', method: str = 'auto',
+def convolve(in1: Array, in2: Array, mode: ModeString = 'full', method: str = 'auto',
              precision: PrecisionLike = None) -> Array:
   """Convolution of two N-dimensional arrays.
 
-  JAX implementation of :func:`jax.scipy.signal.convolve`.
+  JAX implementation of :func:`scipy.signal.convolve`.
 
   Args:
     in1: left-hand input to the convolution.
@@ -249,11 +260,11 @@ def convolve(in1: Array, in2: Array, mode: str = 'full', method: str = 'auto',
     raise ValueError(f"Got {method=}; expected 'auto', 'fft', or 'direct'.")
 
 
-def convolve2d(in1: Array, in2: Array, mode: str = 'full', boundary: str = 'fill',
+def convolve2d(in1: Array, in2: Array, mode: ModeString = 'full', boundary: str = 'fill',
                fillvalue: float = 0, precision: PrecisionLike = None) -> Array:
   """Convolution of two 2-dimensional arrays.
 
-  JAX implementation of :func:`jax.scipy.signal.convolve2d`.
+  JAX implementation of :func:`scipy.signal.convolve2d`.
 
   Args:
     in1: left-hand input to the convolution. Must have ``in1.ndim == 2``.
@@ -268,12 +279,6 @@ def convolve2d(in1: Array, in2: Array, mode: str = 'full', boundary: str = 'fill
 
     boundary: only ``"fill"`` is supported.
     fillvalue: only ``0`` is supported.
-    method: controls the computation method. Options are
-
-      * ``"auto"``: (default) always uses the ``"direct"`` method.
-      * ``"direct"``: lower to :func:`jax.lax.conv_general_dilated`.
-      * ``"fft"``: compute the result via a fast Fourier transform.
-
     precision: Specify the precision of the computation. Refer to
       :class:`jax.lax.Precision` for a description of available values.
 
@@ -284,19 +289,50 @@ def convolve2d(in1: Array, in2: Array, mode: str = 'full', boundary: str = 'fill
     - :func:`jax.numpy.convolve`: 1D convolution
     - :func:`jax.scipy.signal.convolve`: ND convolution
     - :func:`jax.scipy.signal.correlate`: ND correlation
+
+  Examples:
+    A few 2D convolution examples:
+
+    >>> x = jnp.array([[1, 2],
+    ...                [3, 4]])
+    >>> y = jnp.array([[2, 1, 1],
+    ...                [4, 3, 4],
+    ...                [1, 3, 2]])
+
+    Full 2D convolution uses implicit zero-padding at the edges:
+
+    >>> jax.scipy.signal.convolve2d(x, y, mode='full')
+    Array([[ 2.,  5.,  3.,  2.],
+           [10., 22., 17., 12.],
+           [13., 30., 32., 20.],
+           [ 3., 13., 18.,  8.]], dtype=float32)
+
+    Specifying ``mode = 'same'`` returns a centered 2D convolution of the same size
+    as the first input:
+
+    >>> jax.scipy.signal.convolve2d(x, y, mode='same')
+    Array([[22., 17.],
+           [30., 32.]], dtype=float32)
+
+    Specifying ``mode = 'valid'`` returns only the portion of 2D convolution
+    where the two arrays fully overlap:
+
+    >>> jax.scipy.signal.convolve2d(x, y, mode='valid')
+    Array([[22., 17.],
+           [30., 32.]], dtype=float32)
   """
   if boundary != 'fill' or fillvalue != 0:
     raise NotImplementedError("convolve2d() only supports boundary='fill', fillvalue=0")
-  if jnp.ndim(in1) != 2 or jnp.ndim(in2) != 2:
+  if np.ndim(in1) != 2 or np.ndim(in2) != 2:
     raise ValueError("convolve2d() only supports 2-dimensional inputs.")
   return _convolve_nd(in1, in2, mode, precision=precision)
 
 
-def correlate(in1: Array, in2: Array, mode: str = 'full', method: str = 'auto',
+def correlate(in1: Array, in2: Array, mode: ModeString = 'full', method: str = 'auto',
               precision: PrecisionLike = None) -> Array:
   """Cross-correlation of two N-dimensional arrays.
 
-  JAX implementation of :func:`jax.scipy.signal.correlate`.
+  JAX implementation of :func:`scipy.signal.correlate`.
 
   Args:
     in1: left-hand input to the cross-correlation.
@@ -325,15 +361,38 @@ def correlate(in1: Array, in2: Array, mode: str = 'full', method: str = 'auto',
     - :func:`jax.numpy.correlate`: 1D cross-correlation
     - :func:`jax.scipy.signal.correlate2d`: 2D cross-correlation
     - :func:`jax.scipy.signal.convolve`: ND convolution
+
+  Examples:
+    A few 1D correlation examples:
+
+    >>> x = jnp.array([1, 2, 3, 2, 1])
+    >>> y = jnp.array([1, 3, 2])
+
+    Full 1D correlation uses implicit zero-padding at the edges:
+
+    >>> jax.scipy.signal.correlate(x, y, mode='full')
+    Array([ 2.,  7., 13., 15., 11.,  5.,  1.], dtype=float32)
+
+    Specifying ``mode = 'same'`` returns a centered 1D correlation of the same
+    size as the first input:
+
+    >>> jax.scipy.signal.correlate(x, y, mode='same')
+    Array([ 7., 13., 15., 11.,  5.], dtype=float32)
+
+    Specifying ``mode = 'valid'`` returns only the portion of 1D correlation
+    where the two arrays fully overlap:
+
+    >>> jax.scipy.signal.correlate(x, y, mode='valid')
+    Array([13., 15., 11.], dtype=float32)
   """
   return convolve(in1, jnp.flip(in2.conj()), mode, precision=precision, method=method)
 
 
-def correlate2d(in1: Array, in2: Array, mode: str = 'full', boundary: str = 'fill',
+def correlate2d(in1: Array, in2: Array, mode: ModeString = 'full', boundary: str = 'fill',
                 fillvalue: float = 0, precision: PrecisionLike = None) -> Array:
   """Cross-correlation of two 2-dimensional arrays.
 
-  JAX implementation of :func:`jax.scipy.signal.correlate2d`.
+  JAX implementation of :func:`scipy.signal.correlate2d`.
 
   Args:
     in1: left-hand input to the cross-correlation. Must have ``in1.ndim == 2``.
@@ -348,12 +407,6 @@ def correlate2d(in1: Array, in2: Array, mode: str = 'full', boundary: str = 'fil
 
     boundary: only ``"fill"`` is supported.
     fillvalue: only ``0`` is supported.
-    method: controls the computation method. Options are
-
-      * ``"auto"``: (default) always uses the ``"direct"`` method.
-      * ``"direct"``: lower to :func:`jax.lax.conv_general_dilated`.
-      * ``"fft"``: compute the result via a fast Fourier transform.
-
     precision: Specify the precision of the computation. Refer to
       :class:`jax.lax.Precision` for a description of available values.
 
@@ -364,10 +417,42 @@ def correlate2d(in1: Array, in2: Array, mode: str = 'full', boundary: str = 'fil
     - :func:`jax.numpy.correlate`: 1D cross-correlation
     - :func:`jax.scipy.signal.correlate`: ND cross-correlation
     - :func:`jax.scipy.signal.convolve`: ND convolution
+
+  Examples:
+    A few 2D correlation examples:
+
+    >>> x = jnp.array([[2, 1, 3],
+    ...                [1, 3, 1],
+    ...                [4, 1, 2]])
+    >>> y = jnp.array([[1, 3],
+    ...                [4, 2]])
+
+    Full 2D correlation uses implicit zero-padding at the edges:
+
+    >>> jax.scipy.signal.correlate2d(x, y, mode='full')
+    Array([[ 4., 10., 10., 12.],
+           [ 8., 15., 24.,  7.],
+           [11., 28., 14.,  9.],
+           [12.,  7.,  7.,  2.]], dtype=float32)
+
+    Specifying ``mode = 'same'`` returns a centered 2D correlation of the same
+    size as the first input:
+
+    >>> jax.scipy.signal.correlate2d(x, y, mode='same')
+    Array([[15., 24.,  7.],
+           [28., 14.,  9.],
+           [ 7.,  7.,  2.]], dtype=float32)
+
+    Specifying ``mode = 'valid'`` returns only the portion of 2D correlation
+    where the two arrays fully overlap:
+
+    >>> jax.scipy.signal.correlate2d(x, y, mode='valid')
+    Array([[15., 24.],
+           [28., 14.]], dtype=float32)
   """
   if boundary != 'fill' or fillvalue != 0:
     raise NotImplementedError("correlate2d() only supports boundary='fill', fillvalue=0")
-  if jnp.ndim(in1) != 2 or jnp.ndim(in2) != 2:
+  if np.ndim(in1) != 2 or np.ndim(in2) != 2:
     raise ValueError("correlate2d() only supports 2-dimensional inputs.")
 
   swap = all(s1 <= s2 for s1, s2 in zip(in1.shape, in2.shape))
@@ -393,7 +478,8 @@ def correlate2d(in1: Array, in2: Array, mode: str = 'full', boundary: str = 'fil
   return result
 
 
-def detrend(data: ArrayLike, axis: int = -1, type: str = 'linear', bp: int = 0,
+def detrend(data: ArrayLike, axis: int = -1, type: str = 'linear',
+            bp: int | Sequence[int] | np.ndarray = 0,
             overwrite_data: None = None) -> Array:
   """
   Remove linear or piecewise linear trends from data.
@@ -415,7 +501,7 @@ def detrend(data: ArrayLike, axis: int = -1, type: str = 'linear', bp: int = 0,
   Returns:
     The detrended data array.
 
-  Example:
+  Examples:
     A simple detrend operation in one dimension:
 
     >>> data = jnp.array([1., 4., 8., 8., 9.])
@@ -479,13 +565,9 @@ def _fft_helper(x: Array, win: Array, detrend_func: Callable[[Array], Array],
     result = x[..., np.newaxis]
   else:
     step = nperseg - noverlap
-    batch_shape = list(batch_shape)
-    x = x.reshape((math.prod(batch_shape), signal_length, 1))
-    result = jax.lax.conv_general_dilated_patches(
-        x, (nperseg,), (step,),
-        'VALID',
-        dimension_numbers=('NTC', 'OIT', 'NTC'))
-    result = result.reshape(*batch_shape, *result.shape[-2:])
+    starts = jnp.arange(signal_length - nperseg + 1, step=step)
+    slice_func = partial(lax.dynamic_slice_in_dim, operand=x, slice_size=nperseg, axis=-1)
+    result = api.vmap(slice_func, out_axes=-2)(start_index=starts)
 
   # Detrend each data segment individually
   result = detrend_func(result)
@@ -497,9 +579,9 @@ def _fft_helper(x: Array, win: Array, detrend_func: Callable[[Array], Array],
 
   # Perform the fft on last axis. Zero-pads automatically
   if sides == 'twosided':
-    return jax.numpy.fft.fft(result, n=nfft)
+    return jnp_fft.fft(result, n=nfft)
   else:
-    return jax.numpy.fft.rfft(result.real, n=nfft)
+    return jnp_fft.rfft(result.real, n=nfft)
 
 
 def odd_ext(x: Array, n: int, axis: int = -1) -> Array:
@@ -569,8 +651,7 @@ def _spectral_helper(x: Array, y: ArrayLike | None, fs: ArrayLike = 1.0,
         f"Unknown boundary option '{boundary}', "
         f"must be one of: {list(boundary_funcs.keys())}")
 
-  axis = jax.core.concrete_or_error(operator.index, axis,
-                                    "axis of windowed-FFT")
+  axis = core.concrete_or_error(operator.index, axis, "axis of windowed-FFT")
   axis = canonicalize_axis(axis, x.ndim)
 
   if y is None:
@@ -600,9 +681,9 @@ def _spectral_helper(x: Array, y: ArrayLike | None, fs: ArrayLike = 1.0,
   noverlap_int: int = 0
 
   if nperseg is not None:  # if specified by user
-    nperseg_int = jax.core.concrete_or_error(int, nperseg,
-                                             "nperseg of windowed-FFT")
-    if nperseg_int < 1:  # type: ignore[operator]
+    nperseg_int = core.concrete_or_error(
+        int, nperseg, "nperseg of windowed-FFT")
+    if nperseg_int < 1:
       raise ValueError('nperseg must be a positive integer')
   # parse window; if array like, then set nperseg = win.shape
   win, nperseg_int = signal_helper._triage_segments(
@@ -610,16 +691,15 @@ def _spectral_helper(x: Array, y: ArrayLike | None, fs: ArrayLike = 1.0,
       input_length=x.shape[axis], dtype=x.dtype)
 
   if noverlap is None:
-    noverlap_int = nperseg_int // 2  # type: ignore[operator]
+    noverlap_int = nperseg_int // 2
   else:
-    noverlap_int = jax.core.concrete_or_error(int, noverlap,
-                                              "noverlap of windowed-FFT")
+    noverlap_int = core.concrete_or_error(
+        int, noverlap, "noverlap of windowed-FFT")
 
   if nfft is None:
     nfft_int = nperseg_int
   else:
-    nfft_int = jax.core.concrete_or_error(int, nfft,
-                                          "nfft of windowed-FFT")
+    nfft_int = core.concrete_or_error(int, nfft, "nfft of windowed-FFT")
 
   # Special cases for size == 0
   if y is None:
@@ -668,19 +748,23 @@ def _spectral_helper(x: Array, y: ArrayLike | None, fs: ArrayLike = 1.0,
       y_arr = jnp.concatenate((y_arr, jnp.zeros_like(x, shape=(*y_arr.shape[:-1], nadd))), axis=-1)
 
   # Handle detrending and window functions
-  if not detrend_type:
-    detrend_func = lambda d: d
-  elif not callable(detrend_type):
+  detrend_func: Any
+  if isinstance(detrend_type, str):
     detrend_func = partial(detrend, type=detrend_type, axis=-1)
-  elif axis != -1:
-    # Wrap this function so that it receives a shape that it could
-    # reasonably expect to receive.
-    def detrend_func(d):
-      d = jnp.moveaxis(d, axis, -1)
-      d = detrend_type(d)
-      return jnp.moveaxis(d, -1, axis)
+  elif callable(detrend_type):
+    if axis != -1:
+      # Wrap this function so that it receives a shape that it could
+      # reasonably expect to receive.
+      def detrend_func(d):
+        d = jnp.moveaxis(d, axis, -1)
+        d = detrend_type(d)
+        return jnp.moveaxis(d, -1, axis)
+    else:
+      detrend_func = detrend_type
+  elif not detrend_type:
+    detrend_func = lambda d: d
   else:
-    detrend_func = detrend_type
+    raise ValueError(f'Unsupported detrend type: {detrend_type}')
 
   # Determine scale
   if scaling == 'density':
@@ -704,9 +788,11 @@ def _spectral_helper(x: Array, y: ArrayLike | None, fs: ArrayLike = 1.0,
     sides = 'twosided'
 
   if sides == 'twosided':
-    freqs = jax.numpy.fft.fftfreq(nfft_int, 1/fs, dtype=freq_dtype)
+    freqs = jnp_fft.fftfreq(nfft_int, 1/fs, dtype=freq_dtype)
   elif sides == 'onesided':
-    freqs = jax.numpy.fft.rfftfreq(nfft_int, 1/fs, dtype=freq_dtype)
+    freqs = jnp_fft.rfftfreq(nfft_int, 1/fs, dtype=freq_dtype)
+  else:
+    raise ValueError(f'incorrect value of sides {sides}')
 
   # Perform the windowed FFTs
   result = _fft_helper(x, win, detrend_func,
@@ -925,8 +1011,8 @@ def _overlap_and_add(x: Array, step_size: int) -> Array:
     An array with `(..., output_size)`-shape containing overlapped signal.
   """
   check_arraylike("_overlap_and_add", x)
-  step_size = jax.core.concrete_or_error(int, step_size,
-                                        "step_size for overlap_and_add")
+  step_size = core.concrete_or_error(
+      int, step_size, "step_size for overlap_and_add")
   if x.ndim < 2:
     raise ValueError('Input must have (..., frames, frame_length) shape.')
 
@@ -945,16 +1031,16 @@ def _overlap_and_add(x: Array, step_size: int) -> Array:
   x = x.reshape((flat_batchsize, nframes, nstep_per_segment, step_size))
 
   # For obtaining shifted signals, this routine reinterprets flattened array
-  # with a shrinked axis.  With appropriate truncation/ padding, this operation
+  # with a shrunken axis.  With appropriate truncation/ padding, this operation
   # pushes the last padded elements of the previous row to the head of the
   # current row.
   # See implementation of `overlap_and_add` in Tensorflow for details.
   x = x.transpose((0, 2, 1, 3))  # x: (B, S, N, T)
   x = jnp.pad(x, ((0, 0), (0, 0), (0, nframes), (0, 0)))  # x: (B, S, N*2, T)
-  shrinked = x.shape[2] - 1
+  shrunken = x.shape[2] - 1
   x = x.reshape((flat_batchsize, -1))
-  x = x[:, :(nstep_per_segment * shrinked * step_size)]
-  x = x.reshape((flat_batchsize, nstep_per_segment, shrinked * step_size))
+  x = x[:, :(nstep_per_segment * shrunken * step_size)]
+  x = x.reshape((flat_batchsize, nstep_per_segment, shrunken * step_size))
 
   # Finally, sum shifted segments, and truncate results to the output_size.
   x = x.sum(axis=1)[:, :output_size]
@@ -982,7 +1068,7 @@ def istft(Zxx: Array, fs: ArrayLike = 1.0, window: str = 'hann',
     noverlap: Number of points to overlap between segments (default: ``nperseg // 2``).
     nfft: Number of FFT points used in the STFT. If ``None`` (default), the
       value is determined from the size of ``Zxx``.
-    input_onesided: If Tru` (default), interpret the input as a one-sided STFT
+    input_onesided: If True (default), interpret the input as a one-sided STFT
       (positive frequencies only). If False, interpret the input as a two-sided STFT.
     boundary: If True (default), it is assumed that the input signal was extended at
       its boundaries by ``stft``. If `False`, the input signal is assumed to have been truncated at the boundaries by `stft`.
@@ -996,7 +1082,7 @@ def istft(Zxx: Array, fs: ArrayLike = 1.0, window: str = 'hann',
   See Also:
     :func:`jax.scipy.signal.stft`: short-time Fourier transform.
 
-  Example:
+  Examples:
     Demonstrate that this gives the inverse of :func:`~jax.scipy.signal.stft`:
 
     >>> x = jnp.array([1., 2., 3., 2., 1., 0., 1., 2.])
@@ -1010,7 +1096,7 @@ def istft(Zxx: Array, fs: ArrayLike = 1.0, window: str = 'hann',
     [1. 2. 3. 2. 1. 0. 1. 2.]
   """
   # Input validation
-  check_arraylike("istft", Zxx)
+  Zxx = ensure_arraylike("istft", Zxx)
   if Zxx.ndim < 2:
     raise ValueError('Input stft must be at least 2d!')
   freq_axis = canonicalize_axis(freq_axis, Zxx.ndim)
@@ -1018,13 +1104,12 @@ def istft(Zxx: Array, fs: ArrayLike = 1.0, window: str = 'hann',
   if freq_axis == time_axis:
     raise ValueError('Must specify differing time and frequency axes!')
 
-  Zxx = jnp.asarray(Zxx, dtype=jax.dtypes.canonicalize_dtype(
-      np.result_type(Zxx, np.complex64)))
+  Zxx = jnp.asarray(Zxx, dtype=dtypes.to_complex_dtype(Zxx.dtype))
 
   n_default = (2 * (Zxx.shape[freq_axis] - 1) if input_onesided
                else Zxx.shape[freq_axis])
 
-  nperseg_int = jax.core.concrete_or_error(int, nperseg or n_default,
+  nperseg_int = core.concrete_or_error(int, nperseg or n_default,
                                            "nperseg: segment length of STFT")
   if nperseg_int < 1:
     raise ValueError('nperseg must be a positive integer')
@@ -1035,13 +1120,13 @@ def istft(Zxx: Array, fs: ArrayLike = 1.0, window: str = 'hann',
     if input_onesided and nperseg_int == n_default + 1:
       nfft_int += 1  # Odd nperseg, no FFT padding
   else:
-    nfft_int = jax.core.concrete_or_error(int, nfft, "nfft of STFT")
+    nfft_int = core.concrete_or_error(int, nfft, "nfft of STFT")
   if nfft_int < nperseg_int:
     raise ValueError(
         f'FFT length ({nfft_int}) must be longer than nperseg ({nperseg_int}).')
 
-  noverlap_int = jax.core.concrete_or_error(int, noverlap or nperseg_int // 2,
-                                            "noverlap of STFT")
+  noverlap_int = core.concrete_or_error(
+      int, noverlap or nperseg_int // 2, "noverlap of STFT")
   if noverlap_int >= nperseg_int:
     raise ValueError('noverlap must be less than nperseg.')
   nstep = nperseg_int - noverlap_int
@@ -1053,19 +1138,19 @@ def istft(Zxx: Array, fs: ArrayLike = 1.0, window: str = 'hann',
     Zxx = jnp.transpose(Zxx, outer_idxs + (freq_axis, time_axis))
 
   # Perform IFFT
-  ifunc = jax.numpy.fft.irfft if input_onesided else jax.numpy.fft.ifft
+  ifunc = jnp_fft.irfft if input_onesided else jnp_fft.ifft
   # xsubs: [..., T, N], N is the number of frames, T is the frame length.
   xsubs = ifunc(Zxx, axis=-2, n=nfft)[..., :nperseg_int, :]
 
   # Get window as array
-  if window == 'hann':
+  if isinstance(window, str) and window == 'hann':
     # Implement the default case without scipy
-    win = jnp.array([1.0]) if nperseg_int == 1 else jnp.sin(jnp.linspace(0, jnp.pi, nperseg_int, endpoint=False)) ** 2
+    win = jnp.array([1.0]) if nperseg_int == 1 else jnp.sin(jnp.linspace(0, np.pi, nperseg_int, endpoint=False)) ** 2
     win = win.astype(xsubs.dtype)
   elif isinstance(window, (str, tuple)):
     # TODO(jakevdp): implement get_window() in JAX to remove optional scipy dependency
     try:
-      from scipy.signal import get_window
+      from scipy.signal import get_window  # pyrefly: ignore[missing-import]
     except ImportError as err:
       raise ImportError(f"scipy must be available to use {window=}") from err
     win = get_window(window, nperseg_int)

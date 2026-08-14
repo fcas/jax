@@ -28,6 +28,7 @@ Adjoint algorithm based on Appendix C of https://arxiv.org/pdf/1806.07366.pdf
 
 from functools import partial
 import operator as op
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -38,21 +39,16 @@ from jax._src.numpy.util import promote_dtypes_inexact
 from jax._src.util import safe_map, safe_zip
 from jax.flatten_util import ravel_pytree
 from jax.tree_util import tree_leaves, tree_map
-from jax._src import linear_util as lu
 
 map = safe_map
 zip = safe_zip
 
 
-def ravel_first_arg(f, unravel):
-  return ravel_first_arg_(lu.wrap_init(f), unravel).call_wrapped
-
-@lu.transformation
-def ravel_first_arg_(unravel, y_flat, *args):
-  y = unravel(y_flat)
-  ans = yield (y,) + args, {}
-  ans_flat, _ = ravel_pytree(ans)
-  yield ans_flat
+def ravel_first_arg(f: Callable, unravel):
+  def raveled(y_flat, *args):
+    ans = f(unravel(y_flat), *args)
+    return ravel_pytree(ans)[0]
+  return raveled
 
 def interp_fit_dopri(y0, y1, k, dt):
   # Fit a polynomial to the results of a Runge-Kutta step.
@@ -169,7 +165,7 @@ def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=jnp.inf, hmax=jn
     shape/structure as `y0` except with a new leading axis of length `len(t)`.
   """
   for arg in tree_leaves(args):
-    if not isinstance(arg, core.Tracer) and not core.valid_jaxtype(arg):
+    if not core.valid_jaxtype(arg):
       raise TypeError(
         f"The contents of odeint *args must be arrays or scalars, but got {arg}.")
   if not jnp.issubdtype(t.dtype, jnp.floating):
@@ -178,14 +174,16 @@ def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=jnp.inf, hmax=jn
   converted, consts = custom_derivatives.closure_convert(func, y0, t[0], *args)
   return _odeint_wrapper(converted, rtol, atol, mxstep, hmax, y0, t, *args, *consts)
 
-@partial(jax.jit, static_argnums=(0, 1, 2, 3, 4))
-def _odeint_wrapper(func, rtol, atol, mxstep, hmax, y0, ts, *args):
+@jax.jit(static_argnums=(0, 1, 2, 3, 4))
+@jax.default_matmul_precision("highest")
+def _odeint_wrapper(func: Callable, rtol, atol, mxstep, hmax, y0, ts, *args):
   y0, unravel = ravel_pytree(y0)
   func = ravel_first_arg(func, unravel)
   out = _odeint(func, rtol, atol, mxstep, hmax, y0, ts, *args)
   return jax.vmap(unravel)(out)
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3, 4))
+@jax.default_matmul_precision("highest")
 def _odeint(func, rtol, atol, mxstep, hmax, y0, ts, *args):
   func_ = lambda y, t: func(y, t, *args)
 
@@ -224,6 +222,7 @@ def _odeint_fwd(func, rtol, atol, mxstep, hmax, y0, ts, *args):
   ys = _odeint(func, rtol, atol, mxstep, hmax, y0, ts, *args)
   return ys, (ys, ts, args)
 
+@jax.default_matmul_precision("highest")
 def _odeint_rev(func, rtol, atol, mxstep, hmax, res, g):
   ys, ts, args = res
 

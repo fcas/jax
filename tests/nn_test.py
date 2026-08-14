@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for nn module."""
-
 import collections
 from functools import partial
 import itertools
@@ -24,10 +22,14 @@ from absl.testing import parameterized
 
 import scipy.stats
 
+from jax._src import ad_checkpoint
 from jax._src import config
 from jax._src import core
+from jax._src import dtypes as _dtypes
 from jax._src import test_util as jtu
-from jax._src import ad_checkpoint
+from jax._src.cudnn.scaled_matmul_stablehlo import (
+    quantize,
+)
 from jax.test_util import check_grads
 from jax import nn
 from jax import random
@@ -36,12 +38,384 @@ import jax.numpy as jnp
 
 config.parse_flags_with_absl()
 
+def _check_cudnn_backend(fn, *args, **kwargs):
+  lowered = jax.jit(fn).lower(*args, **kwargs)
+  hlo = lowered.as_text('stablehlo', debug_info=True)
+  return '__cudnn$fmha' in hlo
 
+_cudnn_dbias_error = 'cuDNN only supports bias gradient'
+
+def quantize_to_qtype(x, q_dtype, compute_dtype, scale):
+  # Explicitly cast the max values to the compute dtype to avoid unnecessary
+  # casting to FP32 during the subsequent math operations."
+  assert q_dtype in (jnp.float8_e4m3fn, )
+  dtype_max = jnp.finfo(q_dtype).max.astype(compute_dtype)
+  scaled_x = x / jnp.broadcast_to(
+      jnp.asarray(scale, dtype=compute_dtype), x.shape
+  )
+  clipped_x = jnp.clip(scaled_x, -dtype_max, dtype_max)
+  return clipped_x.astype(q_dtype)
+
+def quantize_dequantize(x, q_dtype, scale, compute_dtype):
+  qx = quantize_to_qtype(x, q_dtype, compute_dtype, scale)
+  out = qx.astype(x.dtype) * jnp.broadcast_to(
+      jnp.asarray(scale, dtype=x.dtype), qx.shape
+  )
+  return out
+
+def _generate_quantized_tensors(
+    batch, lhs_non_contract, contract, rhs_non_contract,
+    configs, dtype=jnp.float32,
+  ):
+  cast_to_representable = partial(
+      quantize_dequantize,
+      scale=jnp.ones((1,)),
+      compute_dtype=dtype,
+  )
+
+  k1, k2 = jax.random.split(jax.random.key(123), 2)
+
+  a = cast_to_representable(
+      jax.random.uniform(
+          k1, (batch, lhs_non_contract, contract), minval=-1.0, dtype=dtype
+      ),
+      configs[0].data_type,
+  )
+  b = cast_to_representable(
+      jax.random.uniform(
+          k2, (batch, rhs_non_contract, contract), minval=-1.0, dtype=dtype
+      ),
+      configs[1].data_type,
+  )
+
+  a_q, a_scales = quantize(a, configs[0])
+  b_q, b_scales = quantize(b, configs[1])
+
+  return a, b, a_q, b_q, a_scales, b_scales
+
+def create_mxfp8_configs_if_available():
+  if _dtypes.float8_e8m0fnu is None:
+    raise unittest.SkipTest("float8_e8m0fnu is not available.")
+
+  return [nn.get_scaled_dot_general_config("mxfp8") for _ in range(3)]
+
+
+@jtu.with_config(jax_legacy_prng_key="allow",
+                 jax_numpy_dtype_promotion="standard")
 class NNFunctionsTest(jtu.JaxTestCase):
-  @jtu.skip_on_flag("jax_skip_slow_tests", True)
+
+  @parameterized.product(
+      contract=[160, 96],
+      lhs_non_contract=[240, 100],
+      dtype=[jnp.float16, jnp.bfloat16, jnp.float32],
+  )
+  def testScaledMatmul(self, contract, lhs_non_contract, dtype):
+    if not jtu.test_device_matches(["gpu", "cpu"]):
+      raise unittest.SkipTest("Test requires GPU or CPU.")
+    if jtu.is_device_cuda() and not jtu.is_cuda_compute_capability_at_least("10.0"):
+      raise unittest.SkipTest("Needs compute capability 10.0 or higher.")
+    # TODO: Re-enable once scaled dot is implemented for ROCm in XLA.
+    if jtu.is_device_rocm():
+      self.skipTest("Skipped on ROCm: scaled dot not yet supported in XLA.")
+    # Check if float8_e8m0fnu is available
+    configs = create_mxfp8_configs_if_available()
+    batch, rhs_non_contract = 4, 256
+    a, b, a_q, b_q, a_scales, b_scales = _generate_quantized_tensors(
+        batch, lhs_non_contract, contract, rhs_non_contract,
+        configs, dtype=dtype,
+    )
+    out = nn.scaled_matmul(a_q, b_q, a_scales, b_scales,
+                           preferred_element_type=dtype)
+    out_ref = jnp.matmul(a.astype(jnp.float32),
+                         jnp.transpose(b, (0, 2, 1)).astype(jnp.float32))
+    self.assertArraysAllClose(
+        out, out_ref.astype(dtype), rtol=1e-3, atol=1e-3
+    )
+
+  @parameterized.product(
+      is_training=[True, False],
+      output_type=[jnp.float16, jnp.bfloat16, jnp.float32],
+  )
+  def testScaledDotGeneral(
+      self, is_training, output_type):
+    if not jtu.test_device_matches(["gpu"]):
+      raise unittest.SkipTest("Test requires GPU.")
+    if jtu.is_device_cuda() and not jtu.is_cuda_compute_capability_at_least("10.0"):
+      raise unittest.SkipTest("Needs compute capability 10.0 or higher.")
+    # TODO: Re-enable once scaled dot is implemented for ROCm in XLA.
+    if jtu.is_device_rocm():
+      self.skipTest("Skipped on ROCm: scaled dot not yet supported in XLA.")
+
+    configs = create_mxfp8_configs_if_available()
+    cast_to_representable = partial(
+        quantize_dequantize,
+        scale=jnp.ones((1,)),
+        compute_dtype=jnp.float32,
+    )
+    k1, k2 = jax.random.split(jax.random.key(0), 2)
+    a_shape = [2, 256, 96]
+    b_shape = [2, 96, 160]
+    dimension_numbers = (([2], [1]), ([0], [0]))
+    a = cast_to_representable(
+        jax.random.uniform(k1, a_shape, minval=-1.0, dtype=output_type),
+        configs[0].data_type,
+    )
+    b = cast_to_representable(
+        jax.random.uniform(k2, b_shape, minval=-1.0, dtype=output_type),
+        configs[1].data_type,
+    )
+
+    scaled_dot_general_fn = partial(
+        nn.scaled_dot_general, configs=configs
+    )
+    def fwd(a, b, is_ref=False):
+      fn = jax.lax.dot_general if is_ref else scaled_dot_general_fn
+      y = fn(a, b, dimension_numbers,
+             preferred_element_type=output_type)
+      return jnp.sum(y)
+
+    if is_training:
+      j_train = jax.jit(jax.value_and_grad(fwd, argnums=[0, 1]))
+
+      j_train_ref = jax.jit(
+          jax.value_and_grad(partial(fwd, is_ref=True), argnums=[0, 1])
+      )
+      out, (x_grad, w_grad) = j_train(a, b)
+      out_ref, (x_grad_ref, w_grad_ref) = j_train_ref(a, b)
+
+      self.assertArraysAllClose(out, out_ref, rtol=1e-2, atol=1e-2)
+      self.assertArraysAllClose(x_grad, x_grad_ref, rtol=1e-2, atol=1e1)
+      self.assertArraysAllClose(w_grad, w_grad_ref, rtol=1e-2, atol=1e1)
+    else:
+      j_inference = jax.jit(fwd)
+      j_inference_ref = jax.jit(partial(fwd, is_ref=True))
+      out = j_inference(a, b)
+      out_ref = j_inference_ref(a, b)
+      self.assertArraysAllClose(out, out_ref, rtol=1e-2, atol=1e-2)
+
+  @parameterized.product(
+      dtype=[jnp.bfloat16, jnp.float16],
+      group_num=[1, 2, 4],
+      use_vmap=[False, True],
+      impl=['cudnn', 'xla'],
+  )
+  def testDotProductAttention(self, dtype, group_num, use_vmap, impl):
+    if impl == 'cudnn' and jtu.is_device_rocm():
+      raise unittest.SkipTest("cuDNN not available on ROCm.")
+    if impl == 'cudnn' and not jtu.is_cuda_compute_capability_at_least("8.0"):
+      raise unittest.SkipTest("Needs compute capability 8.0 or higher.")
+    if impl == 'cudnn' and dtype == jnp.float32:
+      raise unittest.SkipTest("cuDNN only supports fp16 or bf16.")
+    if impl == 'cudnn' and jtu.is_cuda_version_at_least(13, 0):
+      raise unittest.SkipTest("cuDNN creates no execution plans on CUDA 13.0.")
+
+    B, S, T, N, H, G = 2, 128, 128, 4, 32, group_num
+    keys = random.split(random.PRNGKey(0), 5)
+    Q = random.normal(keys[0], (B, T, N, H), dtype)
+    K = random.normal(keys[1], (B, S, N // G, H), dtype)
+    V = random.normal(keys[2], (B, S, N // G, H), dtype)
+    grad = random.normal(keys[3], (B, T, N, H), dtype)
+    lse_grad = random.normal(keys[4], (B, T, N), dtype)
+    bias, mask = None, None
+
+    sdpa = nn.dot_product_attention
+    sdpa_ref = partial(sdpa, implementation=None)
+    sdpa_ans = partial(sdpa, implementation=impl)
+    sdpa_ref_lse = partial(sdpa, implementation=None, return_residual=True)
+    sdpa_ans_lse = partial(sdpa, implementation=impl, return_residual=True)
+    if use_vmap:
+      sdpa_ans = jax.vmap(sdpa_ans, in_axes=(0, 0, 0, None, None), out_axes=0)
+
+    # For testing purposes, we call the non-GQA version without vmap in the
+    # reference code
+    K_ref = jnp.repeat(K, G, axis=2)
+    V_ref = jnp.repeat(V, G, axis=2)
+    out_ref, sdpa_vjp_ref = jax.vjp(sdpa_ref, Q, K_ref, V_ref, bias, mask)
+    out_ans, sdpa_vjp_ans = jax.vjp(sdpa_ans, Q, K, V, bias, mask)
+
+    out_ref_lse, sdpa_vjp_ref_lse = jax.vjp(sdpa_ref_lse, Q, K_ref, V_ref, bias, mask)
+    out_ans_lse, sdpa_vjp_ans_lse = jax.vjp(sdpa_ans_lse, Q, K, V, bias, mask)
+
+    dQ_ref, dK_ref, dV_ref = sdpa_vjp_ref(grad)[:3]
+    dQ_ans, dK_ans, dV_ans = sdpa_vjp_ans(grad)[:3]
+    dK_ref = dK_ref.reshape(B, S, N // G, G, H).sum(axis=3)
+    dV_ref = dV_ref.reshape(B, S, N // G, G, H).sum(axis=3)
+
+    dQ_ref_lse, dK_ref_lse, dV_ref_lse = sdpa_vjp_ref_lse((grad, lse_grad))[:3]
+    dQ_ans_lse, dK_ans_lse, dV_ans_lse = sdpa_vjp_ans_lse((grad, lse_grad))[:3]
+    dK_ref_lse = dK_ref_lse.reshape(B, S, N // G, G, H).sum(axis=3)
+    dV_ref_lse = dV_ref_lse.reshape(B, S, N // G, G, H).sum(axis=3)
+
+    if impl == 'cudnn':
+      self.assertTrue(_check_cudnn_backend(sdpa_ans, Q, K, V, bias, mask))
+      self.assertTrue(_check_cudnn_backend(sdpa_vjp_ans, grad))
+      self.assertTrue(_check_cudnn_backend(sdpa_ans_lse, Q, K, V, bias, mask))
+      self.assertTrue(_check_cudnn_backend(sdpa_vjp_ans_lse, (grad, lse_grad)))
+
+    self.assertAllClose(out_ref, out_ans, atol=.01, rtol=.01)
+    self.assertAllClose(dQ_ref, dQ_ans, rtol=.01, atol=.01)
+    self.assertAllClose(dK_ref, dK_ans, rtol=.01, atol=.01)
+    self.assertAllClose(dV_ref, dV_ans, rtol=.01, atol=.01)
+
+    self.assertAllClose(out_ref_lse[0], out_ans_lse[0], atol=.01, rtol=.01)
+    self.assertAllClose(out_ref_lse[1], out_ans_lse[1], atol=.01, rtol=.01)
+    self.assertAllClose(dQ_ref_lse, dQ_ans_lse, rtol=.01, atol=.01)
+    self.assertAllClose(dK_ref_lse, dK_ans_lse, rtol=.01, atol=.01)
+    self.assertAllClose(dV_ref_lse, dV_ans_lse, rtol=.01, atol=.01)
+
+  @parameterized.product(
+      mask_mode=['bias', 'causal', 'padding', 'custom', ('causal', 'padding'),
+                 ('custom', 'padding'), ('bias', 'causal'),
+                 ('causal', 'sliding_window')],
+  )
+  def testDotProductAttentionMask(self, mask_mode):
+    if isinstance(mask_mode, str):
+      mask_mode = (mask_mode,)
+    # ROCm: use XLA implementation instead of cuDNN
+    use_cudnn = jtu.is_device_cuda()
+    if use_cudnn:
+      if not jtu.is_cuda_compute_capability_at_least("8.0"):
+        raise unittest.SkipTest("Requires compute capability 8.0 or higher.")
+      if jtu.is_cuda_version_at_least(13, 0):
+        raise unittest.SkipTest("cuDNN creates no execution plans on CUDA 13.0.")
+
+    dtype = jnp.bfloat16
+    B, S, T, N, H = 2, 128, 128, 4, 32
+    keys = random.split(random.PRNGKey(0), 4)
+    Q = random.normal(keys[0], (B, T, N, H), dtype)
+    K = random.normal(keys[1], (B, S, N, H), dtype)
+    V = random.normal(keys[2], (B, S, N, H), dtype)
+    grad = random.normal(keys[3], (B, T, N, H), dtype)
+    bias, mask = None, None
+    q_seqlen, kv_seqlen = None, None
+    window_size = None
+
+    is_causal = 'causal' in mask_mode
+    if 'padding' in mask_mode:
+      q_seqlen = jnp.array([T // 2, T // 4], dtype=jnp.int32)
+      kv_seqlen = jnp.array([S // 4, S // 2], dtype=jnp.int32)
+    if 'custom' in mask_mode:
+      # Use a generated causal mask as the custom mask.
+      custom_mask = jnp.tril(jnp.ones((T, S), dtype=jnp.bool_))
+      mask = custom_mask[None, None, :, :]
+    if 'bias' in mask_mode:
+      bias = random.normal(keys[4], (1, N, T, S), dtype)
+    if 'sliding_window' in mask_mode:
+      window_size = (3, 2) if is_causal else (3, 0)
+
+    sdpa = nn.dot_product_attention
+    impl = 'cudnn' if use_cudnn else 'xla'
+    sdpa_ref = partial(sdpa, is_causal=is_causal, implementation=None)
+    sdpa_ans = partial(sdpa, is_causal=is_causal, implementation=impl)
+
+    args = (Q, K, V, bias, mask)
+    kwargs = {'query_seq_lengths': q_seqlen, 'key_value_seq_lengths': kv_seqlen}
+
+    # Convert the kargs to positional args for the jax.vjp.
+    fn_ref = lambda q, k, v, b, m, qs, kvs: sdpa_ref(
+        q, k, v, b, m, query_seq_lengths=qs, key_value_seq_lengths=kvs,
+        local_window_size=window_size,
+    )
+    fn_ans = lambda q, k, v, b, m, qs, kvs: sdpa_ans(
+        q, k, v, b, m, query_seq_lengths=qs, key_value_seq_lengths=kvs,
+        local_window_size=window_size,
+    )
+    out_ref, sdpa_vjp_ref = jax.vjp(fn_ref, *args, q_seqlen, kv_seqlen)
+    out_ans, sdpa_vjp_ans = jax.vjp(fn_ans, *args, q_seqlen, kv_seqlen)
+    dQ_ref, dK_ref, dV_ref, dbias_ref = sdpa_vjp_ref(grad)[:4]
+    dQ_ans, dK_ans, dV_ans, dbias_ans = sdpa_vjp_ans(grad)[:4]
+
+    # Check if cudnn backend is called (only on CUDA).
+    if use_cudnn:
+      self.assertTrue(_check_cudnn_backend(sdpa_ans, *args, **kwargs))
+      self.assertTrue(_check_cudnn_backend(sdpa_vjp_ans, grad))
+
+    self.assertAllClose(out_ref, out_ans, atol=.01, rtol=.01)
+    self.assertAllClose(dQ_ref, dQ_ans, rtol=.02, atol=.02)
+    self.assertAllClose(dK_ref, dK_ans, rtol=.02, atol=.02)
+    self.assertAllClose(dV_ref, dV_ans, rtol=.01, atol=.01)
+    self.assertAllClose(dbias_ref, dbias_ans, rtol=.02, atol=.02)
+
+  def testDotProductAttentionFloat64MaskDebugInfs(self):
+    # Regression test for https://github.com/jax-ml/jax/issues/37422
+    with jax.enable_x64():
+      T, S, K, N, H = 5, 7, 3, 6, 11
+      mask = jnp.arange(S) <= S // 2
+      with self.assertNoWarnings():
+        with jax.debug_infs(True):
+          out = nn.dot_product_attention(
+              jnp.zeros((T, N, H), dtype=jnp.float64),
+              jnp.zeros((S, K, H), dtype=jnp.float64),
+              jnp.zeros((S, K, H), dtype=jnp.float64),
+              mask=mask,
+          )
+          out.block_until_ready()
+
+  @parameterized.product(
+      batch_size=[1, 16],
+      use_vmap=[False, True],
+  )
+  def testDotProductAttentionBiasGradient(self, batch_size, use_vmap):
+    # ROCm: use XLA implementation instead of cuDNN
+    use_cudnn = jtu.is_device_cuda()
+    if use_cudnn:
+      if not jtu.is_cuda_compute_capability_at_least("8.0"):
+        raise unittest.SkipTest("Requires compute capability 8.0 or higher.")
+      if jtu.is_cuda_version_at_least(13, 0):
+        raise unittest.SkipTest("cuDNN creates no execution plans on CUDA 13.0.")
+
+    dtype = jnp.bfloat16
+    B, S, N, H = batch_size, 128, 4, 32
+    keys = random.split(random.PRNGKey(0), 2)
+    x = random.normal(keys[0], (B, S, N, H), dtype)
+    bias = random.normal(keys[1], (B, N, S, S), dtype=dtype)
+    mask = jnp.ones((1, 1, S), dtype=jnp.bool_)
+
+    def attention(x, bias, mask, impl):
+      return jax.nn.dot_product_attention(
+          query=x,
+          key=x,
+          value=x,
+          bias=bias,
+          mask=mask,
+          is_causal=False,
+          implementation=impl,
+      )
+    attn_ref = partial(attention, impl=None)
+    attn_ans = partial(attention, impl='cudnn' if use_cudnn else 'xla')
+    if use_vmap:
+      attn_batched_ref = jax.vmap(attn_ref, in_axes=(0, 0, None))
+      attn_batched_ans = jax.vmap(attn_ans, in_axes=(0, 0, None))
+    else:
+      attn_batched_ref = attn_ref
+      attn_batched_ans = attn_ans
+
+    fwd_ref = jax.jit(attn_batched_ref)
+    fwd_ans = jax.jit(attn_batched_ans)
+    y_ref = fwd_ref(x, bias, mask)
+    y_ans = fwd_ans(x, bias, mask)
+    self.assertAllClose(y_ref, y_ans)
+
+    @jax.jit
+    def bwd_ref(x, bias, mask):
+      _, f_vjp = jax.vjp(attn_ref, x, bias, mask)
+      return f_vjp(x)
+    @jax.jit
+    def bwd_ans(x, bias, mask):
+      _, f_vjp = jax.vjp(attn_ans, x, bias, mask)
+      return f_vjp(x)
+
+    _, dbias_ref, _ = bwd_ref(x, bias, mask)
+    _, dbias_ans, _ = bwd_ans(x, bias, mask)
+    self.assertAllClose(dbias_ans, dbias_ref, rtol=0.1, atol=0.1)
+
   def testSoftplusGrad(self):
     check_grads(nn.softplus, (1e-8,), order=4,
-                rtol=1e-2 if jtu.test_device_matches(["tpu"]) else None)
+                rtol=1e-2 if jtu.test_device_matches(["tpu"]) else None,
+                modes=["fwd"])
+    check_grads(nn.softplus, (1e-8,), order=4,
+                rtol=1e-2 if jtu.test_device_matches(["tpu"]) else None,
+                modes=["rev"])
 
   def testSoftplusGradZero(self):
     check_grads(nn.softplus, (0.,), order=1,
@@ -84,7 +458,11 @@ class NNFunctionsTest(jtu.JaxTestCase):
 
   def testSquareplusGrad(self):
     check_grads(nn.squareplus, (1e-8,), order=4,
-                rtol=1e-2 if jtu.test_device_matches(["tpu"]) else None)
+                rtol=1e-2 if jtu.test_device_matches(["tpu"]) else None,
+                modes=["fwd"])
+    check_grads(nn.squareplus, (1e-8,), order=4,
+                rtol=1e-2 if jtu.test_device_matches(["tpu"]) else None,
+                modes=["rev"])
 
   def testSquareplusGradZero(self):
     check_grads(nn.squareplus, (0.,), order=1,
@@ -104,7 +482,11 @@ class NNFunctionsTest(jtu.JaxTestCase):
 
   def testMishGrad(self):
     check_grads(nn.mish, (1e-8,), order=4,
-                rtol=1e-2 if jtu.test_device_matches(["tpu"]) else None)
+                rtol=1e-2 if jtu.test_device_matches(["tpu"]) else None,
+                modes=["fwd"])
+    check_grads(nn.mish, (1e-8,), order=4,
+                rtol=1e-2 if jtu.test_device_matches(["tpu"]) else None,
+                modes=["rev"])
 
   def testMishGradZero(self):
     check_grads(nn.mish, (0.,), order=1,
@@ -127,7 +509,12 @@ class NNFunctionsTest(jtu.JaxTestCase):
     check_grads(nn.relu, (1.,), order=3, rtol=rtol)
     check_grads(nn.relu, (-1.,), order=3, rtol=rtol)
     jaxpr = jax.make_jaxpr(jax.grad(nn.relu))(0.)
-    self.assertGreaterEqual(len(jaxpr.jaxpr.eqns), 2)
+    self.assertGreaterEqual(len(jaxpr.eqns), 2)
+
+  def testReluGradAtZero(self):
+    # https://dl.acm.org/doi/10.5555/3540261.3540297
+    grad = jax.grad(nn.relu)(0.)
+    self.assertEqual(grad, 0.)
 
   def testRelu6Grad(self):
     rtol = 1e-2 if jtu.test_device_matches(["tpu"]) else None
@@ -157,9 +544,9 @@ class NNFunctionsTest(jtu.JaxTestCase):
     val = nn.mish(1e3)
     self.assertAllClose(val, 1e3, check_dtypes=False, atol=1e-3)
 
-  @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def testEluGrad(self):
-    check_grads(nn.elu, (1e4,), order=4, eps=1.)
+    check_grads(nn.elu, (1e4,), order=4, eps=1., modes=["fwd"])
+    check_grads(nn.elu, (1e4,), order=4, eps=1., modes=["rev"])
 
   def testEluValue(self):
     val = nn.elu(1e4)
@@ -179,29 +566,36 @@ class NNFunctionsTest(jtu.JaxTestCase):
   def testGelu(self, approximate):
     def gelu_reference(x):
       return x * scipy.stats.norm.cdf(x)
-    rng = jtu.rand_default(self.rng())
-    args_maker = lambda: [rng((4, 5, 6), jnp.float32)]
+    args_maker = lambda: [jnp.linspace(-12, 5, 10000, dtype=jnp.float32)]
+    rtol = 2e-5
+    atol = 1e-3 if approximate else 0
     self._CheckAgainstNumpy(
-      gelu_reference, partial(nn.gelu, approximate=approximate), args_maker,
-      check_dtypes=False, tol=1e-3 if approximate else None)
+        gelu_reference,
+        partial(nn.gelu, approximate=approximate),
+        args_maker,
+        check_dtypes=False,
+        tol=0,
+        rtol=rtol,
+        atol=atol,
+    )
 
   @parameterized.parameters(*itertools.product(
       (jnp.float32, jnp.bfloat16, jnp.float16),
       (partial(nn.gelu, approximate=False),
        partial(nn.gelu, approximate=True),
-       nn.relu, nn.softplus, nn.sparse_plus, nn.sigmoid, nn.squareplus, nn.mish)))
+       nn.relu, nn.identity, nn.softplus, nn.sparse_plus, nn.sigmoid, nn.squareplus, nn.mish)))
   def testDtypeMatchesInput(self, dtype, fn):
     x = jnp.zeros((), dtype=dtype)
     out = fn(x)
     self.assertEqual(out.dtype, dtype)
 
   def testEluMemory(self):
-    # see https://github.com/google/jax/pull/1640
+    # see https://github.com/jax-ml/jax/pull/1640
     with jax.enable_checks(False):  # With checks we materialize the array
       jax.make_jaxpr(lambda: nn.elu(jnp.ones((10 ** 12,))))  # don't oom
 
   def testHardTanhMemory(self):
-    # see https://github.com/google/jax/pull/1640
+    # see https://github.com/jax-ml/jax/pull/1640
     with jax.enable_checks(False):  # With checks we materialize the array
       jax.make_jaxpr(lambda: nn.hard_tanh(jnp.ones((10 ** 12,))))  # don't oom
 
@@ -238,7 +632,7 @@ class NNFunctionsTest(jtu.JaxTestCase):
 
   @parameterized.parameters([nn.softmax, nn.log_softmax])
   def testSoftmaxWhereGrad(self, fn):
-    # regression test for https://github.com/google/jax/issues/19490
+    # regression test for https://github.com/jax-ml/jax/issues/19490
     x = jnp.array([36., 10000.])
     mask = x < 1000
 
@@ -280,6 +674,26 @@ class NNFunctionsTest(jtu.JaxTestCase):
 
     self.assertAllClose(out_masked, out_filtered)
 
+  def testStandardizeNegativeVariance(self):
+    # Regression test for https://github.com/google/jax/issues/30426
+    x = jnp.array([-11., -11., -11.]) + 3e-6
+    result = jax.nn.standardize(x)
+    self.assertFalse(jnp.any(jnp.isnan(result)))
+
+  def testStandardizeStableAlgorithm(self):
+    # Regression test for https://github.com/jax-ml/jax/issues/37281
+    # The stable algorithm should give consistent results regardless of
+    # compilation context.
+    x = jnp.array([1e6, 1e6 + 1, 1e6 + 2], dtype=jnp.float32)
+    result_eager = nn.standardize(x, algorithm="stable")
+    result_jit = jax.jit(lambda x: nn.standardize(x, algorithm="stable"))(x)
+    self.assertAllClose(result_eager, result_jit, atol=1e-5)
+    # Should be close to [-1, 0, 1] * scale
+    self.assertFalse(jnp.any(jnp.isnan(result_eager)))
+    # Fast algorithm should also work (backward compat)
+    result_fast = nn.standardize(x, algorithm="fast")
+    self.assertFalse(jnp.any(jnp.isnan(result_fast)))
+
   def testOneHot(self):
     actual = nn.one_hot(jnp.array([0, 1, 2]), 3)
     expected = jnp.array([[1., 0., 0.],
@@ -314,7 +728,7 @@ class NNFunctionsTest(jtu.JaxTestCase):
     self.assertAllClose(actual, expected)
 
   def testOneHotConcretizationError(self):
-    # https://github.com/google/jax/issues/3654
+    # https://github.com/jax-ml/jax/issues/3654
     msg = r"in jax.nn.one_hot argument `num_classes`"
     with self.assertRaisesRegex(core.ConcretizationTypeError, msg):
       jax.jit(nn.one_hot)(3, 5)
@@ -330,11 +744,16 @@ class NNFunctionsTest(jtu.JaxTestCase):
     actual = nn.one_hot(jnp.array([1, 2, 0]), 3, axis=-2)
     self.assertAllClose(actual, expected, check_dtypes=False)
 
+  def testOneHotNonInteger(self):
+    with self.assertDeprecationWarnsOrRaises("jax-nn-one-hot-float-input",
+                                             "jax.nn.one_hot input should be integer-typed"):
+      nn.one_hot(jnp.array([1.0]), 3)
+
   def testTanhExists(self):
     nn.tanh  # doesn't crash
 
   def testCustomJVPLeak(self):
-    # https://github.com/google/jax/issues/8171
+    # https://github.com/jax-ml/jax/issues/8171
     @jax.jit
     def fwd():
       a = jnp.array(1.)
@@ -350,7 +769,7 @@ class NNFunctionsTest(jtu.JaxTestCase):
       fwd()  # doesn't crash
 
   def testCustomJVPLeak2(self):
-    # https://github.com/google/jax/issues/8171
+    # https://github.com/jax-ml/jax/issues/8171
     # The above test uses jax.nn.sigmoid, as in the original #8171, but that
     # function no longer actually has a custom_jvp! So we inline the old def.
 
@@ -374,12 +793,74 @@ class NNFunctionsTest(jtu.JaxTestCase):
     with jax.checking_leaks():
       fwd()  # doesn't crash
 
+  @parameterized.product(
+      shape=[(5,), (3, 5), (2, 3, 5)],
+      use_where=[True, False],
+      keepdims=[True, False],
+  )
+  def testLogMeanExp(self, shape, use_where, keepdims):
+    x = self.rng().rand(*shape) * 2 - 1
+    axis = self.rng().randint(0, x.ndim)
+    if use_where:
+      where = self.rng().randint(0, 2, size=shape).astype(bool)
+    else:
+      where = None
+    got = nn.logmeanexp(x, axis=axis, where=where, keepdims=keepdims)
+    expected = jnp.log(jnp.mean(jnp.exp(x), axis=axis, where=where, keepdims=keepdims))
+    self.assertAllClose(got, expected, atol=1e-3)
+
+  def testLog1mExp(self):
+    x, expected = jnp.array([
+        [0.1, jnp.log(1 - jnp.exp(-0.1))],
+        [1.1, jnp.log(1 - jnp.exp(-1.1))],
+        [0, -jnp.inf],
+        [1, -0.45867515],
+        [1e2, 0.0],
+        [1e-5, jnp.log(1e-5)],
+        [-1, jnp.nan],
+        [-1e-2, jnp.nan],
+        [-1e2, jnp.nan],
+        [jnp.inf, 0.0],
+    ]).T
+    got = nn.log1mexp(x)
+    self.assertAllClose(got, expected, rtol=1e-3, atol=1e-3)
+
+  def testLog1mExpGrad(self):
+    check_grads(
+        nn.log1mexp,
+        (jnp.array([1e-2, 1e-1, 1e0, 1e1, 1e2]),),
+        order=1,
+        rtol=1e-2 if jtu.test_device_matches(["tpu"]) else 1e-3,
+        atol=1e-3,
+    )
+
+  def testDotProductAttention_localWindowSizeWithoutMask(self):
+    dtype = jnp.float32
+    B, S, T, N, H = 2, 128, 128, 4, 32
+    keys = random.split(random.PRNGKey(0), 3)
+    Q = random.normal(keys[0], (B, T, N, H), dtype)
+    K = random.normal(keys[1], (B, S, N, H), dtype)
+    V = random.normal(keys[2], (B, S, N, H), dtype)
+
+    output_large_window = nn.dot_product_attention(
+        Q, K, V, mask=None, local_window_size=(32, 32)
+    )
+
+    output_small_window = nn.dot_product_attention(
+        Q, K, V, mask=None, local_window_size=(1, 1)
+    )
+
+    self.assertFalse(
+        jnp.allclose(output_large_window, output_small_window),
+        "Attention output should differ with different local_window_size, even without a mask.",
+    )
+
 
 InitializerRecord = collections.namedtuple(
   "InitializerRecord",
   ["name", "initializer", "shapes", "dtypes"])
 
-ALL_SHAPES = [(2,), (2, 2), (2, 3), (3, 2), (2, 3, 4), (4, 3, 2), (2, 3, 4, 5)]
+ALL_SHAPES = [(), (2,), (2, 2), (2, 3), (3, 2), (2, 3, 4), (4, 3, 2), (2, 3, 4, 5)]
 
 def initializer_record(name, initializer, dtypes, min_dims=2, max_dims=4):
   shapes = [shape for shape in ALL_SHAPES
@@ -397,7 +878,30 @@ INITIALIZER_RECS = [
     initializer_record("lecun_uniform", nn.initializers.lecun_uniform, jtu.dtypes.inexact),
     initializer_record("orthogonal", nn.initializers.orthogonal, jtu.dtypes.floating, 2, 2),
     initializer_record("truncated_normal", nn.initializers.truncated_normal, jtu.dtypes.floating, 1),
-    initializer_record("delta_orthogonal", nn.initializers.delta_orthogonal, jtu.dtypes.floating, 4, 4)
+    initializer_record("delta_orthogonal", nn.initializers.delta_orthogonal, jtu.dtypes.floating, 4, 4),
+    initializer_record(
+        "variance_scaling_fan_geo_avg",
+        partial(nn.initializers.variance_scaling, 1, "fan_geo_avg", "normal"),
+        jtu.dtypes.floating,
+    ),
+    initializer_record(
+        "variance_scaling_fan_in",
+        partial(nn.initializers.variance_scaling, 1, "fan_in", "normal", in_axis=[0], out_axis=[]),
+        jtu.dtypes.floating,
+        min_dims=1,
+    ),
+    initializer_record(
+        "variance_scaling_fan_in",
+        partial(nn.initializers.variance_scaling, 1, "fan_in", "normal", in_axis=[], out_axis=[0]),
+        jtu.dtypes.floating,
+        min_dims=1,
+    ),
+    initializer_record(
+        "variance_scaling_fan_in",
+        partial(nn.initializers.variance_scaling, 1, "fan_in", "normal", in_axis=[], out_axis=[]),
+        jtu.dtypes.floating,
+        min_dims=0,
+    ),
 ]
 
 
@@ -416,7 +920,34 @@ class NNInitializersTest(jtu.JaxTestCase):
     val = initializer(rng, shape, dtype)
 
     self.assertEqual(shape, jnp.shape(val))
-    self.assertEqual(jax.dtypes.canonicalize_dtype(dtype), jnp.dtype(val))
+    self.assertEqual(jax.dtypes.canonicalize_dtype(dtype), val.dtype)
+
+  @jtu.sample_product(
+    rows=range(4),
+    cols=range(4),
+    dtype=jtu.dtypes.floating,
+  )
+  def testInitializerOrthogonalZeroSize(self, rows, cols, dtype):
+    rng = random.PRNGKey(0)
+    initializer = nn.initializers.orthogonal()
+    val = initializer(rng, (rows, cols), dtype)
+    assert val.shape == (rows, cols)
+    assert val.dtype == dtype
+
+    if jtu.test_device_matches(["tpu"]):
+      atol = 2e-3
+      rtol = 1e-2
+    else:
+      atol = None
+      rtol = None
+
+    if rows <= cols:
+      m = val @ val.T
+      self.assertAllClose(m, jnp.eye(rows, dtype=dtype), atol=atol, rtol=rtol)
+
+    if cols <= rows:
+      m = val.T @ val
+      self.assertAllClose(m, jnp.eye(cols, dtype=dtype), atol=atol, rtol=rtol)
 
   @parameterized.parameters(itertools.chain.from_iterable(
     jtu.sample_product_testcases(
@@ -432,7 +963,7 @@ class NNInitializersTest(jtu.JaxTestCase):
     val = initializer(rng, shape)
 
     self.assertEqual(shape, jnp.shape(val))
-    self.assertEqual(jax.dtypes.canonicalize_dtype(dtype), jnp.dtype(val))
+    self.assertEqual(jax.dtypes.canonicalize_dtype(dtype), val.dtype)
 
   def testVarianceScalingMultiAxis(self):
     rng = random.PRNGKey(0)
@@ -462,10 +993,17 @@ class NNInitializersTest(jtu.JaxTestCase):
 
     with self.assertRaisesRegex(
       ValueError,
-      "Can't compute input and output sizes of a 1"
-      "-dimensional weights tensor. Must be at least 2D."
+      "Can't compute input and output sizes of a 1-dimensional"
+      " weights tensor with default in_axis. Must be at least 2D or specify"
+      " in_axis explicitly.",
     ):
       initializer(rng, shape)
+
+  def testIdentity(self):
+    x  = jnp.array([1., 2., 3.])
+    self.assertAllClose(nn.identity(x), x, check_dtypes=False)
+    grad = jax.grad(nn.identity)(6.0)
+    self.assertEqual(grad, 1.)
 
   def testAccidentalUpcasting(self):
     rng = random.PRNGKey(0)

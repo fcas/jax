@@ -29,7 +29,7 @@ Usage::
   #
   # Returns:
   #   (f32[qy_size, k], i32[qy_size, k])
-  @functools.partial(jax.jit, static_argnames=["k", "recall_target"])
+  @jax.jit(static_argnames=["k", "recall_target"])
   def mips(qy, db, k=10, recall_target=0.95):
     dists = jax.lax.dot(qy, db.transpose())
     # Computes max_k along the last dimension
@@ -78,12 +78,11 @@ from jax._src import ad_util
 from jax._src import core
 from jax._src import dispatch
 from jax._src import dtypes
+from jax._src.numpy.indexing import take_along_axis
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
-from jax._src.interpreters import xla
-from jax._src.lax import lax
-from jax._src.lib import xla_client as xc
+from jax._src.lib import _jax
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import func
 from jax._src.lib.mlir.dialects import hlo
@@ -99,6 +98,11 @@ def approx_max_k(operand: Array,
   """Returns max ``k`` values and their indices of the ``operand`` in an approximate manner.
 
   See https://arxiv.org/abs/2206.14286 for the algorithm details.
+
+  **Note:** This algorithm does not guarantee stability. If there are tied values
+  in the operand, the returned indices may not preserve their original relative
+  order. In the event of a tie that crosses the top-k boundary, the exact subset
+  of indices returned is implementation-defined.
 
   Args:
     operand : Array to search for max-k. Must be a floating number type.
@@ -129,7 +133,7 @@ def approx_max_k(operand: Array,
   >>> import functools
   >>> import jax
   >>> import numpy as np
-  >>> @functools.partial(jax.jit, static_argnames=["k", "recall_target"])
+  >>> @jax.jit(static_argnames=["k", "recall_target"])
   ... def mips(qy, db, k=10, recall_target=0.95):
   ...   dists = jax.lax.dot(qy, db.transpose())
   ...   # returns (f32[qy_size, k], i32[qy_size, k])
@@ -158,6 +162,11 @@ def approx_min_k(operand: Array,
   """Returns min ``k`` values and their indices of the ``operand`` in an approximate manner.
 
   See https://arxiv.org/abs/2206.14286 for the algorithm details.
+
+  **Note:** This algorithm does not guarantee stability. If there are tied values
+  in the operand, the returned indices may not preserve their original relative
+  order. In the event of a tie that crosses the top-k boundary, the exact subset
+  of indices returned is implementation-defined.
 
   Args:
     operand : Array to search for min-k. Must be a floating number type.
@@ -188,7 +197,7 @@ def approx_min_k(operand: Array,
   >>> import functools
   >>> import jax
   >>> import numpy as np
-  >>> @functools.partial(jax.jit, static_argnames=["k", "recall_target"])
+  >>> @jax.jit(static_argnames=["k", "recall_target"])
   ... def l2_ann(qy, db, half_db_norms, k=10, recall_target=0.95):
   ...   dists = half_db_norms - jax.lax.dot(qy, db.transpose())
   ...   return jax.lax.approx_min_k(dists, k=k, recall_target=recall_target)
@@ -229,54 +238,31 @@ def _approx_top_k_abstract_eval(operand, *, k, reduction_dimension,
   if not dtypes.issubdtype(operand.dtype, np.floating):
     raise ValueError('operand must be a floating type')
   reduction_input_size = dims[reduction_dimension]
-  dims[reduction_dimension] = xc.ops.ApproxTopKReductionOutputSize(
-      reduction_input_size, len(dims), k, recall_target, aggregate_to_topk,
-      reduction_input_size_override)[0]
-  return (operand.update(
-      shape=dims, dtype=operand.dtype, weak_type=operand.weak_type),
-          operand.update(shape=dims, dtype=np.dtype(np.int32)))
-
-
-def _comparator_builder(op_type, is_max_k):
-  c = xc.XlaBuilder(
-      'top_k_{}_comparator'.format('gt' if is_max_k else 'lt'))
-  p0 = xla.parameter(c, 0, xc.Shape.scalar_shape(op_type))
-  p1 = xla.parameter(c, 1, xc.Shape.scalar_shape(op_type))
-  xla.parameter(c, 2, xc.Shape.scalar_shape(np.dtype(np.int32)))
-  xla.parameter(c, 3, xc.Shape.scalar_shape(np.dtype(np.int32)))
-  if is_max_k:
-    cmp_result = xc.ops.Gt(p0, p1)
+  if aggregate_to_topk:
+    dims[reduction_dimension] = k
+  elif core.is_constant_shape((reduction_input_size, k)):
+    dims[reduction_dimension] = _jax.approx_top_k_reduction_output_size(
+        reduction_input_size, len(dims), k, recall_target, aggregate_to_topk,
+        reduction_input_size_override)[0]
   else:
-    cmp_result = xc.ops.Lt(p0, p1)
-  return c.build(cmp_result)
-
+    raise NotImplementedError(
+         "approx_top_k with aggregate_to_topk=False not yet implemented when "
+         f"either the `k` ({k}) or the "
+         f" reduction dimension size ({reduction_input_size}) are symbolic")
+  operand_s = operand.sharding
+  if operand_s.spec[reduction_dimension] is not None:
+    raise core.ShardingTypeError(
+        f"reduction dimension {reduction_dimension} in operand"
+        f" {operand.str_short()} should be unsharded i.e. the spec of that dim"
+        " should be `None`.")
+  return (operand.update(shape=dims, dtype=operand.dtype,
+                         weak_type=operand.weak_type,
+                         manual_axis_type=operand.mat, sharding=operand_s),
+          operand.update(shape=dims, dtype=np.dtype(np.int32),
+                         manual_axis_type=operand.mat, sharding=operand_s))
 
 def _get_init_val_literal(op_type, is_max_k):
   return np.array(-np.inf if is_max_k else np.inf, dtype=op_type)
-
-def _approx_top_k_tpu_translation(ctx, avals_in, avals_out, operand, *, k,
-                                  reduction_dimension, recall_target, is_max_k,
-                                  reduction_input_size_override,
-                                  aggregate_to_topk):
-  c = ctx.builder
-  op_shape = c.get_shape(operand)
-  if not op_shape.is_array():
-    raise ValueError(f'operand must be an array, but was {op_shape}')
-  op_dims = op_shape.dimensions()
-  op_type = op_shape.element_type()
-  if reduction_dimension < 0:
-    reduction_dimension = len(op_dims) + reduction_dimension
-  comparator = _comparator_builder(op_type, is_max_k)
-  init_val_literal = _get_init_val_literal(op_type, is_max_k)
-  iota = xc.ops.Iota(c, xc.Shape.array_shape(np.dtype(np.int32), op_dims),
-                     reduction_dimension)
-  init_val = xc.ops.Constant(c, init_val_literal)
-  init_arg = xc.ops.Constant(c, np.int32(-1))
-  out = xc.ops.ApproxTopK(c, [operand, iota], [init_val, init_arg], k,
-                          reduction_dimension, comparator, recall_target,
-                          aggregate_to_topk, reduction_input_size_override)
-  return xla.xla_destructure(c, out)
-
 
 def _comparator_builder_mlir(ctx, op_type, is_max_k):
   scalar = ir.RankedTensorType.get([], op_type)
@@ -323,10 +309,9 @@ def _approx_top_k_lowering(ctx, operand, *, k,
 
   init_arg = hlo.constant(ir.DenseElementsAttr.get(np.int32(-1)))
   init_val_array = _get_init_val_literal(ctx.avals_in[0].dtype, is_max_k)
-  init_val = mlir.ir_constant(init_val_array.reshape(()))
+  init_vals = [mlir.ir_constant(init_val_array.reshape(()))]
 
   backend_config = {
-    "top_k" : mlir.i64_attr(k),
     "reduction_dim" : mlir.i64_attr(reduction_dimension),
     "recall_target" : mlir.ir.FloatAttr.get(recall_type, recall_target),
     "aggregate_to_topk" : mlir.ir.BoolAttr.get(aggregate_to_topk),
@@ -338,17 +323,32 @@ def _approx_top_k_lowering(ctx, operand, *, k,
   if all(core.is_constant_shape(aval_out.shape) for aval_out in ctx.avals_out):
     result_shapes = None
   else:
-    result_shapes = [
-        mlir.shape_tensor(mlir.eval_dynamic_shape(ctx, aval_out.shape))
-        for aval_out in ctx.avals_out]
+    result_shapes, _ = mlir.ir_tree_registry.flatten([
+        mlir.shape_tensor(ctx.module_context, mlir.eval_dynamic_shape(ctx, aval_out.shape))
+        for aval_out in ctx.avals_out
+    ])
 
-  out = mlir.custom_call(
-      "ApproxTopK",
-      result_types=[mlir.aval_to_ir_type(aval) for aval in ctx.avals_out],
-      operands=[operand, iota, init_val, init_arg],
-      called_computations=[comparator.name.value],
-      backend_config=backend_config,
-      result_shapes=result_shapes)
+  flat_res_types, _ = mlir.ir_tree_registry.flatten([
+      mlir.aval_to_ir_types(ctx.module_context, a) for a in ctx.avals_out
+  ])
+  if core.is_constant_dim(k):
+    backend_config["top_k"] = mlir.i64_attr(k)
+    out = mlir.custom_call(
+        "ApproxTopK",
+        result_types=flat_res_types,
+        operands=[operand, iota, *init_vals, init_arg],
+        called_computations=[comparator.name.value],
+        backend_config=backend_config,
+        result_shapes=result_shapes)
+  else:
+    k_value, = mlir.eval_dynamic_shape_as_vals(ctx, (k,))
+    out = mlir.custom_call(
+        "stablehlo.dynamic_approx_top_k",
+        result_types=flat_res_types,
+        operands=[operand, iota, *init_vals, init_arg, k_value],
+        called_computations=[comparator.name.value],
+        backend_config=backend_config,
+        result_shapes=result_shapes)
 
   return out.results
 
@@ -395,19 +395,14 @@ def _approx_top_k_jvp(primals, tangents, *, k, reduction_dimension,
                                     reduction_input_size_override,
                                     aggregate_to_topk)
   if type(tangent) is ad_util.Zero:
-    tangent_out = ad_util.Zero.from_value(val_out)
+    tangent_out = ad_util.p2tz(val_out)
   else:
     arg_shape = arg_out.shape
     rank = len(arg_shape)
     if reduction_dimension < 0:
       reduction_dimension += rank
-    iotas = [
-        lax.broadcasted_iota(arg_out.dtype, arg_shape, i) for i in range(rank)
-    ]
-    idx = tuple(
-        arg_out if i == reduction_dimension else iotas[i] for i in range(rank))
-    tangent_out = tangent[idx]
-  return (val_out, arg_out), (tangent_out, ad_util.Zero.from_value(arg_out))
+    tangent_out = take_along_axis(tangent, arg_out, axis=reduction_dimension)
+  return (val_out, arg_out), (tangent_out, ad_util.p2tz(arg_out))
 
 
 approx_top_k_p = core.Primitive('approx_top_k')

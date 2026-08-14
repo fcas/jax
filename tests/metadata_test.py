@@ -37,11 +37,11 @@ class MetadataTest(jtu.JaxTestCase):
 
   def test_jit_metadata(self):
     hlo = module_to_string(jax.jit(jnp.sin).lower(1.).compiler_ir())
-    self.assertRegex(hlo, r'loc\("jit\(sin\)/jit\(main\)/sin"')
+    self.assertRegex(hlo, r'loc\("jit\(sin\)/sin"')
     def foo(x):
       return jnp.sin(x)
     hlo = module_to_string(jax.jit(foo).lower(1.).compiler_ir())
-    self.assertRegex(hlo, r'loc\("jit\(foo\)/jit\(main\)/sin"')
+    self.assertRegex(hlo, r'loc\("jit\(foo\)/sin"')
 
   @unittest.skip("TODO") # TODO(jekbradbury)
   def test_nested_jit_metadata(self):
@@ -70,8 +70,8 @@ class MetadataTest(jtu.JaxTestCase):
     def foo(x):
       return jnp.sin(x)
     hlo = module_to_string(jax.jit(jax.grad(foo)).lower(1.).compiler_ir())
-    self.assertRegex(hlo, r'loc\(".*jvp\(jit\(foo\)\)/cos"')
-    self.assertRegex(hlo, r'loc\(".*transpose\(jvp\(jit\(foo\)\)\)/mul"')
+    self.assertRegex(hlo, r'loc\(".*jvp\(jit\(foo\)\)"')
+    self.assertRegex(hlo, r'loc\(".*transpose\(jvp\(jit\(foo\)\)\)"')
 
   def test_cond_metadata(self):
     def true_fun(x):
@@ -79,9 +79,8 @@ class MetadataTest(jtu.JaxTestCase):
     def false_fun(x):
       return jnp.cos(x)
     def f(which, x):
-      return jax.lax.cond(which, x, true_fun, x, false_fun)
+      return jax.lax.cond(which, true_fun, false_fun, x)
     hlo = module_to_string(jax.jit(f).lower(True, 1.).compiler_ir())
-    self.assertRegex(hlo, r'loc\(".*cond\[linear=\(False, False\)\]"')
     self.assertRegex(hlo, r'loc\(".*cond/branch_0_fun/cos"')
     self.assertRegex(hlo, r'loc\(".*cond/branch_1_fun/sin"')
 
@@ -91,6 +90,7 @@ class MetadataTest(jtu.JaxTestCase):
     hlo = module_to_string(jax.jit(f).lower(jnp.arange(8.0)).compiler_ir())
     self.assertNotRegex(hlo, r'<.* at 0x[0-9a-fA-F]+>')
 
+  @unittest.skip('b/352539562')
   def test_source_file_prefix_removal(self):
 
     def make_hlo():

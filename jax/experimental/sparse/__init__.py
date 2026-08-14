@@ -15,10 +15,17 @@
 """
 .. currentmodule:: jax.experimental.sparse
 
+.. note::
+
+  The methods in ``jax.experimental.sparse`` are experimental reference implementations,
+  and not recommended for use in performance-critical applications. The submodule is no
+  longer being actively developed, but the team will continue supporting existing features
+  as best we can.
+
 The :mod:`jax.experimental.sparse` module includes experimental support for sparse matrix
-operations in JAX. It is under active development, and the API is subject to change. The
-primary interfaces made available are the :class:`BCOO` sparse array type, and the
-:func:`sparsify` transform.
+operations in JAX. The primary interfaces made available are the :class:`BCOO` sparse array
+type, and the :func:`sparsify` transform.
+
 
 Batched-coordinate (BCOO) sparse matrices
 -----------------------------------------
@@ -189,7 +196,7 @@ To fit the same model on sparse data, we can apply the :func:`sparsify` transfor
 """
 
 # Note: import <name> as <name> is required for names to be exported.
-# See PEP 484 & https://github.com/google/jax/issues/7570
+# See PEP 484 & https://github.com/jax-ml/jax/issues/7570
 
 from jax.experimental.sparse.ad import (
     jacfwd as jacfwd,

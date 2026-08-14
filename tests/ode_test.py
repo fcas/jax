@@ -40,7 +40,6 @@ class ODETest(jtu.JaxTestCase):
 
     self.assertAllClose(jax_result, scipy_result, check_dtypes=False, atol=tol, rtol=tol)
 
-  @jtu.skip_on_devices("tpu")
   def test_pend_grads(self):
     def pend(_np, y, _, m, g):
       theta, omega = y
@@ -57,7 +56,6 @@ class ODETest(jtu.JaxTestCase):
     jtu.check_grads(integrate, (y0, ts, *args), modes=["rev"], order=2,
                     atol=tol, rtol=tol)
 
-  @jtu.skip_on_devices("tpu", "gpu")
   def test_pytree_state(self):
     """Test calling odeint with y(t) values that are pytrees."""
     def dynamics(y, _t):
@@ -71,7 +69,6 @@ class ODETest(jtu.JaxTestCase):
     jtu.check_grads(integrate, (y0, ts), modes=["rev"], order=2,
                     atol=tol, rtol=tol)
 
-  @jtu.skip_on_devices("tpu")
   def test_weird_time_pendulum_grads(self):
     """Test that gradients are correct when the dynamics depend on t."""
     def dynamics(_np, y, t):
@@ -87,11 +84,9 @@ class ODETest(jtu.JaxTestCase):
     jtu.check_grads(integrate, (y0, ts), modes=["rev"], order=2,
                     rtol=tol, atol=tol)
 
-  @jtu.skip_on_devices("tpu", "gpu")
   def test_decay(self):
     def decay(_np, y, t, arg1, arg2):
-        return -_np.sqrt(t) - y + arg1 - _np.mean((y + arg2)**2)
-
+      return -_np.sqrt(t) - y + arg1 - _np.mean((y + arg2)**2)
 
     rng = self.rng()
     args = (rng.randn(3), rng.randn(3))
@@ -105,7 +100,6 @@ class ODETest(jtu.JaxTestCase):
     jtu.check_grads(integrate, (y0, ts, *args), modes=["rev"], order=2,
                     rtol=tol, atol=tol)
 
-  @jtu.skip_on_devices("tpu", "gpu")
   def test_swoop(self):
     def swoop(_np, y, t, arg1, arg2):
       return _np.array(y - _np.sin(t) - _np.cos(t) * arg1 + arg2)
@@ -121,7 +115,6 @@ class ODETest(jtu.JaxTestCase):
     jtu.check_grads(integrate, (y0, ts, *args), modes=["rev"], order=2,
                     rtol=tol, atol=tol)
 
-  @jtu.skip_on_devices("tpu", "gpu")
   def test_swoop_bigger(self):
     def swoop(_np, y, t, arg1, arg2):
       return _np.array(y - _np.sin(t) - _np.cos(t) * arg1 + arg2)
@@ -137,9 +130,8 @@ class ODETest(jtu.JaxTestCase):
     jtu.check_grads(integrate, (big_y0, ts, *args), modes=["rev"], order=2,
                     rtol=tol, atol=tol)
 
-  @jtu.skip_on_devices("tpu", "gpu")
   def test_odeint_vmap_grad(self):
-    # https://github.com/google/jax/issues/2531
+    # https://github.com/jax-ml/jax/issues/2531
 
     def dx_dt(x, *args):
       return 0.1 * x
@@ -167,18 +159,16 @@ class ODETest(jtu.JaxTestCase):
     rtol = {jnp.float32: 1e-5, jnp.float64: 2e-15}
     self.assertAllClose(ans, expected, check_dtypes=False, atol=atol, rtol=rtol)
 
-  @jtu.skip_on_devices("tpu", "gpu")
   def test_disable_jit_odeint_with_vmap(self):
-    # https://github.com/google/jax/issues/2598
+    # https://github.com/jax-ml/jax/issues/2598
     with jax.disable_jit():
       t = jnp.array([0.0, 1.0])
       x0_eval = jnp.zeros((5, 2))
       f = lambda x0: odeint(lambda x, _t: x, x0, t)
       jax.vmap(f)(x0_eval)  # doesn't crash
 
-  @jtu.skip_on_devices("tpu", "gpu")
   def test_grad_closure(self):
-    # simplification of https://github.com/google/jax/issues/2718
+    # simplification of https://github.com/jax-ml/jax/issues/2718
     def experiment(x):
       def model(y, t):
         return -x * y
@@ -186,9 +176,8 @@ class ODETest(jtu.JaxTestCase):
       return history[-1]
     jtu.check_grads(experiment, (0.01,), modes=["rev"], order=1)
 
-  @jtu.skip_on_devices("tpu", "gpu")
   def test_grad_closure_with_vmap(self):
-    # https://github.com/google/jax/issues/2718
+    # https://github.com/jax-ml/jax/issues/2718
     @jax.jit
     def experiment(x):
       def model(y, t):
@@ -202,14 +191,13 @@ class ODETest(jtu.JaxTestCase):
     ans = h[11], g[11]
 
     expected_h = experiment(t[11])
-    expected_g = (experiment(t[11] + 1e-5) - expected_h) / 1e-5
+    expected_g = (experiment(t[11] + 5e-6) - experiment(t[11] - 5e-6)) / 1e-5
     expected = expected_h, expected_g
 
     self.assertAllClose(ans, expected, check_dtypes=False, atol=1e-2, rtol=1e-2)
 
-  @jtu.skip_on_devices("tpu", "gpu")
   def test_forward_mode_error(self):
-    # https://github.com/google/jax/issues/3558
+    # https://github.com/jax-ml/jax/issues/3558
 
     def f(k):
       return odeint(lambda x, t: k*x, 1.,  jnp.linspace(0, 1., 50)).sum()
@@ -217,9 +205,8 @@ class ODETest(jtu.JaxTestCase):
     with self.assertRaisesRegex(TypeError, "can't apply forward-mode.*"):
       jax.jacfwd(f)(3.)
 
-  @jtu.skip_on_devices("tpu", "gpu")
   def test_closure_nondiff(self):
-    # https://github.com/google/jax/issues/3584
+    # https://github.com/jax-ml/jax/issues/3584
 
     def dz_dt(z, t):
       return jnp.stack([z[0], z[1]])
@@ -230,10 +217,9 @@ class ODETest(jtu.JaxTestCase):
 
     jax.grad(f)(jnp.ones(2))  # doesn't crash
 
-  @jtu.skip_on_devices("tpu", "gpu")
   def test_complex_odeint(self):
-    # https://github.com/google/jax/issues/3986
-    # https://github.com/google/jax/issues/8757
+    # https://github.com/jax-ml/jax/issues/3986
+    # https://github.com/jax-ml/jax/issues/8757
 
     def dy_dt(y, t, alpha):
       return alpha * y * jnp.exp(-t).astype(y.dtype)
@@ -251,7 +237,6 @@ class ODETest(jtu.JaxTestCase):
     with jax.numpy_dtype_promotion('standard'):
       jtu.check_grads(f, (y0, ts, alpha), modes=["rev"], order=2, atol=tol, rtol=tol)
 
-  @jtu.skip_on_devices("tpu", "gpu")
   def test_hmax(self):
     """Test max step size control."""
 

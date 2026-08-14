@@ -26,7 +26,7 @@ is invoked from the other framework.
 The native serialization mode has several advantages:
 
    * supports virtually all operations supported by native execution, e.g.,
-     `xmap`, `shard_map`, `pmap`, parallel collective operations, and all
+     `shard_map`, `pmap`, parallel collective operations, and all
      primitives at all data types.
    * uses standard native JAX code paths for lowering, and thus it is easier
      to trust that the semantics and performance stays faithful to the native
@@ -54,46 +54,12 @@ The reasons we wrap the StableHLO in a TensorFlow op are:
     do the just-in-time preprocessing needed for shape polymorphism.
   * the semantics of JAX program is still preserved faithfully because it
     is entirely captured by the StableHLO serialization.
-
-For backwards compatibility purposes, and for special uses,
-the JAX-TensorFlow interoperation APIs can be used also
-in a **graph serialization** mode (the only mode available before version 0.4.7,
-and the default mode before JAX version 0.4.15),
-without going through StableHLO.
-
-  * For calling JAX functions from TensorFlow,
-    it is possible to request that the JAX function be lowered with one TensorFlow
-    op for each JAX primitive.
-    This can be achieved by setting `native_serialization=False`.
-    This enables the following:
-
-       * TensorFlow eager mode execution, e.g., for debugging,
-       * producing a `tf.Graph` for consumption by tooling that understands
-         TensorFlow ops but does not yet work with StableHLO,
-         e.g., TFLite and TensorFlow.js.
-       * using the more mature support for dynamic shapes in TensorFlow.
-         [StableHLO does have support for dynamic
-         shapes](https://github.com/openxla/stablehlo/blob/main/rfcs/20230704-dynamism-101.md),
-         and in the near future we expect it will support shape polymorphism
-         to the same extent as graph serialization.
-
-    Even in the graph serialization mode the resulting TensorFlow graph
-    is pretty much 1:1 with the StableHLO module
-    that would be obtained through native serialization.
-
   * For calling TensorFlow functions from JAX, if the resulting JAX program
     is executed in op-by-op mode (i.e., not under `jax.jit` or `jax.pmap`
     and not inside `lax.cond` or `lax.scan`)
     then the target TensorFlow function is executed in eager mode. This can
     be useful if the target TensorFlow function is not lowerable to HLO, e.g.,
     is using strings.
-
-To disable native serialization, you can do the following, in decreasing
-priority order:
-
-  * set `native_serialization=False`, or
-  * use the configuration flag `--jax2tf_default_native_serialization=false`, or
-  * use the environment variable `JAX2TF_DEFAULT_NATIVE_SERIALIZATION=false`.
 
 We describe below some general concepts and capabilities, first for
 `jax2tf.convert` and [later](#calling-tensorflow-functions-from-jax)
@@ -102,10 +68,8 @@ For more involved examples, please see examples involving:
 
    * SavedModel for archival ([examples below](#usage-saved-model)), including
      saving [batch-polymorphic functions](#shape-polymorphic-conversion),
-   * TensorFlow Lite ([examples](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/examples/tflite/mnist/README.md)),
-   * TensorFlow.js ([examples](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/examples/tf_js/quickdraw/README.md)),
    * TFX ([examples](https://github.com/tensorflow/tfx/blob/master/tfx/examples/penguin/README.md#instructions-for-using-flax)),
-   * TensorFlow Hub and Keras ([examples](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/examples/README.md)).
+   * TensorFlow Hub and Keras ([examples](https://github.com/jax-ml/jax/blob/main/jax/experimental/jax2tf/examples/README.md)).
 
 [TOC]
 
@@ -138,7 +102,7 @@ f_tf_graph = tf.function(f_tf, autograph=False)
 ```
 
 Note that when using the default native serialization, the target JAX function
-must be jittable (see [JAX - The Sharp Bits](https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html)).
+must be jittable (see [JAX - The Sharp Bits](https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html)).
 In the native serialization mode, under TensorFlow eager
 the whole JAX function executes as one op.
 
@@ -151,8 +115,8 @@ and to avoid warnings and outright errors.
 ## Usage: saved model
 
 You can serialize JAX program into a TensorFlow SavedModel, for use
-with tooling that understands SavedModel. Both in native and non-native
-serialization you can count on 6 months of backwards compatibility (you
+with tooling that understands SavedModel.
+You can count on 6 months of backwards compatibility (you
 can load a function serialized today with tooling that will be built
 up to 6 months in the future), and 3 weeks of limited forwards compatibility
 (you can load a function serialized today with tooling that was built
@@ -237,7 +201,7 @@ params_vars = tf.nest.map_structure(tf.Variable, params)
 prediction_tf = lambda inputs: jax2tf.convert(model_jax)(params_vars, inputs)
 
 my_model = tf.Module()
-# Tell the model saver what are the variables.
+# Tell the model saver what the variables are.
 my_model._variables = tf.nest.flatten(params_vars)
 my_model.f = tf.function(prediction_tf, jit_compile=True, autograph=False)
 tf.saved_model.save(my_model)
@@ -248,7 +212,7 @@ graph (they will be saved in a `variables` area of the model, which is not
 subject to the 2GB limitation).
 
 For examples of how to save a Flax model as a SavedModel see the
-[examples directory](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/examples/README.md).
+[examples directory](https://github.com/jax-ml/jax/blob/main/jax/experimental/jax2tf/examples/README.md).
 
 ### Saved model and differentiation
 
@@ -461,7 +425,7 @@ presence of shape polymorphism, some dimensions may be dimension variables.
 The `polymorphic_shapes` parameter must be either `None`,
 or a pytree of shape specifiers corresponding to the pytree of arguments.
 (A value `None` for `polymorphic_shapes` is equivalent to a list of `None`.
-See [how optional parameters are matched to arguments](https://jax.readthedocs.io/en/latest/pytrees.html#applying-optional-parameters-to-pytrees).)
+See [how optional parameters are matched to arguments](https://docs.jax.dev/en/latest/pytrees.html#applying-optional-parameters-to-pytrees).)
 A shape specifier is combined with a `TensorSpec` as follows:
 
   * A shape specifier of `None` means that the shape is given
@@ -568,6 +532,7 @@ because the shape abstraction that JAX tracing uses is given by the
 actual arguments are more specific and would actually work.
 
 Also,
+
 ```python
 jax2tf.convert(lambda x: jnp.matmul(x, x),
                polymorphic_shapes=["(v, 4)"])(np.ones((4, 4)))
@@ -618,7 +583,7 @@ Cannot solve for values of dimension variables {'a', 'b'}. "
 We can only solve linear uni-variate constraints. "
 Using the following polymorphic shapes specifications: args[0].shape = (a + b,).
 Unprocessed specifications: 'a + b' for dimension size args[0].shape[0]. "
-Please see https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#dimension-variables-must-be-solvable-from-the-input-shapes for more details.
+Please see https://github.com/jax-ml/jax/blob/main/jax/experimental/jax2tf/README.md#dimension-variables-must-be-solvable-from-the-input-shapes for more details.
 ```
 
 ### Shape assertion errors
@@ -644,7 +609,7 @@ Input shapes do not match the polymorphic shapes specification.
 Division had remainder 1 when computing the value of 'd'.
 Using the following polymorphic shapes specifications: args[0].shape = (b, b, 2*d).
 Obtained dimension variables: 'b' = 3 from specification 'b' for dimension args[0].shape[0] (= 3).
-Please see https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#shape-assertion-errors for more details.
+Please see https://github.com/jax-ml/jax/blob/main/jax/experimental/jax2tf/README.md#shape-assertion-errors for more details.
 ```
 
 When using native serialization these are checked by the `tf.XlaCallModule`
@@ -760,7 +725,7 @@ symbolic constraints:
     We plan to improve somewhat this area in the future.
   * Equality constraints are treated as normalization rules.
     E.g., `floordiv(a, b) = c` works by replacing all
-    occurences of the left-hand-side with the right-hand-side.
+    occurrences of the left-hand-side with the right-hand-side.
     You can only have equality constraints where the left-hand-side
     is a multiplication of factors, e.g, `a * b`, or `4 * a`, or
     `floordiv(a, b)`. Thus, the left-hand-side cannot contain
@@ -808,6 +773,7 @@ TypeError: add got incompatible shapes for broadcasting: (a,), (floordiv(b, 2),)
 ```
 
 You can fix this by adding a constraint:
+
 ```python
 jax2tf.convert(lambda x, y: x + y[:y.shape[0] // 2],
                polymorphic_shapes=("a", "b"),
@@ -826,19 +792,19 @@ For example,
 the following code will fail because `a1` and `a2`
 use different scopes (created by `export.symbolic_shape`):
 
-````python
+```python
 a1, = export.symbolic_shape("a,")
 a2, = export.symbolic_shape("a,", constraints=("a >= 8",))
 
 a1 + a2
-````
+```
 
 The symbolic expressions that originate from a single call
 to `export.symbolic_shape` share a scope and
 can be mixed up in arithmetic operations. The result would
 also share the same scope.
 
-You can re-use scopes:
+You can reuse scopes:
 
 ```python
 a, = export.symbolic_shape("a,", constraints=("a >= 8",))
@@ -868,7 +834,7 @@ leads to errors for the following expressions `b == a or b == b` or `b in [a, b]
 even though the error is avoided if we change the order of the comparisons.
 
 We attempted to retain soundness and hashability by creating both hashable and unhashable
-kinds of symbolic dimensions [PR #14200](https://github.com/google/jax/pull/14200),
+kinds of symbolic dimensions [PR #14200](https://github.com/jax-ml/jax/pull/14200),
 but it turned out to be very hard to diagnose hashing failures in user programs because
 often hashing is implicit when using sets or memo tables.
 
@@ -879,7 +845,7 @@ is unsound.
 ### Division of symbolic dimensions is partially supported
 
 JAX will attempt to simplify division and modulo operations,
-e.g., `(a * b + a) // (b + 1) == a` and `6*a + 4 % 3 == 1`.
+e.g., `(a * b + a) // (b + 1) == a` and `(6 * a + 4) % 3 == 1`.
 In particular, JAX will handle the cases when either (a) there
 is no remainder, or (b) the divisor is a constant
 in which case there may be a constant remainder.
@@ -988,7 +954,7 @@ We list here a history of the serialization version numbers:
     June 13th, 2023 (JAX 0.4.13).
   * Version 7 adds support for `stablehlo.shape_assertion` operations and
     for `shape_assertions` specified in `disabled_checks`.
-    See [Errors in presence of shape polymorphism](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#errors-in-presence-of-shape-polymorphism). Supported by XlaCallModule
+    See [Errors in presence of shape polymorphism](https://github.com/jax-ml/jax/blob/main/jax/experimental/jax2tf/README.md#errors-in-presence-of-shape-polymorphism). Supported by XlaCallModule
     since July 12th, 2023 (cl/547482522),
     available in JAX serialization since July 20th, 2023 (JAX 0.4.14),
     and the default since August 12th, 2023 (JAX 0.4.15).
@@ -1005,18 +971,17 @@ We list here a history of the serialization version numbers:
     available in JAX since October 20th, 2023 (JAX 0.4.20),
     and the default since February 1st, 2024 (JAX 0.4.24).
     This is the only supported version as of 27th of March, 2024.
+  * Version 10 propagate the `jax.config.use_shardy_partitioner` value to
+    XlaCallModule.
 
 ## Known issues
 
 `jax2tf` has been in use since 2020 and the vast majority of users encounter
 no problems. However, there are a few rare corner cases
 in which the different conventions of JAX and TensorFlow result in a breakage.
-We try to give an exhaustive list below, specifying whether the limitations
-apply to the native serialization or non-native.
+We try to give an exhaustive list below.
 
 ### Different 64-bit precision in JAX and TensorFlow
-
-Applies to both native and non-native serialization.
 
 JAX behaves somewhat differently than TensorFlow in the handling
 of 32-bit vs. 64-bit values. However, the `jax2tf` lowered function
@@ -1024,7 +989,7 @@ always behaves like the JAX function.
 
 JAX interprets the type of Python scalars differently based on
 `JAX_ENABLE_X64` flag. (See
-[JAX - The Sharp Bits: Double (64bit) precision](https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#double-64bit-precision).)
+[JAX - The Sharp Bits: Double (64bit) precision](https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html#double-64bit-precision).)
 In the default configuration, the
 flag is unset, and JAX interprets Python constants as 32-bit,
 e.g., the type of `3.14` is `float32`. This is also what
@@ -1048,7 +1013,7 @@ jax2tf.convert(jnp.sin)(np.float64(3.14))  # Has type float32
 tf.function(jax2tf.convert(jnp.sin), autograph=False)(tf.Variable(3.14, dtype=tf.float64))
 ```
 
-When the `JAX_ENABLE_X64` flas is set, JAX uses 64-bit types
+When the `JAX_ENABLE_X64` flag is set, JAX uses 64-bit types
 for Python scalars and respects the explicit 64-bit types:
 
 ```python
@@ -1082,11 +1047,9 @@ jax2tf.convert(jax_fun)(tf.Variable(3.14, dtype=jax2tf.dtype_of_val(3.14)))
 
 ### Functions whose arguments and results are nested Python data structures
 
-Applies to both native and non-native serialization.
-
 `jax2tf` can lower functions with arguments and results that are nested
 collections (tuples, lists, dictionaries) of numeric values or JAX arrays
-([pytrees](https://jax.readthedocs.io/en/latest/pytrees.html)). The
+([pytrees](https://docs.jax.dev/en/latest/pytrees.html)). The
 resulting TensorFlow function will take the same kind of arguments except the
 leaves can be numeric values or TensorFlow tensors (`tf.Tensor`, `tf.TensorSpec`, `tf.Variable`).
 
@@ -1160,10 +1123,8 @@ self.assertAllClose(grad_jax.b, grad_tf[1])
 
 ### Lowering gradients for functions with integer arguments or unused arguments
 
-Applies to both native and non-native serialization.
-
 When JAX differentiates functions with integer or boolean arguments, the gradients will
-be zero-vectors with a special `float0` type (see PR 4039](https://github.com/google/jax/pull/4039)).
+be zero-vectors with a special `float0` type (see PR 4039](https://github.com/jax-ml/jax/pull/4039)).
 This type is translated to `int32` when lowering to TF.
 For example,
 
@@ -1239,13 +1200,11 @@ g_jax2tf_0 = tape.gradient(res, xs,
 
 ### Errors due to tf.Module magic conversion during attribute assignment
 
-Applies to both native and non-native serialization.
-
 `tf.Module` will automatically wrap the standard Python container data types into
 trackable classes during attribute assignment.
 Python Dict/List/Tuple are changed to _DictWrapper/_ListWrapper/_TupleWrapper
 classes.
-In most situation, these Wrapper classes work exactly as the standard
+In most situations, these Wrapper classes work exactly as the standard
 Python data types. However, the low-level pytree data structures are different
 and this can lead to errors.
 
@@ -1268,8 +1227,6 @@ input_data = jax.tree_util.tree_unflatten(m.input_data['tree_def'], m.input_data
 
 ### Large saved_model.pb due too many PRNG operations
 
-Applies to both native and non-native serialization.
-
 The default `threefry2x32` PRNG is implemented in JAX with dozens
 of additions and bitwise operations. This means that a single PRNG
 operation in JAX will result in dozens of TF ops after jax2tf.
@@ -1285,19 +1242,15 @@ per PRNG operation. The "unsafe" part is that it doesn't guarantee
 determinism across JAX/XLA versions, and the quality of random
 streams it generates from different keys is less well understood.
 Nevertheless, this should be fine for most inference/serving cases.
-See more details in the [JAX PRNG documentation](https://jax.readthedocs.io/en/latest/jax.random.html?highlight=unsafe_rbg#advanced-rng-configuration).
+See more details in the [JAX PRNG documentation](https://docs.jax.dev/en/latest/jax.random.html?highlight=unsafe_rbg#advanced-rng-configuration).
 
 ### SavedModel supports only first-order gradients
-
-Applies to both native and non-native serialization.
 
 The `jax2tf`-lowered function supports higher-order gradients, but when the
 function is saved in a SavedModel, only the first-order gradient is saved.
 This is primarily a limitation of the SavedModel support for custom gradients.
 
 ### Native serialization supports only select dialects
-
-Applies to native serialization only.
 
 JAX native serialization checks that the code to be serialized contains
 operations only from MLIR dialects that are known to have stability guarantees,
@@ -1306,8 +1259,6 @@ operations from the MHLO dialect, but they are converted to corresponding
 StableHLO operations upon serialization.
 
 ### Native serialization supports only select custom calls
-
-Applies to native serialization only.
 
 JAX natively uses custom calls for lowering of certain primitives.
 The most common example is for the implementation of PRNG on GPUs,
@@ -1328,20 +1279,11 @@ parameter of the `jax2tf` function.
 
 ### XlaCallModule not supported by some TensorFlow tools
 
-Applies to native serialization only.
-
 JAX native serialization uses the `XlaCallModule` TensorFlow op to host
 the StableHLO program obtained from JAX. This is a relatively
-new TensorFlow op and may not be supported by some tools. In fact,
-certain tools that need to do `tf.Graph` inspection and transformation
-cannot work when the whole JAX program is a single TensorFlow op.
-
-This is the case, for example, for the TFLite and TensorFlow.js converters.
-There is work underway to enable more tools to consume StableHLO.
+new TensorFlow op and may not be supported by some tools.
 
 ### Natively serialized JAX modules are platform specific
-
-Applies to native serialization only.
 
 When you use native serialization, JAX will record the platform for
 which the module was serialized, and you will get an error if you
@@ -1409,14 +1351,10 @@ with tf.device('/device:TPU:0'):
 
 ### Unsupported JAX features
 
-Applies to non-native serialization only.
-
-There is currently no support for `pmap`, `xmap`, `shard_map`,
+There is currently no support for `pmap`, `shard_map`,
 nor for the collective operations, except in native serialization.
 
 ### Shape polymorphism with native serialization limitations for `lax.linalg.eigh`
-
-Applies to native serialization only.
 
 JAX lowers `lax.linalg.eigh` using custom calls, and needs to call helper
 functions to determine the workspace size based on the non-batch dimensions.
@@ -1431,201 +1369,6 @@ In presence of shape polymorphism, JAX will always use `syevd`, because `syevj`
 requires knowing the batch dimensions statically in order to compute
 the workspace size. This means that the performance and the numerical behavior
 may be slightly different for small matrices.
-
-### Slow implementation of associative reductions for CPU
-
-Applies to non-native serialization only.
-
-Operations like ``jax.numpy.cumsum`` are lowered by JAX differently based
-on the platform. For TPU, the lowering uses the [HLO ReduceWindow](https://www.tensorflow.org/xla/operation_semantics#reducewindow)
-operation, which has an efficient implementation for the cases when the
-reduction function is associative. For CPU and GPU, JAX uses an alternative
-lowering using [associative scans](https://github.com/google/jax/blob/f08bb50bfa9f6cf2de1f3f78f76e1aee4a78735d/jax/_src/lax/control_flow.py#L2801).
-jax2tf uses the TPU lowering (because it does not support backend-specific lowering)
-and hence it can be slow in some cases on CPU and GPU.
-
-We have filed a bug with the XLA:CPU compiler to improve ReduceWindow.
-Meanwhile, if you run into this problem you can use the
-``--jax2tf_associative_scan_reductions`` flag to get the special
-associative scan lowering.
-You can alternatively use the ``with jax.jax2tf_associative_scan_reductions(True)``
-around the code that invokes the function returned by ``jax2tf.convert``.
-Use this only if it improves the performance for your application.
-
-Note that this lowering may not work as well as the default one in presence
-of shape polymorphism.
-
-### TensorFlow XLA ops
-
-Applies to non-native serialization only.
-
-For most JAX primitives there is a natural TensorFlow op that fits the needed semantics.
-There are a few (listed in [no_xla_limitations.md](g3doc/no_xla_limitations.md)) JAX primitives
-for which there is no single TensorFlow op with matching semantics.
-This is not so surprising, because JAX primitives have been designed
-to be compiled to [HLO ops](https://www.tensorflow.org/xla/operation_semantics),
-while the corresponding TensorFlow ops are sometimes higher-level.
-For the cases when there is no matching canonical TensorFlow op,
-we use a set of special TensorFlow ops that are thin wrappers over HLO ops
-(a subset of those registered in
-[tf2xla/ops/xla_ops.cc](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/compiler/tf2xla/ops/xla_ops.cc)
-and implemented in,
-e.g.,
-[tf2xla/kernels/xla_pad_op.cc](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/compiler/tf2xla/kernels/xla_pad_op.cc).)
-We refer to these ops here as the XLA TensorFlow ops. Note that these are
-still regular TF ops, e.g., they can be saved in a SavedModel.
-
-There are several drawbacks of using XLA TensorFlow ops:
-
-   * These ops will only be executable by a consumer that has XLA linked in.
-   This should not be a problem for TPU execution, since that requires XLA anyway.
-   * These ops are not yet recognized by tools that process
-   tf.Graph, e.g., TensorFlow.js converter or the TensorFlow Lite converter.
-
-As an experimental feature we implemented alternative conversions to avoid the XLA TensorFlow ops.
-You can enable this with the `enable_xla=False` parameter to `jax2tf.convert`.
-For more details see [no_xla_limitations.md](g3doc/no_xla_limitations.md).
-
-### Different performance characteristics
-
-Applies to non-native serialization only.
-
-The lowered code may have slightly different performance characteristics than
-the original JAX code.
-We do expect that the performance characteristics of lowered code
-should be the same as those of JAX when used with the XLA compiler (`tf.function(jit_compile=True)`).
-This is because
-during lowering we try to generate one TensorFlow op for one JAX primitive.
-We expect that the lowering that XLA does is similar to that done by JAX
-before conversion. (This is a hypothesis, we have not yet verified it extensively.)
-
-There is one know case when the performance of the lowered code will be different.
-JAX programs use a [stateless
-deterministic PRNG](https://github.com/google/jax/blob/main/docs/design_notes/prng.md)
-and it has an internal JAX primitive for it.
-This primitive is at the moment lowered to a soup of tf.bitwise operations,
-which has a clear performance penalty. We plan to look into using the
-HLO [RNGBitGenerator](https://www.tensorflow.org/xla/operation_semantics#rngbitgenerator)
-(exposed as a TFXLA op), which does implement
-the same basic Threefry algorithm as JAX’s PRNG, although that would
-result in different results than JAX’s PRNG.
-
-In absence of TensorFlow XLA compilation,
-if one were to write the same functionality in JAX idiomatic code vs.
-native TensorFlow idiomatic code we could end up with very different compilation paths.
-Take for example, the case of batch normalization.
-In TensorFlow if one uses [tf.nn.batch_normalization](https://www.tensorflow.org/api_docs/python/tf/nn/batch_normalization),
-a “high-level” TensorFlow op for batch
-normalization is generated, and in the absence of XLA, on CPU or GPU,
-a custom C++ “high-level” kernel implementing batch normalization is executed.
-In JAX, there is no primitive for batch normalization, and instead the
-operation is decomposed into low-level primitives (e.g., [flax.linen.BatchNorm](https://flax.readthedocs.io/en/latest/_autosummary/flax.linen.BatchNorm.html),
-or haiku.BatchNorm).
-Once those primitives are lowered to TensorFlow, and the resulting code is
-run without XLA, the ensemble of the kernels executed will quite
-possibly behave differently, performance-wise or even numerically,
-than either the TensorFlow native or JAX native batch normalization.
-A similar example is that of an LSTM cell.
-
-
-### Unchecked assumption that the dimension variables take strictly positive values
-
-Applies to non-native serialization only.
-
-The shape polymorphic conversion is sound with the assumption that the dimension
-variables take non-zero values. In the following example, the function to be lowered
-has different behavior for empty shapes. The broken assumption is caught by jax2tf if
-the lowered function is executed eagerly, but not if it is first traced to a
-TensorFlow graph:
-
-```python
-def f_jax(x):
-  return 0 if x.shape[0] == 0 else 1
-
-x0 = np.array([], np.float32)
-self.assertEqual(0, f_jax(x0))  # JAX sees that the x.shape[0] == 0
-
-# jax2tf catches the broken assumption b >= 1 if the lowered function is executed
-# eagerly.
-# Raises: ValueError: Dimension variable b must have integer value >= 1. Found value 0 when solving b == 0
-jax2tf.convert(f_jax, polymorphic_shapes=["b"])(x0)
-
-# However, if we first trace to a TensorFlow graph, we may miss the broken assumption:
-f_tf = tf.function(
-        jax2tf.convert(f_jax, polymorphic_shapes=["b"]), autograph=False
-       ).get_concrete_function(tf.TensorSpec([None], dtype=np.float32))
-self.assertEqual(1, f_tf(x0))
-```
-
-Another possible source of unsoundness is that JAX assumes that all unknown
-dimensions represented by the same dimension variable have equal size. As before,
-this assumption is checked if the lowered function is executed eagerly, but
-it may be missed if it is first traced to a TensorFlow graph:
-
-```python
-def f_jax(x):
-  return 0 if x.shape[0] != x.shape[1] else 1
-
-x45 = np.ones((4, 5), dtype=np.float32)
-self.assertEqual(0, f_jax(x45))  # JAX seems that x.shape[0] != x.shape[1]
-
-# jax2tf catches the broken assumption x.shape[0] == x.shape[1] if the lowered
-# function is executed eagerly.
-# Raises: ValueError: polymorphic shape ('b, b',) has dimension variable 'b' corresponding to multiple values {4, 5}, for argument shapes (TensorShape([4, 5]),)
-jax2tf.convert(f_jax, polymorphic_shapes=["b, b"])(x45)
-
-# However, if we first trace to a TensorFlow graph, we may miss the broken assumption.
-f_tf = tf.function(
-    jax2tf.convert(f_jax, polymorphic_shapes=["b, b"]),
-    autograph=False).get_concrete_function(tf.TensorSpec([None, None], dtype=np.float32))
-self.assertEqual(1, f_tf(x45))
-```
-
-### Incomplete TensorFlow data type coverage
-
-Applies to non-native serialization only.
-
-There are a number of cases when the TensorFlow ops that are used by the
-`jax2tf` are not supported by TensorFlow for the same data types as in JAX.
-There is an
-[up-to-date list of unimplemented cases](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/g3doc/primitives_with_limited_support.md).
-
-If you try to lower and run in TensorFlow a program with partially supported primitives,
-you may see TensorFlow errors that
-a TensorFlow op is used with an unsupported data type, or that
-there is no supported TensorFlow kernel for the op for the given
-data type. The former case can happen even if you `jit_compile`
-the TensorFlow program, and it is a priority to fit. The latter
-case only appears in TensorFlow non-compiled mode; you can
-avoid the problem if you use XLA to `jit_compile` (always recommended).
-
-Our priority is to ensure numerical and performance accuracy for
-the lowered program **when using XLA to compile the lowered program**.
-It is always a good idea to use XLA on the lowered function.
-
-Sometimes you cannot compile the entire TensorFlow function for your
-model, because in addition to the function that is lowered from JAX,
-it may include some pre-processing TensorFlow code that
-is not compilable with XLA, e.g., string parsing. Even in those situations
-you can instruct TensorFlow to compile only the portion that originates
-from JAX:
-
-```python
-def entire_tf_fun(x):
-  y = preprocess_tf_fun_not_compilable(x)
-  # Compile the code that is lowered from JAX
-  z = tf.function(jax2tf.convert(compute_jax_fn),
-                  autograph=False, jit_compile=True)(y)
-  return postprocess_tf_fun_not_compilable(z)
-```
-
-You won't be able to compile the `entire_tf_fun`, but you can still execute
-it knowing that the jax2tf-lowered code is compiled. You can even save
-the function to a SavedModel, knowing that upon restore the
-jax2tf-lowered code will be compiled.
-
-For a more elaborate example, see the test `test_tf_mix_jax_with_uncompilable`
-in [savedmodel_test.py](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/tests/savedmodel_test.py).
 
 # Calling TensorFlow functions from JAX
 
@@ -1703,7 +1446,7 @@ For a more elaborate example, including round-tripping from JAX
 to TensorFlow and back through a SavedModel, with support for
 custom gradients,
 see the test `test_round_trip_custom_grad_saved_model`
-in [call_tf_test.py](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/tests/call_tf_test.py).
+in [call_tf_test.py](https://github.com/jax-ml/jax/blob/main/jax/experimental/jax2tf/tests/call_tf_test.py).
 
 All the metadata inserted by TF during tracing and compilation, e.g.,
 source location information and op names, is carried through to the
@@ -1761,7 +1504,6 @@ def fun_jax(x):
 jax2tf.convert(fun_jax, polymorphic_shapes=["b, ..."])(x)
 ```
 
-The shape polymorphism support for `call_tf` does not yet work for native serialization.
 
 ### Limitations of call_tf
 
@@ -1864,12 +1606,12 @@ purposes of `call_tf`.)
 
 Inside Google, you can turn on logging by using the `--vmodule` argument to
 specify the logging levels for different modules,
-e.g., `--vmodule=jax_export=3`. You can set `TF_DUMP_GRAPH_PREFIX` to
+e.g., `--vmodule=_export=3`. You can set `TF_DUMP_GRAPH_PREFIX` to
 a directory where modules should be dumped, or to `"-"` to dump the
 modules to the log.
 The following modules are useful for debugging JAX native serialization:
 
-  * `jax_export=3` - will log the StableHLO module on serialization.
+  * `_export=3` - will log the StableHLO module on serialization.
   * `jax2tf=3` - will log the parameters to `XlaCallModule` op on serialization.
   * `xla_call_module_loader=3` - will log the StableHLO module upon loading,
     after shape refinements, and on verification error. You can use level `4` to
@@ -1900,7 +1642,7 @@ As of today, the tests are run using `tf_nightly==2.14.0.dev20230720`.
 
 To run jax2tf on GPU, both jaxlib and TensorFlow must be installed with support
 for CUDA. One must be mindful to install a version of CUDA that is compatible
-with both [jaxlib](https://github.com/google/jax/blob/main/README.md#pip-installation) and
+with both [jaxlib](https://github.com/jax-ml/jax/blob/main/README.md#pip-installation) and
 [TensorFlow](https://www.tensorflow.org/install/source#tested_build_configurations).
 
 ## Updating the limitations documentation
@@ -1912,9 +1654,9 @@ JAX primitive, data type, device type, and TensorFlow execution mode (`eager`,
 `graph`, or `compiled`). These limitations are also used
 to generate tables of limitations, e.g.,
 
-   * [List of primitives not supported in JAX](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/g3doc/jax_primitives_coverage.md),
+   * [List of primitives not supported in JAX](https://github.com/jax-ml/jax/blob/main/jax/experimental/jax2tf/g3doc/jax_primitives_coverage.md),
      e.g., due to unimplemented cases in the XLA compiler, and
-   * [List of primitives not supported in jax2tf](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/g3doc/primitives_with_limited_support.md),
+   * [List of primitives not supported in jax2tf](https://github.com/jax-ml/jax/blob/main/jax/experimental/jax2tf/g3doc/primitives_with_limited_support.md),
      e.g., due to unimplemented cases in TensorFlow. This list is incremental
      on top of the unsupported JAX primitives.
 

@@ -12,55 +12,81 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@rules_python//python:defs.bzl", "py_library")
 load(
     "//jaxlib:jax.bzl",
+    "jax_visibility",
     "py_deps",
+    "pytype_library",
 )
 
 package(
     default_applicable_licenses = [],
     default_visibility = [
-        "//:__subpackages__",
+        "//jax:internal",
     ],
 )
 
-py_library(
+pytype_library(
     name = "pallas",
-    srcs = glob(
-        include = ["**/*.py"],
-        exclude = [
-            "triton/*.py",
-            "mosaic/*.py",
-        ],
-    ),
+    srcs = [
+        "__init__.py",
+        "core.py",
+        "cost_estimate.py",
+        "einshape.py",
+        "helpers.py",
+        "hlo_interpreter.py",
+        "mpmd.py",
+        "pallas_call.py",
+        "primitives.py",
+        "utils.py",
+    ],
+    type_checking = "pyrefly",
+    visibility = [
+        "//jax:internal",
+    ] + jax_visibility("pallas"),
     deps = [
         "//jax",
-        "//jax:ad_util",
-        "//jax:core",
-        "//jax:mlir",
-        "//jax:partial_eval",
-        "//jax:pretty_printer",
-        "//jax:tree_util",
-        "//jax:util",
+        "//jax/_src:ad",
+        "//jax/_src:ad_util",
+        "//jax/_src:api",
+        "//jax/_src:api_util",
+        "//jax/_src:basearray",
+        "//jax/_src:batching",
+        "//jax/_src:checkify",
+        "//jax/_src:config",
+        "//jax/_src:core",
+        "//jax/_src:custom_derivatives",
+        "//jax/_src:debugging",
+        "//jax/_src:dtypes",
+        "//jax/_src:effects",
+        "//jax/_src:export",
+        "//jax/_src:flattree",
+        "//jax/_src:frozen_dict",
+        "//jax/_src:hijax",
+        "//jax/_src:lax",
+        "//jax/_src:mesh",
+        "//jax/_src:mlir",
+        "//jax/_src:numpy",
+        "//jax/_src:partial_eval",
+        "//jax/_src:pretty_printer",
+        "//jax/_src:shard_map",
+        "//jax/_src:source_info_util",
+        "//jax/_src:traceback_util",
+        "//jax/_src:tree_util",
+        "//jax/_src:typing",
+        "//jax/_src:util",
         "//jax/_src/lib",
     ] + py_deps("numpy"),
 )
 
-py_library(
-    name = "gpu",
-    visibility = [],
-    deps = [
-        ":pallas",
-        "//jax/_src/pallas/triton",
+pytype_library(
+    name = "pallas_test_util",
+    srcs = [
+        "pallas_test_util.py",
     ],
-)
-
-py_library(
-    name = "tpu",
-    visibility = [],
+    type_checking = "pyrefly",
     deps = [
         ":pallas",
-        "//jax/_src/pallas/mosaic",
+        "//jax/_src:test_util",
     ],
 )

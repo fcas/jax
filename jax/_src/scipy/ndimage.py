@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import functools
 import itertools
 import operator
-from typing import Callable
+
+import numpy as np
 
 from jax._src import api
+from jax._src import dtypes
+from jax._src import numpy as jnp
 from jax._src import util
-from jax import lax
-import jax.numpy as jnp
+from jax._src.lax import lax
 from jax._src.typing import ArrayLike, Array
 from jax._src.util import safe_zip as zip
 
@@ -30,7 +32,7 @@ def _nonempty_prod(arrs: Sequence[Array]) -> Array:
   return functools.reduce(operator.mul, arrs)
 
 def _nonempty_sum(arrs: Sequence[Array]) -> Array:
-  return functools.reduce(operator.add, arrs)
+  return sum(arrs[1:], arrs[0])
 
 def _mirror_index_fixer(index: Array, size: int) -> Array:
     s = size - 1 # Half-wavelength of triangular wave
@@ -50,11 +52,11 @@ _INDEX_FIXERS: dict[str, Callable[[Array, int], Array]] = {
 
 
 def _round_half_away_from_zero(a: Array) -> Array:
-  return a if jnp.issubdtype(a.dtype, jnp.integer) else lax.round(a)
+  return a if dtypes.issubdtype(a.dtype, np.integer) else lax.round(a)
 
 
 def _nearest_indices_and_weights(coordinate: Array) -> list[tuple[Array, ArrayLike]]:
-  index = _round_half_away_from_zero(coordinate).astype(jnp.int32)
+  index = _round_half_away_from_zero(coordinate).astype(np.int32)
   weight = coordinate.dtype.type(1)
   return [(index, weight)]
 
@@ -63,11 +65,11 @@ def _linear_indices_and_weights(coordinate: Array) -> list[tuple[Array, ArrayLik
   lower = jnp.floor(coordinate)
   upper_weight = coordinate - lower
   lower_weight = 1 - upper_weight
-  index = lower.astype(jnp.int32)
+  index = lower.astype(np.int32)
   return [(index, lower_weight), (index + 1, upper_weight)]
 
 
-@functools.partial(api.jit, static_argnums=(2, 3, 4))
+@api.jit(static_argnums=(2, 3, 4))
 def _map_coordinates(input: ArrayLike, coordinates: Sequence[ArrayLike],
                      order: int, mode: str, cval: ArrayLike) -> Array:
   input_arr = jnp.asarray(input)
@@ -116,18 +118,12 @@ def _map_coordinates(input: ArrayLike, coordinates: Sequence[ArrayLike],
     else:
       all_valid = functools.reduce(operator.and_, validities)
       contribution = jnp.where(all_valid, input_arr[indices], cval)
-    outputs.append(_nonempty_prod(weights) * contribution)  # type: ignore
+    outputs.append(_nonempty_prod(weights) * contribution)  # pyrefly: ignore[bad-argument-type]
   result = _nonempty_sum(outputs)
-  if jnp.issubdtype(input_arr.dtype, jnp.integer):
+  if dtypes.issubdtype(input_arr.dtype, np.integer):
     result = _round_half_away_from_zero(result)
   return result.astype(input_arr.dtype)
 
-
-"""
-    Only nearest neighbor (``order=0``), linear interpolation (``order=1``) and
-    modes ``'constant'``, ``'nearest'``, ``'wrap'`` ``'mirror'`` and ``'reflect'`` are currently supported.
-
-    """
 
 def map_coordinates(
     input: ArrayLike, coordinates: Sequence[ArrayLike], order: int,
@@ -151,8 +147,13 @@ def map_coordinates(
       * 1: Linear
 
     mode: Points outside the boundaries of the input are filled according to the given mode.
-      JAX supports one of ``('constant', 'nearest', 'mirror', 'wrap', 'reflect')``.
-      Default is 'constant'.
+      JAX supports one of ``('constant', 'nearest', 'mirror', 'wrap', 'reflect')``. Note the
+      ``'wrap'`` mode in JAX behaves as ``'grid-wrap'`` mode in SciPy, and ``'constant'``
+      mode in JAX behaves as ``'grid-constant'`` mode in SciPy. This discrepancy was caused
+      by a former bug in those modes in SciPy (https://github.com/scipy/scipy/issues/2640),
+      which was first fixed in JAX by changing the behavior of the existing modes, and later
+      on fixed in SciPy, by adding modes with new names, rather than fixing the existing
+      ones, for backwards compatibility reasons. Default is 'constant'.
     cval: Value used for points outside the boundaries of the input if ``mode='constant'``
       Default is 0.0.
 
@@ -172,7 +173,7 @@ def map_coordinates(
 
   Note:
     Interpolation near boundaries differs from the scipy function, because JAX
-    fixed an outstanding bug; see https://github.com/google/jax/issues/11097.
+    fixed an outstanding bug; see https://github.com/jax-ml/jax/issues/11097.
     This function interprets the ``mode`` argument as documented by SciPy, but
     not as implemented by SciPy.
   """

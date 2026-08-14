@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 from functools import reduce, partial
 
 from absl.testing import absltest
@@ -62,6 +61,10 @@ class JetTest(jtu.JaxTestCase):
 
     y, terms = jet(fun, primals, series)
     expected_y, expected_terms = jvp_taylor(fun, primals, series)
+
+    outer_struct = jax.tree_util.tree_structure([1] * len(expected_terms))
+    inner_struct = jax.tree_util.tree_structure(y)
+    expected_terms = jax.tree_util.tree_transpose(outer_struct, inner_struct, expected_terms)
 
     self.assertAllClose(y, expected_y, atol=atol, rtol=rtol,
                         check_dtypes=check_dtypes)
@@ -243,6 +246,8 @@ class JetTest(jtu.JaxTestCase):
   @jtu.skip_on_devices("tpu")
   def test_ceil(self):       self.unary_check(jnp.ceil)
   @jtu.skip_on_devices("tpu")
+  def test_trunc(self):       self.unary_check(jnp.trunc)
+  @jtu.skip_on_devices("tpu")
   def test_round(self):      self.unary_check(lax.round)
   @jtu.skip_on_devices("tpu")
   def test_sign(self):       self.unary_check(lax.sign)
@@ -287,6 +292,8 @@ class JetTest(jtu.JaxTestCase):
                                               atol=5e-3)
   @jtu.skip_on_devices("tpu")
   def test_logistic(self):   self.unary_check(lax.logistic, lims=[-100, 100], order=5)
+  @unittest.skipIf(jtu.is_test_rbe() and jtu.is_gil_disabled() and jtu.is_tsan(),
+                   "Consumes too much RAM under FT TSAN: b/456211935")
   @jtu.skip_on_devices("tpu")
   def test_expit2(self):     self.expit_check(lims=[-500, 500], order=5)
   @jtu.skip_on_devices("tpu")
@@ -317,6 +324,8 @@ class JetTest(jtu.JaxTestCase):
   def test_dynamic_slice(self): self.unary_check(partial(lax.dynamic_slice, start_indices=(1,2), slice_sizes=(1,1)))
   @jtu.skip_on_devices("tpu")
   def test_dynamic_update_slice(self): self.unary_check(partial(lax.dynamic_update_slice, start_indices=(1,2), update=np.arange(6.0).reshape(2, 3)))
+  @jtu.skip_on_devices("tpu")
+  def test_copy(self):       self.unary_check(jnp.array)
 
 
   @jtu.skip_on_devices("tpu")
@@ -402,15 +411,17 @@ class JetTest(jtu.JaxTestCase):
     self.assertArraysEqual(g_out_series, f_out_series)
 
   def test_add_any(self):
-    # https://github.com/google/jax/issues/5217
+    # https://github.com/jax-ml/jax/issues/5217
     f = lambda x, eps: x * eps + eps + x
     def g(eps):
       x = jnp.array(1.)
       return jax.grad(f)(x, eps)
     jet(g, (1.,), ([1.],))  # doesn't crash
 
+  @unittest.skipIf(jtu.is_test_rbe() and jtu.is_gil_disabled() and jtu.is_tsan(),
+                   "Consumes too much RAM under FT TSAN: b/456211935")
   def test_scatter_add(self):
-    # very basic test from https://github.com/google/jax/issues/5365
+    # very basic test from https://github.com/jax-ml/jax/issues/5365
     def f(x):
       x0 = x[0]
       x1 = x[1]
@@ -428,6 +439,30 @@ class JetTest(jtu.JaxTestCase):
       return grad(jacfwd(F))(0.)
 
     self.check_jet(h, (0.,), ([1., 2., 3.],), rtol=1e-3)
+
+  def test_stack(self):
+    order = 3
+    rng = self.rng()
+    x1 = rng.randn(2, 3)
+    x2 = rng.randn(2, 3)
+    primals = (x1, x2)
+    terms_in1 = [rng.randn(*x1.shape) for _ in range(order)]
+    terms_in2 = [rng.randn(*x2.shape) for _ in range(order)]
+    series_in = (terms_in1, terms_in2)
+    self.check_jet(lambda *xs: jnp.stack(xs, axis=0), primals, series_in, atol=1e-3, rtol=1e-3)
+    self.check_jet(lambda *xs: jnp.stack(xs, axis=1), primals, series_in, atol=1e-3, rtol=1e-3)
+    self.check_jet(lambda *xs: jnp.stack(xs, axis=-1), primals, series_in, atol=1e-3, rtol=1e-3)
+
+  def test_unstack(self):
+    order = 3
+    rng = self.rng()
+    x = rng.randn(4, 2, 3)
+    primals = (x,)
+    terms_in = [rng.randn(*x.shape) for _ in range(order)]
+    series_in = (terms_in,)
+    self.check_jet(lambda x: lax.unstack(x, axis=0), primals, series_in, atol=1e-3, rtol=1e-3)
+    self.check_jet(lambda x: lax.unstack(x, axis=1), primals, series_in, atol=1e-3, rtol=1e-3)
+    self.check_jet(lambda x: lax.unstack(x, axis=-1), primals, series_in, atol=1e-3, rtol=1e-3)
 
 
 if __name__ == '__main__':

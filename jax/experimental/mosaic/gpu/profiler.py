@@ -13,143 +13,287 @@
 # limitations under the License.
 # ==============================================================================
 
+from collections.abc import Callable
 import contextlib
-import ctypes
-import functools
+import itertools
 import json
+import math
+import os
+import tempfile
+from typing import Literal, overload
+import warnings
 
 import jax
-from jax._src.interpreters import mlir
-from jax._src.lib import mosaic_gpu as mosaic_gpu_lib
-from jax._src.lib import xla_client
+from jax._src import stages
+from jax._src import util
 import jax.numpy as jnp
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import arith
 from jaxlib.mlir.dialects import gpu
 from jaxlib.mlir.dialects import memref
-from jaxlib.mlir.dialects import scf
 import numpy as np
 
 from .utils import *  # noqa: F403
 
+try:
+  from jax._src.lib import mosaic_gpu as mosaic_gpu_lib
+except ImportError:
+  mosaic_gpu_lib = None
+
 # ruff: noqa: F405
-# mypy: ignore-errors
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Cupti:
+  """CUPTI-based profiler."""
 
-xla_client.register_custom_call_target(
-    "mosaic_gpu_record_event",
-    mosaic_gpu_lib._mosaic_gpu_ext._record_event_capsule(),
-    platform="CUDA",
-)
+  # If `True`, detach CUPTI from the process after measurement.
+  finalize: bool = True
 
-record_event_p = jax.core.Primitive("record_event")
-record_event_p.multiple_results = True
+  def measure(
+      self, f, *, aggregate: bool = True, iterations: int = 1,
+  ):
+    if not isinstance(f, (stages.Wrapped, stages.Compiled)):
+      f = jax.jit(f)
 
-@record_event_p.def_abstract_eval
-def _record_event_abstract_eval(*args, event):
-  del event  # Unused.
-  return args
+    def wrapper(*args, **kwargs):
+      if mosaic_gpu_lib is None:
+        raise RuntimeError("CUPTI profiling is not supported on this platform")
 
-@functools.partial(mlir.register_lowering, record_event_p, platform="cuda")
-def _record_event_lowering_rule(ctx, *args, event):
-  ptr_bytes = ctypes.cast(event, ctypes.c_void_p).value.to_bytes(
-      8, byteorder="little"
-  )  # pytype: disable=attribute-error
-  op = mlir.custom_call(
-      "mosaic_gpu_record_event",
-      result_types=[mlir.aval_to_ir_type(aval) for aval in ctx.avals_out],
-      operands=args,
-      backend_config=ptr_bytes,
-      operand_output_aliases={i: i for i in range(len(args))},
-  )
-  return op.results
+      jax.block_until_ready(f(*args, **kwargs))  # Warmup.
+      ext = mosaic_gpu_lib._mosaic_gpu_ext
+      ext._cupti_init()
+      try:
+        all_results = [f(*args, **kwargs) for _ in range(iterations)]
+        for r in all_results:
+          jax.block_until_ready(r)
+        results = all_results[0]
+      finally:
+        timings = ext._cupti_get_timings(self.finalize)
+      if not timings:
+        return results, None
 
-def _record_event(args, event):
-  flat_args, treedef = jax.tree.flatten(args)
-  return jax.tree.unflatten(
-      treedef, record_event_p.bind(*flat_args, event=event)
-  )
+      if len(timings) % iterations != 0:
+        raise RuntimeError(
+            "The number of kernel launches is not divisible by the number of"
+            " iterations"
+        )
+      kernels_per_iter = len(timings) // iterations
+      iter_timings = util.split_list(
+          timings, [kernels_per_iter] * (iterations - 1)
+      )
+      for kernel_idx, (kernel_name, _) in enumerate(iter_timings[0]):
+        for i in range(1, iterations):
+          if iter_timings[i][kernel_idx][0] != kernel_name:
+            raise RuntimeError("Kernel names are not consistent across iterations")
 
-def measure(f, *args):
-  # TODO(apaszke): Raise if this is called under jit.
-  start_event = mosaic_gpu_lib._mosaic_gpu_ext._gpu_event_create()
-  end_event = mosaic_gpu_lib._mosaic_gpu_ext._gpu_event_create()
-  try:
-    @jax.jit
-    def run(*args):
-      return _record_event(f(*_record_event(args, start_event)), end_event)
-    jax.block_until_ready(run(*args))  # Warmup.
-    results = jax.block_until_ready(run(*args))
-    elapsed = mosaic_gpu_lib._mosaic_gpu_ext._gpu_event_elapsed(
-        start_event, end_event
-    )
-  finally:
-    mosaic_gpu_lib._mosaic_gpu_ext._gpu_event_destroy(start_event)
-    mosaic_gpu_lib._mosaic_gpu_ext._gpu_event_destroy(end_event)
-  return results, elapsed
+      if aggregate:
+        iter_timings = [
+            sum(item[1] for item in timings) for timings in iter_timings
+        ]
+
+      return results, iter_timings[0] if len(iter_timings) == 1 else iter_timings
+
+    return wrapper
+
+@overload
+def measure[T, **P](
+    f: Callable[P, T],
+    *,
+    aggregate: Literal[True] = ...,
+    iterations: Literal[1] = ...,
+) -> Callable[P, tuple[T, float | None]]:
+  ...
+
+@overload
+def measure[T, **P](
+    f: Callable[P, T],
+    *,
+    aggregate: Literal[False] = ...,
+    iterations: Literal[1] = ...,
+) -> Callable[P, tuple[T, list[tuple[str, float]] | None]]:
+  ...
+
+@overload
+def measure[T, **P](
+    f: Callable[P, T],
+    *,
+    aggregate: Literal[True] = ...,
+    iterations: int = ...,
+) -> Callable[P, tuple[T, list[float] | None]]:
+  ...
+
+@overload
+def measure[T, **P](
+    f: Callable[P, T],
+    *,
+    aggregate: Literal[False] = ...,
+    iterations: int = ...,
+) -> Callable[P, tuple[T, list[list[tuple[str, float]]] | None]]:
+  ...
+
+
+def measure(
+    f, *, aggregate: bool = True, iterations: int = 1,
+):
+  """Measures the GPU runtime of a function using CUPTI.
+
+  ``measure`` is a higher-order function that wraps a function ``f`` to
+  return GPU runtime in milliseconds, in addition to its regular outputs.
+
+  Args:
+    f: The function to measure.
+    aggregate: Whether to report an aggregate runtime. When ``False`` (only
+      supported by ``mode="cupti"``), the per-kernel timings are returned as a
+      list of tuples ``(<kernel name>, <runtime in ms>)``.
+    iterations: How many times to run the function. Only supported by
+      ``mode="cupti"``. When greater than 1, the return type will become a list
+      of measurements.
+
+  Returns:
+    A function that accepts the same inputs as ``f`` and returns
+    ``(f_outputs, timings)``, where ``f_outputs`` are the outputs of ``f``,
+    and ``timings`` is either a float or a list of tuples, depending on
+    ``aggregate``. If no kernels are launched, ``timings`` is ``None``.
+
+  Notes:
+    `CUPTI (CUDA Profiling Tools Interface)
+    <https://docs.nvidia.com/cupti/index.html>`_ is a high-accuracy profiling
+    API used by Nsight Systems and Nsight Compute. The CUPTI API only allows a
+    single subscriber, so ``measure`` cannot be used with other CUPTI-based
+    tools like CUDA-GDB, Compute Sanitizer, Nsight Systems, or Nsight
+    Compute.
+  """  # fmt: skip
+  if iterations < 1:
+    raise ValueError(f"{iterations=} must be positive")
+  return Cupti().measure(f, aggregate=aggregate, iterations=iterations)
 
 
 class ProfilerSpec:
   ENTER = 0
   EXIT = 1 << 31
 
-  def __init__(self, num_entries: int):
-    self.num_entries = num_entries
-    self.interned_names = {}
+  def __init__(
+      self,
+      entries_per_warpgroup: int,
+      dump_path: str = "sponge",
+      trace_scope: ThreadSubset = ThreadSubset.WARPGROUP,
+      bounds_check: bool = False,
+  ):
+    """Profiler configuration.
 
-  @property
-  def mlir_buffer_type(self) -> ir.Type:
+    Args:
+      entries_per_warpgroup: The size of the profile buffer. Each begin/end
+        event costs 2 entries, and 3 entries are reserved for a header.
+      dump_path: Where to write the trace.
+      trace_scope: Whether one trace covers a warp or a warpgroup.
+      bounds_check: If True, events past the buffer capacity are dropped (the
+        trace is truncated) at the cost of a slightly higher per-event overhead.
+        If False (default), overflowing the buffer corrupts neighbouring SMEM,
+        which usually crashes the kernel.
+    """
+    self.entries_per_warpgroup = entries_per_warpgroup
+    self.interned_names: dict[str, int] = {}
+    self.bounds_check = bounds_check
+    if dump_path == "sponge":
+      self.dump_path = os.getenv(
+          "TEST_UNDECLARED_OUTPUTS_DIR", tempfile.gettempdir()
+      )
+    else:
+      self.dump_path = dump_path
+    if trace_scope not in (ThreadSubset.WARP, ThreadSubset.WARPGROUP):
+      raise ValueError(f"Unsupported trace scope: {trace_scope}")
+    self.trace_scope = trace_scope
+
+  def _num_traces(
+      self, grid: tuple[int, ...], block: tuple[int, ...]
+  ) -> int:
+    if self.trace_scope == ThreadSubset.WARP:
+      scope_size = WARP_SIZE
+    elif self.trace_scope == ThreadSubset.WARPGROUP:
+      scope_size = WARPGROUP_SIZE
+    else:
+      raise NotImplementedError(f"Scope {self.trace_scope} not supported")
+
+    if math.prod(block) % scope_size:
+      raise ValueError(f"Block size is not a multiple of {scope_size}")
+    return math.prod(grid) * math.prod(block) // scope_size
+
+  def mlir_buffer_type(
+      self, grid: tuple[int, ...], block: tuple[int, ...]
+  ) -> ir.MemRefType:
     return ir.MemRefType.get(
-        (1 + self.num_entries,), ir.IntegerType.get_signless(32)
+        (self._num_traces(grid, block) * self.entries_per_warpgroup,),
+        ir.IntegerType.get_signless(32),
     )
 
-  @property
-  def jax_buffer_type(self) -> ir.Type:
-    return jax.ShapeDtypeStruct((1 + self.num_entries,), jnp.uint32)
+  def jax_buffer_type(
+      self, grid: tuple[int, ...], block: tuple[int, ...]
+  ) -> jax.ShapeDtypeStruct:
+    return jax.ShapeDtypeStruct(
+        (self._num_traces(grid, block) * self.entries_per_warpgroup,),
+        jnp.uint32,
+    )
 
-  def smem_i32_elements(self, grid: tuple[int, ...]):
-    return int(self.num_entries // np.prod(grid))
+  def smem_i32_elements(self, block: tuple[int, ...]):
+    num_traces = self._num_traces((), block)
+    return int(num_traces * self.entries_per_warpgroup)
 
-  def smem_bytes(self, grid: tuple[int, ...]):
+  def smem_bytes(self, block: tuple[int, ...]):
     bytes_per_entry = 4
-    return self.smem_i32_elements(grid) * bytes_per_entry
+    return self.smem_i32_elements(block) * bytes_per_entry
 
   def intern_name(self, name: str) -> int:
-    if name_id := self.interned_names.get(name, None):
+    if (name_id := self.interned_names.get(name, None)) is not None:
       return name_id
     name_id = self.interned_names[name] = len(self.interned_names)
     if name_id & self.EXIT:
       raise RuntimeError("Allocated too many names")
     return name_id
 
-  def dump(self, buffer, f):
+  def dump(self, buffer, f, grid: tuple[int, ...], block: tuple[int, ...]):
     buffer = np.asarray(buffer)
-    num_blocks = buffer[0]
-    per_block = self.num_entries // num_blocks
-    block_entries = buffer[1 : 1 + num_blocks * per_block].reshape(
-        num_blocks, per_block
+    num_blocks = math.prod(grid)
+    traces_per_block = self._num_traces((), block)
+    entries = buffer.reshape(
+        num_blocks, traces_per_block, self.entries_per_warpgroup
     )
-    start_times = block_entries[:, :2].astype(np.int64)
-    start_times = (start_times[:, 0] << 32) + start_times[:, 1]
-    start_times -= start_times.min()  # Normalize
-    entries_used = block_entries[:, 2]
-    if np.any(entries_used > per_block - 2):
+    start_times = entries[..., 0]
+    sm_ids = entries[..., 1]
+    traces_used = entries[..., 2]
+    entries_used = traces_used + 3
+    if np.any(entries_used > self.entries_per_warpgroup):
       raise RuntimeError("Insufficient space to capture a full trace")
-    block_traces = block_entries[:, 3:]
+    traces = entries[..., 3:]
+
+    # Estimate the overhead of profiling.
+    time_events = traces[:, :, 1::2]
+    valid_times_mask = np.arange(traces.shape[-1])[1::2] < traces_used[..., None]
+    # 12 cycles is a ballpark estimate for H100
+    profiling_overhead = (time_events[:, :, 1:] - time_events[:, :, :-1]).min(
+        where=valid_times_mask[:, :, 1:], initial=12
+    )
+    profiling_overhead = max(0, profiling_overhead - 1)
+
     unintern = {v: k for k, v in self.interned_names.items()}
     events = []
-    for block_idx in range(num_blocks):
-      valid_entries = entries_used[block_idx] - 3
+    for block_idx, trace_idx in np.ndindex(num_blocks, traces_per_block):
+      valid_entries = traces_used[block_idx, trace_idx]
       local_clock_offset = None
-      assert valid_entries % 2 == 0
-      start_time = start_times[block_idx]
+      if valid_entries % 2:
+        raise RuntimeError(
+            "Profiler collected an odd number of trace events. This likely "
+            "indicates memory corruption due to insufficient profiling space. "
+            "Try again with a larger profiling space."
+        )
+      start_time = start_times[block_idx, trace_idx]
       block_events = []
+      last_time = float("-inf")
       for i in range(0, valid_entries, 2):
-        tag = block_traces[block_idx, i]
-        time = block_traces[block_idx, i + 1]
+        tag = traces[block_idx, trace_idx, i]
+        time = traces[block_idx, trace_idx, i + 1]
         if local_clock_offset is None:
           local_clock_offset = time
         time -= local_clock_offset
-        time -= i * 6  # Account for the overhead of profiling.
+        time -= (i // 2) * profiling_overhead  # Account for the overhead of profiling.
         if time < 0:
           break  # Detect a timer wraparound
         name_id = tag
@@ -158,35 +302,121 @@ class ProfilerSpec:
           name_id = name_id ^ ProfilerSpec.EXIT
           begin = False
         name = unintern[name_id]
+        if last_time >= time:
+          if last_time - time > 10:
+            warnings.warn(
+                "Profiler clock went significantly backwards for event"
+                f" {'start' if begin else 'end'} `{name}`: {last_time} ->"
+                f" {time}"
+            )
+          time = last_time + 1
+        last_time = time
         block_events.append({
             "name": name,
             "ph": "B" if begin else "E",
             "ts": float(start_time + time) / 1e3,
-            "pid": 0,
-            "tid": block_idx,
+            "pid": 1 + int(sm_ids[block_idx, trace_idx]),
+            "tid": 1 + trace_idx + traces_per_block * block_idx,
         })
       else:  # If we didn't break
-        events.extend(block_events)
-    return json.dump({"displayTimeUnit": "ns", "traceEvents": events}, f)
+        if block_events:
+          # Bounds-checked traces can be truncated mid-range, leaving events
+          # that were opened but never closed. Emit synthetic end events (at
+          # the last observed timestamp) so the trace stays balanced. On a
+          # complete trace the stack ends empty and this is a no-op.
+          open_stack = []
+          for event in block_events:
+            if event["ph"] == "B":
+              open_stack.append(event)
+            else:
+              open_stack.pop()
+          last_ts = block_events[-1]["ts"]
+          for event in reversed(open_stack):
+            block_events.append({**event, "ph": "E", "ts": last_ts})
+          events.append(block_events)
+    events = sorted(events, key=lambda x: x[0]["ts"])
+    flat_events = list(itertools.chain.from_iterable(events))
+    return json.dump({"displayTimeUnit": "ns", "traceEvents": flat_events}, f)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProfilerCtx:
+  """Set of IR values referenced by the profiler logic.
+
+  The profiler logic is implemented using `CustomPrimitiveOp` which requires
+  that all IR values referenced in its body be passed as operands to the op.
+  """
+
+  start: ir.Value
+  is_profiling_thread: ir.Value
+  smem_buffer: ir.Value
+  gmem_buffer: ir.Value
+  offset: ir.Value
 
 
 class OnDeviceProfiler:
 
-  def __init__(self, spec: ProfilerSpec, smem_buffer: ir.Value, gmem_buffer: ir.Value):
-    self.spec = spec
-    # self.should_store = gpu.thread_id(gpu.Dimension.x)
+  def __init__(
+      self,
+      spec: ProfilerSpec,
+      smem_buffer: ir.Value,
+      gmem_buffer: ir.Value,
+      wrap_in_custom_primitive: bool,
+  ):
     i32 = ir.IntegerType.get_signless(32)
     index = ir.IndexType.get()
-    num_blocks = c(1, index)
-    for dim in gpu.Dimension:
-      num_blocks = arith.muli(num_blocks, gpu.grid_dim(dim))
-    memref.store(arith.index_cast(i32, num_blocks), gmem_buffer, [c(0, index)])
-    self.entries_per_block = arith.divui(c(spec.num_entries, index), num_blocks)
-    self.smem_buffer = smem_buffer
-    self.gmem_buffer = gmem_buffer
+    self.spec = spec
+    self.entries_per_wg = spec.entries_per_warpgroup
+    self.wrap_in_custom_primitive = wrap_in_custom_primitive
+    if spec.trace_scope == ThreadSubset.WARP:
+      trace_idx = warp_idx(sync=False)
+      scope_size = WARP_SIZE
+    elif spec.trace_scope == ThreadSubset.WARPGROUP:
+      trace_idx = warpgroup_idx(sync=False)
+      scope_size = WARPGROUP_SIZE
+    else:
+      raise NotImplementedError(f"Scope {spec.trace_scope} not supported")
+    trace_offset = arith.index_cast(
+        index, arith.muli(trace_idx, c(self.entries_per_wg, i32))
+    )
+    smem_buffer = memref_slice(smem_buffer, ds(trace_offset, self.entries_per_wg))
+    is_profiling_thread = arith.cmpi(
+        arith.CmpIPredicate.eq,
+        arith.remui(thread_idx(), c(scope_size, i32)),
+        c(0, i32),
+    )
     # Hopefully mem2reg will remove the allocation.
-    self.offset = memref.alloca(ir.MemRefType.get((), i32), [], [])
-    memref.store(c(0, i32), self.offset, [])
+    offset = memref.alloca(ir.MemRefType.get((), index), [], [])
+    memref.store(c(0, index), offset, [])
+    self.ctx = _ProfilerCtx(
+        start=globaltimer("low"),
+        is_profiling_thread=is_profiling_thread,
+        smem_buffer=smem_buffer,
+        gmem_buffer=gmem_buffer,
+        offset=offset,
+    )
+
+  @contextlib.contextmanager
+  def _profiler_ctx(self):
+    if not self.wrap_in_custom_primitive:
+      yield self.ctx
+      return
+
+    def fields(obj) -> list[ir.Value]:
+      return [getattr(obj, field.name) for field in dataclasses.fields(obj)]
+
+    op = dialect.CustomPrimitiveOp(
+        result=[],
+        operands_=fields(self.ctx),
+        in_layouts=[],
+        in_transforms=[ir.ArrayAttr.get([])],
+        out_layouts=[],
+    )
+    args_ty = [arg.type for arg in op.operands_]
+    block = op.body.blocks.append(*args_ty)
+    with ir.InsertionPoint(block):
+      yield _ProfilerCtx(*block.arguments)
+      dialect.return_([])
 
   @contextlib.contextmanager
   def record(self, name: str):
@@ -194,71 +424,78 @@ class OnDeviceProfiler:
     index = ir.IndexType.get()
     name_id = self.spec.intern_name(name)
     def store(modifier):
-      cur = arith.index_cast(index, memref.load(self.offset, []))
-      # TODO(apaszke): Clamp indices
-      # bound = arith.subi(self.entries_per_block, c(2, index))
-      # cur = arith.select(
-      #     arith.cmpi(arith.CmpIPredicate.ult, cur, bound), cur, bound
-      # )
-      memref.store(c(modifier | name_id, i32), self.smem_buffer, [cur])
-      memref.store(
-          clock(), self.smem_buffer, [arith.addi(cur, c(1, cur.type))]
-      )
-      memref.store(
-          arith.index_cast(i32, arith.addi(cur, c(2, cur.type))),
-          self.offset,
-          [],
-      )
+      with self._profiler_ctx() as ctx:
+        # smem_buffer[offset] = modifier | name_id
+        # smem_buffer[offset + 1] = %clock
+        # offset += 2
+        offset = memref.load(ctx.offset, [])
+        new_offset = arith.addi(offset, c(2, index))
+        record_event = ctx.is_profiling_thread
+        if self.spec.bounds_check:
+          # The last 3 entries are reserved for the header written by
+          # `finalize`. Events past the capacity are dropped (the trace is
+          # truncated) instead of overrunning the buffer and corrupting
+          # neighbouring SMEM.
+          capacity = self.entries_per_wg - 3
+          in_bounds = arith.cmpi(
+              arith.CmpIPredicate.ule, new_offset, c(capacity, index)
+          )
+          record_event = arith.andi(record_event, in_bounds)
+          new_offset = arith.select(in_bounds, new_offset, offset)
+        base_ref = memref_slice(ctx.smem_buffer, offset)
+        i64 = ir.IntegerType.get_signless(64)
+        base_addr = llvm.ptrtoint(i64, memref_ptr(base_ref))
+        llvm.inline_asm(
+            ir.Type.parse("!llvm.void"),
+            [record_event, base_addr, c(modifier | name_id, i32)],
+            """
+            @$0 st.shared.v2.u32 [$1], {$2, %clock};
+            """,
+            "b,l,r",
+            has_side_effects=True,
+        )
+        memref.store(new_offset, ctx.offset, [])
+
     store(ProfilerSpec.ENTER)
     yield
     store(ProfilerSpec.EXIT)
 
-  def finalize(self, grid):
+  def finalize(self, grid: tuple[int, ...], block: tuple[int, ...]):
     index = ir.IndexType.get()
     i32 = ir.IntegerType.get_signless(32)
 
-    block_idx = c(0, index)
-    for dim in reversed(gpu.Dimension):  # pytype: disable=wrong-arg-types
-      block_idx = arith.addi(
-          arith.muli(block_idx, gpu.grid_dim(dim)), gpu.block_id(dim)
-      )
-    start_offset = arith.addi(
-        arith.muli(block_idx, self.entries_per_block), c(1, index)
-    )
-    block_gmem_buffer = memref.subview(
-        self.gmem_buffer, [start_offset], [self.spec.num_entries], [1],
-        result_type=ir.Type.parse(
-            f"memref<{self.spec.num_entries}xi32, strided<[1], offset: ?>>"
-        ),
-    )
-    # TODO(apaszke): Either use globaltimer or delete
-    # memref.store(globaltimer("high"), block_gmem_buffer, [c(0, index)])
-    # memref.store(globaltimer("low"), block_gmem_buffer, [c(1, index)])
-    memref.store(c(0, i32), block_gmem_buffer, [c(0, index)])
-    memref.store(c(0, i32), block_gmem_buffer, [c(1, index)])
-    memref.store(
-        arith.addi(memref.load(self.offset, []), c(3, i32)),
-        block_gmem_buffer,
-        [c(2, index)],
-    )
+    with self._profiler_ctx() as ctx:
+      gpu.barrier()  # Make sure all warpgroups are done.
 
-    if_first = scf.IfOp(
-        arith.cmpi(
-            arith.CmpIPredicate.eq, gpu.thread_id(gpu.Dimension.x), c(0, index)
+      block_idx = c(0, index)
+      for dim in gpu.Dimension:
+        block_idx = arith.addi(
+            arith.muli(block_idx, gpu.grid_dim(dim)), gpu.block_id(dim)
         )
-    )
-    with ir.InsertionPoint(if_first.then_block):
-      for_op = scf.ForOp(
-          c(0, index),
-          c(self.spec.smem_i32_elements(grid) - 3, index),
-          c(1, index),
+      if self.spec.trace_scope == ThreadSubset.WARP:
+        trace_idx = warp_idx(sync=False)
+        traces_per_block = math.prod(block) // WARP_SIZE
+      elif self.spec.trace_scope == ThreadSubset.WARPGROUP:
+        trace_idx = warpgroup_idx(sync=False)
+        traces_per_block = math.prod(block) // WARPGROUP_SIZE
+      else:
+        raise NotImplementedError(f"Scope {self.spec.trace_scope} not supported")
+      global_trace_idx = arith.addi(
+          arith.muli(block_idx, c(traces_per_block, index)),
+          arith.index_cast(index, trace_idx),
       )
-      with ir.InsertionPoint(for_op.body):
-        x = memref.load(self.smem_buffer, [for_op.induction_variable])
-        memref.store(
-            x,
-            block_gmem_buffer,
-            [arith.addi(for_op.induction_variable, c(3, index))],
+      start_offset = arith.muli(global_trace_idx, c(self.entries_per_wg, index))
+      wg_gmem_buffer = memref_slice(
+          ctx.gmem_buffer, ds(start_offset, self.entries_per_wg)
+      )
+      with when(ctx.is_profiling_thread):
+        memref.store(ctx.start, wg_gmem_buffer, [c(0, index)])
+        memref.store(smid(), wg_gmem_buffer, [c(1, index)])
+        num_traces = arith.index_cast(i32, memref.load(ctx.offset, []))
+        memref.store(num_traces, wg_gmem_buffer, [c(2, index)])
+        traces = vector.load(
+            ir.VectorType.get((self.entries_per_wg - 3,), i32),
+            ctx.smem_buffer,
+            [c(0, index)],
         )
-        scf.yield_([])
-      scf.yield_([])
+        vector.store(traces, wg_gmem_buffer, [c(3, index)])

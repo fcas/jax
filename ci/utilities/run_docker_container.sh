@@ -1,0 +1,82 @@
+#!/bin/bash
+# Copyright 2024 The JAX Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+# Sets up a Docker container for JAX CI.
+#
+# This script creates and starts a Docker container named "jax" for internal
+# JAX CI jobs.
+#
+# Note: While GitHub action workflows use the same Docker images, they do not
+# run this script as they leverage built-in containerization features to run
+# jobs within a container.
+# Usage:
+#     ./ci/utilities/run_docker_container.sh
+#     docker exec jax <build-script>
+#     E.g: docker exec jax ./ci/build_artifacts.sh jaxlib
+#
+# -e: abort script if one command fails
+# -u: error if undefined variable used
+# -x: log all commands
+# -o history: record shell history
+# -o allexport: export all functions and variables to be available to subscripts
+set -exu -o history -o allexport
+
+source ./ci/envs/docker.env
+
+# Keep the existing "jax" container if it's already present.
+if ! docker container inspect jax >/dev/null 2>&1 ; then
+  # Simple retry logic for docker-pull errors. Sleeps if a pull fails.
+  # Pulling an already-pulled container image will finish instantly, so
+  # repeating the command costs nothing.
+  docker pull "$JAXCI_DOCKER_IMAGE" || sleep 15
+  docker pull "$JAXCI_DOCKER_IMAGE"
+
+  # Docker on Windows doesn't support the `host` networking mode.
+  # We will set up the routing for the GCE metadata server inside the container
+  # at runtime instead of using portproxy on the host.
+
+  # Create a temporary file to pass any user defined JAXCI_ / JAX_ / JAXLIB_
+  # variables to the container. Exclude host-specific path variables so they
+  # are recalculated inside the container using its own filesystem layout.
+  JAXCI_TEMP_ENVFILE_DIR=$(mktemp)
+  env | grep -e "JAXCI_" -e "JAX_" -e "JAXLIB_" \
+      | grep -v "^JAXCI_JAX_GIT_DIR=\|^JAXCI_OUTPUT_DIR=" \
+      > "$JAXCI_TEMP_ENVFILE_DIR"
+
+  # On Windows, convert MSYS Linux-like paths to Windows paths.
+  if [[ "$(uname -s)" =~ "MSYS_NT" ]]; then
+    echo 'Converting MSYS Linux-like paths to Windows paths for setting up the Docker container'
+    # Convert all "JAXCI.*DIR" variables
+    source <(python ./ci/utilities/convert_msys_paths_to_win_paths.py --convert $(env | grep "JAXCI.*DIR" | awk -F= '{print $1}'))
+  fi
+
+  # Start the container.
+  docker run $JAXCI_DOCKER_ARGS --name jax \
+          --env-file "$JAXCI_TEMP_ENVFILE_DIR" \
+          -w "$JAXCI_DOCKER_WORK_DIR" -itd --rm \
+          -v "$JAXCI_JAX_GIT_DIR:$JAXCI_DOCKER_WORK_DIR" \
+          "$JAXCI_DOCKER_IMAGE" \
+          bash
+
+  if [[ "$(uname -s)" =~ "MSYS_NT" ]]; then
+    echo "Setting up routing for GCE metadata server inside the container..."
+    docker exec jax powershell -Command '
+      $gateway = (Get-NetRoute | Where { $_.DestinationPrefix -eq "0.0.0.0/0" } | Sort-Object RouteMetric | Select NextHop).NextHop;
+      $ifIndex = (Get-NetAdapter -InterfaceDescription "Hyper-V Virtual Ethernet*" | Sort-Object | Select ifIndex).ifIndex;
+      Remove-NetRoute -DestinationPrefix 169.254.169.254/32 -Confirm:$false -ErrorAction SilentlyContinue;
+      New-NetRoute -DestinationPrefix 169.254.169.254/32 -InterfaceIndex $ifIndex -NextHop $gateway;
+    '
+  fi
+fi

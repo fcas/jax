@@ -18,13 +18,16 @@ Includes the flags from saved_model_main.py.
 See README.md.
 """
 import logging
+import warnings
 from absl import app
 from absl import flags
-from jax.experimental.jax2tf.examples import mnist_lib  # type: ignore
-from jax.experimental.jax2tf.examples import saved_model_main  # type: ignore
-import tensorflow as tf  # type: ignore
-import tensorflow_datasets as tfds  # type: ignore
-import tensorflow_hub as hub  # type: ignore
+from jax.experimental.jax2tf.examples import mnist_lib
+from jax.experimental.jax2tf.examples import saved_model_main
+import tensorflow as tf
+import tensorflow_datasets as tfds  # pyrefly: ignore[missing-import]
+with warnings.catch_warnings():
+  warnings.simplefilter("ignore")
+  import tensorflow_hub as hub  # pyrefly: ignore[missing-import]
 
 
 FLAGS = flags.FLAGS
@@ -60,9 +63,9 @@ def main(_):
   logging.info(keras_model.summary())
 
   train_ds = mnist_lib.load_mnist(
-      tfds.Split.TRAIN, batch_size=mnist_lib.train_batch_size)
+      tfds.Split("train"), batch_size=mnist_lib.train_batch_size)
   test_ds = mnist_lib.load_mnist(
-      tfds.Split.TEST, batch_size=mnist_lib.test_batch_size)
+      tfds.Split("test"), batch_size=mnist_lib.test_batch_size)
   keras_model.fit(train_ds, epochs=FLAGS.num_epochs, validation_data=test_ds)
 
   if saved_model_main.SHOW_IMAGES.value:

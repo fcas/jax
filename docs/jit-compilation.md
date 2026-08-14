@@ -5,7 +5,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.16.1
+    jupytext_version: 1.16.4
 kernelspec:
   display_name: Python 3
   language: python
@@ -21,6 +21,8 @@ kernelspec:
 
 (jit-compilation)=
 # Just-in-time compilation
+
+<!--* freshness: { reviewed: '2024-05-03' } *-->
 
 In this section, we will further explore how JAX works, and how we can make it performant.
 We will discuss the {func}`jax.jit` transformation, which will perform *Just In Time* (JIT)
@@ -49,13 +51,13 @@ def log2(x):
 print(jax.make_jaxpr(log2)(3.0))
 ```
 
-The {ref}`understanding-jaxprs` section of the documentation provides more information on the meaning of the above output.
+The {ref}`jax-internals-jaxpr` section of the documentation provides more information on the meaning of the above output.
 
 Importantly, notice that the jaxpr does not capture the side-effect present in the function: there is nothing in it corresponding to `global_list.append(x)`.
 This is a feature, not a bug: JAX transformations are designed to understand side-effect-free (a.k.a. functionally pure) code.
-If *pure function* and *side-effect* are unfamiliar terms, this is explained in a little more detail in [🔪 JAX - The Sharp Bits 🔪: Pure Functions](https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions).
+If *pure function* and *side-effect* are unfamiliar terms, this is explained in a little more detail in [🔪 JAX - The Sharp Bits 🔪: Pure Functions](https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions).
 
-Impure functions are dangerous because under JAX transformations they are likely not to behave as intended; they might fail silently, or produce surprising downstream errors like leaked Tracers.
+Impure functions are dangerous because under JAX transformations they are likely not to behave as intended; they might fail silently, or produce surprising downstream errors like leaked [Tracers](key-concepts-tracing).
 Moreover, JAX often can't detect when side effects are present.
 (If you want debug printing, use {func}`jax.debug.print`. To express general side-effects at the cost of performance, see {func}`jax.experimental.io_callback`.
 To check for tracer leaks at the cost of performance, use with {func}`jax.check_tracer_leaks`).
@@ -168,7 +170,7 @@ jax.jit(g)(10, 20)  # Raises an error
 The problem in both cases is that we tried to condition the trace-time flow of the program using runtime values.
 Traced values within JIT, like `x` and `n` here, can only affect control flow via their static attributes: such as
 `shape` or `dtype`, and not via their values.
-For more detail on the interaction between Python control flow and JAX, see [🔪 JAX - The Sharp Bits 🔪: Control Flow](https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#control-flow).
+For more detail on the interaction between Python control flow and JAX, see {ref}`control-flow`.
 
 One way to deal with this problem is to rewrite the code to avoid conditionals on value. Another is to use special {ref}`lax-control-flow` like {func}`jax.lax.cond`. However, sometimes that is not possible or practical.
 In that case, you can consider JIT-compiling only part of the function.
@@ -190,6 +192,8 @@ def g_inner_jitted(x, n):
 g_inner_jitted(10, 20)
 ```
 
+(jit-marking-arguments-as-static)=
+
 ## Marking arguments as static
 
 If we really need to JIT-compile a function that has a condition on the value of an input, we can tell JAX to help itself to a less abstract tracer for a particular input by specifying `static_argnums` or `static_argnames`.
@@ -206,12 +210,10 @@ g_jit_correct = jax.jit(g, static_argnames=['n'])
 print(g_jit_correct(10, 20))
 ```
 
-To specify such arguments when using `jit` as a decorator, a common pattern is to use python's {func}`functools.partial`:
+To specify such arguments when using `jit` as a decorator, use the decorator factory pattern:
 
 ```{code-cell}
-from functools import partial
-
-@partial(jax.jit, static_argnames=['n'])
+@jax.jit(static_argnames=['n'])
 def g_jit_decorated(x, n):
   i = 0
   while i < n:

@@ -14,18 +14,32 @@
 
 from __future__ import annotations
 
+import unittest
+
 from absl.testing import absltest
 from absl.testing import parameterized
+from functools import partial
+import itertools as it
 import numpy as np
 import jax
 from jax._src import core
 from jax._src import config
 from jax._src import test_util as jtu
+from jax._src.util import safe_map, safe_zip
+from jax._src.interpreters import mlir
+from jax.sharding import NamedSharding, PartitionSpec as P, AxisType
 import jax.numpy as jnp
 
+from jax._src.state import discharge as state_discharge
 from jax._src.state.types import (RefEffect)
 
 config.parse_flags_with_absl()
+
+jtu.request_cpu_devices(8)
+
+map, unsafe_map = safe_map, map
+zip, unsafe_zip = safe_zip, zip
+
 
 class MutableArrayTest(jtu.JaxTestCase):
 
@@ -39,7 +53,7 @@ class MutableArrayTest(jtu.JaxTestCase):
     if jit:
       f = jax.jit(f)
 
-    x_mut = core.mutable_array(jnp.zeros(3))
+    x_mut = core.new_ref(jnp.zeros(3))
     f(x_mut)
 
     self.assertAllClose(x_mut[...], jnp.array([2., 6., 1.]),
@@ -48,12 +62,71 @@ class MutableArrayTest(jtu.JaxTestCase):
     jaxpr = jax.make_jaxpr(f)(x_mut)
     self.assertTrue(any(isinstance(e, RefEffect) for e in jaxpr.effects))
 
-  # disabling this test for now. TODO(dougalm): re-enable once we add checks to
-  # ensure mutable arrays aren't returned or duplicated etc.
-  # def test_staging_error(self):
-  #   x = jnp.zeros(3)
-  #   with self.assertRaises(Exception):
-  #     jax.jit(core.mutable_array)(x)
+  def test_basic_aot(self):
+    @jax.jit
+    def f(x_mut):
+      x_mut[...] += 1.
+      x_mut[0] += 1
+      x_mut[1] += 5
+
+    x_mut = core.new_ref(jnp.zeros(3))
+    f.lower(x_mut).compile()(x_mut)
+    self.assertAllClose(x_mut[...], jnp.array([2., 6., 1.]),
+                        check_dtypes=False)
+
+  def test_basic_aot_closure(self):
+    x_mut = core.new_ref(jnp.zeros(3))
+
+    @jax.jit
+    def f():
+      x_mut[...] += 1.
+      x_mut[0] += 1
+      x_mut[1] += 5
+
+    c = f.lower().compile()
+    c()
+    c()
+    self.assertAllClose(x_mut[...], jnp.array([4., 12., 2.]),
+                        check_dtypes=False)
+
+  def test_basic_sharded_aot(self):
+    mesh = jtu.create_mesh((2,), ('x',))
+    arr = jax.device_put(np.arange(8.), NamedSharding(mesh, P('x')))
+
+    @jax.jit
+    def f(x_mut):
+      x_mut[...] += 1.
+      x_mut[0] += 1
+      x_mut[1] += 5
+
+    x_mut = core.new_ref(arr)
+    f.lower(x_mut).compile()(x_mut)
+    expected = np.arange(8.) + 1
+    expected[0] += 1
+    expected[1] += 5
+    self.assertAllClose(x_mut[...], expected)
+
+  def test_sharded_aot_mutable_sds(self):
+    mesh = jtu.create_mesh((2,), ('x',))
+    arr = jax.device_put(np.arange(8.), NamedSharding(mesh, P('x')))
+
+    @jax.jit
+    def f(x_mut):
+      x_mut[...] += 1.
+      x_mut[0] += 1
+      x_mut[1] += 5
+
+    sds_mut = jax.ShapeDtypeStruct(arr.shape, arr.dtype, sharding=arr.sharding,
+                                   is_ref=True)
+    compiled = f.lower(sds_mut).compile()
+
+    x_mut = core.new_ref(arr)
+    compiled(x_mut)
+
+    expected = np.arange(8.) + 1
+    expected[0] += 1
+    expected[1] += 5
+    self.assertAllClose(x_mut[...], expected)
 
   @parameterized.parameters([True, False])
   def test_multiple_inputs_and_outputs(self, jit):
@@ -65,9 +138,9 @@ class MutableArrayTest(jtu.JaxTestCase):
     if jit:
       f = jax.jit(f)
 
-    x_mut = core.mutable_array(jnp.zeros((1, 3)))
+    x_mut = core.new_ref(jnp.zeros((1, 3)))
     y = jnp.ones((2, 3))
-    z_mut = core.mutable_array(jnp.zeros((2, 3)))
+    z_mut = core.new_ref(jnp.zeros((2, 3)))
     w = jnp.ones((2, 1))
 
     out1, out2 = f(x_mut, y, z_mut, w)
@@ -79,7 +152,7 @@ class MutableArrayTest(jtu.JaxTestCase):
 
   @parameterized.parameters([True, False])
   def test_closed_over_basic(self, jit):
-    x_mut = core.mutable_array(jnp.zeros(3))
+    x_mut = core.new_ref(jnp.zeros(3))
     def f():
       x_mut[...] += 1.
       x_mut[0] += 1
@@ -98,7 +171,7 @@ class MutableArrayTest(jtu.JaxTestCase):
 
   @parameterized.parameters([True, False])
   def test_closed_over_nested(self, jit):
-    x_mut = core.mutable_array(jnp.zeros(3))
+    x_mut = core.new_ref(jnp.zeros(3))
 
     @jax.jit
     def f(y_mut, z):
@@ -112,7 +185,7 @@ class MutableArrayTest(jtu.JaxTestCase):
     if jit:
       f = jax.jit(f)
 
-    y_mut = core.mutable_array(np.zeros(3))
+    y_mut = core.new_ref(np.zeros(3))
 
     w = f(y_mut, 1)
 
@@ -123,9 +196,21 @@ class MutableArrayTest(jtu.JaxTestCase):
     self.assertAllClose(w, 10, check_dtypes=False)
 
   @parameterized.parameters([True, False])
+  def test_len_mutable_array(self, jit):
+    x_mut = core.new_ref(jnp.zeros(3))
+
+    def f():
+      return jnp.int32(len(x_mut))
+
+    if jit:
+      f = jax.jit(f)
+
+    self.assertEqual(f(), 3)
+
+  @parameterized.parameters([True, False])
   def test_internal_mutarray_basic(self, jit):
     def f():
-      x_mut = core.mutable_array(jnp.zeros(3))
+      x_mut = core.new_ref(jnp.zeros(3))
       x_mut[0] += 1
       x_mut[0] += 1
       x_mut[2] += 1
@@ -138,54 +223,9 @@ class MutableArrayTest(jtu.JaxTestCase):
     self.assertAllClose(out, jnp.array([2., 0., 1.]), check_dtypes=False)
 
   @parameterized.parameters([True, False])
-  def test_refs_in_vjps(self, jit):
-    def gradient_history_calculator_fwd(x, ref):
-      return x, ref
-
-    def gradient_history_calculator_bwd(amax_history, grad_output):
-      amax_update = jnp.max(jnp.abs(grad_output))
-      shifted = jnp.roll(amax_history[:], 1)
-      shifted = shifted.at[0].set(amax_update)
-      amax_history[:] = shifted
-      amax_from_history = jnp.max(amax_history[:])
-      grad_output = grad_output / amax_from_history
-      return grad_output, None
-
-    @jax.custom_vjp
-    def gradient_history_calculator(x, ref):
-      return x
-
-    gradient_history_calculator.defvjp(
-      gradient_history_calculator_fwd,
-      gradient_history_calculator_bwd)
-
-    class DotOp:
-      def __init__(self):
-        self.amax_history = core.mutable_array(jnp.zeros(5,))
-
-      def forward(self, x, y):
-        out = jnp.dot(x, y)
-        out = gradient_history_calculator(out, self.amax_history)
-        return out
-
-    dot_op = DotOp()
-    x_top = jnp.ones((5,))
-    y_top = jnp.ones((5,))
-
-    def loss(x, y):
-      return dot_op.forward(x, y).sum()
-
-    if jit:
-      loss = jax.jit(loss)
-
-    for i in range(3):
-      jax.grad(loss, (0,1))(x_top, y_top)
-      self.assertAllClose(dot_op.amax_history[:], jnp.zeros((5,)).at[:i+1].set(1.0), check_dtypes=False)
-
-  @parameterized.parameters([True, False])
   def test_scan_internal_mut_array(self, jit):
     def body_fun(_, x):
-      x_mut = core.mutable_array(x)
+      x_mut = core.new_ref(x)
       x_mut[...] += 2
       return ((), x_mut[...])
     doit = lambda: jax.lax.scan(body_fun, (), np.arange(5))
@@ -196,7 +236,7 @@ class MutableArrayTest(jtu.JaxTestCase):
 
   @parameterized.parameters([True, False])
   def test_scan_closed_over_mut_array(self, jit):
-    x_mut = core.mutable_array(0)
+    x_mut = core.new_ref(0)
     def body_fun(_, x):
       x_mut[...] += 2
       return ((), x_mut[...])
@@ -213,15 +253,1485 @@ class MutableArrayTest(jtu.JaxTestCase):
     def body_fun(_, index_x):
       (index, x) = index_x
       x[...] += index
-      # breakpoint()
       return ((), x[...])
 
-    x_mut = core.mutable_array(np.arange(5))
+    x_mut = core.new_ref(np.arange(5))
     doit = lambda: jax.lax.scan(body_fun, (), (np.arange(5), x_mut))
     if jit:
       doit = jax.jit(doit)
     _, xs = doit()
     self.assertAllClose(xs, (np.arange(5) * 2), check_dtypes=False)
+
+  def test_double_jit_mutable_array(self):
+    @jax.jit
+    @jax.jit
+    def f():
+      x_ref = core.new_ref(jnp.zeros(8))
+      return x_ref[...]
+    x = f()
+    self.assertArraysEqual(x, jnp.zeros(8))
+
+  @parameterized.parameters([False, True])
+  def test_grad_mutable_array(self, jit):
+
+    def f(x):
+      x_ = core.new_ref(x)
+      x_[()] = x_[()] + x_[()]
+      y = core.freeze(x_)
+      return y
+
+    if jit:
+      f = jax.jit(f)
+
+    ans = jax.grad(f)(1.)
+    expected = 2.0
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_defensive_copy(self):
+    x = jnp.arange(3.)
+    _ = jax.jit(lambda x_ref: x_ref[...])(core.new_ref(x))
+    x + 1  # don't crash
+
+  def test_sharding_persists(self):
+    mesh = jtu.create_mesh((1,), ('i',))
+    x = jax.device_put(jnp.arange(2), NamedSharding(mesh, P('i')))
+    s = x.sharding
+    a = core.new_ref(x)
+    self.assertEqual(s, a.sharding)
+    self.assertEqual(s, a[...].sharding)
+    f = jax.jit(lambda: a[...])
+    y = f()
+    self.assertEqual(s, a.sharding)
+    self.assertEqual(s, y.sharding)
+
+  def test_explicit_sharding_after_indexing(self):
+    # https://github.com/jax-ml/jax/issues/26936
+    mesh = jtu.create_mesh((1, 1), ('x', 'y'),
+                           axis_types=(AxisType.Explicit,) * 2)
+    sharding = NamedSharding(mesh, P('x', 'y'))
+
+    @jax.jit
+    def f(x_ref):
+      self.assertEqual(core.typeof(x_ref).sharding.spec,
+                       core.typeof(x_ref[...]).sharding.spec)
+      y = x_ref[...] + 1
+      return y
+
+    with jax.set_mesh(mesh):
+      x = jnp.zeros((4, 4), jnp.int32, device=sharding)
+      x_ref = core.new_ref(x)
+      f(x_ref)
+
+  def test_vmap_basic(self):
+    @jax.vmap
+    def f(x):
+      x_ref = core.new_ref(x)
+      x_ref[...] =  x_ref[...] * x_ref[...]
+      return x_ref[...]
+    xs = jnp.arange(4.)
+    ys = f(xs)
+    self.assertAllClose(ys, xs ** 2, check_dtypes=False)
+
+  def test_vmap_axes_basic(self):
+    # https://github.com/jax-ml/jax/issues/39288
+    def f(r, x):
+      r[...] = x
+
+    ref = jax.new_ref(jnp.zeros((2, 3)))
+    jax.vmap(f, in_axes=(1, 0))(ref, jnp.ones((3, 2)))  # don't crash
+    self.assertAllClose(ref[...], jnp.ones((2, 3)), check_dtypes=False)
+
+  def test_vmap_extensive_inputs(self):
+    def f(x_ref, val):
+      x_ref[...] += val
+      x_ref[...] += val
+
+    xs_ref = core.new_ref(jnp.array([0, 0, 0]))
+    vals = jnp.arange(3)
+    jax.vmap(f)(xs_ref, vals)
+    self.assertAllClose(xs_ref[...], 2 * vals, check_dtypes=False)
+
+  def test_vmap_closed_over_read_only(self):
+    y_ref = core.new_ref(1)
+
+    def f(x_ref):
+      x_ref[...] += y_ref[...]
+      x_ref[...] += y_ref[...]
+
+    xs_ref = core.new_ref(jnp.array([0, 0, 0]))
+    jax.vmap(f)(xs_ref)
+    self.assertAllClose(xs_ref[...], jnp.array([2, 2, 2]), check_dtypes=False)
+
+  def test_implicit_bitcast_regression(self):
+    # https://github.com/jax-ml/jax/issues/27683
+    v = core.new_ref(jnp.array([0, 0, 0]))
+    with self.assertRaises(ValueError):
+      v[...] += 1.0
+
+  def test_implicit_cast_in_swap(self):
+    v = core.new_ref(jnp.array(0, dtype='bfloat16'))
+    v[...] += 1.0  # don't crash
+
+  def test_rng_key(self):
+    key = core.new_ref(jax.random.key(0))
+    # test read/write
+    key[...] = jax.random.fold_in(key[...], 1) # don't crash
+
+  def test_scan_grad_doesnt_hoist_mutable_stuff(self):
+    x_ref = core.new_ref(0)
+
+    def f(x):
+      def body(c, _):
+        x_ref[...] += 1
+        return c, ()
+      x, () = jax.lax.scan(body, x, (), length=3)
+      return x
+
+    jax.grad(f)(1.0)
+    self.assertAllClose(x_ref[...], 3, check_dtypes=False)
+
+  def test_scan_grad_doesnt_hoist_mutable_stuff2(self):
+    x_ref = core.new_ref(0)
+    const = jnp.arange(3)
+    const2 = jnp.zeros(())
+
+    def f(x):
+      def body(c, _):
+        x_ref[...] += const.sum()
+        return c + const2, ()
+      x, () = jax.lax.scan(body, x, (), length=4)
+      return x
+
+    jax.grad(f)(1.0)
+    self.assertAllClose(x_ref[...], 12, check_dtypes=False)
+
+  @parameterized.parameters([False, True])
+  def test_custom_vjp_grad_stats_plumbing(self, jit):
+
+   @jax.custom_vjp
+   def gradient_history_calculator(x, ref):
+     del ref
+     return x
+
+   def gradient_history_calculator_fwd(x, ref):
+     return x, ref
+
+   def gradient_history_calculator_bwd(amax_history, grad_output):
+     amax_update = jnp.max(jnp.abs(grad_output))
+     shifted = jnp.roll(amax_history[:], 1)
+     shifted = shifted.at[0].set(amax_update)
+     amax_history[:] = shifted
+     amax_from_history = jnp.max(amax_history[:])
+     grad_output = grad_output / amax_from_history
+     return grad_output, None
+
+   gradient_history_calculator.defvjp(
+     gradient_history_calculator_fwd,
+     gradient_history_calculator_bwd)
+
+   class DotOp:
+     def __init__(self):
+       self.amax_history = core.new_ref(jnp.zeros(5,))
+
+     def forward(self, x, y):
+       out = jnp.dot(x, y)
+       out = gradient_history_calculator(out, self.amax_history)
+       return out
+
+   dot_op = DotOp()
+   x_top = jnp.ones((5,))
+   y_top = jnp.ones((5,))
+
+   def loss(x, y):
+     return dot_op.forward(x, y).sum()
+
+   if jit:
+     loss = jax.jit(loss)
+
+   for i in range(3):
+     jax.grad(loss, (0,1))(x_top, y_top)
+     self.assertAllClose(dot_op.amax_history[:], jnp.zeros((5,)).at[:i+1].set(1.0), check_dtypes=False)
+
+  @parameterized.parameters([False, True])
+  def test_custom_vjp_grad_stats_plumbing_basic(self, jit):
+    def primal(grads_ref, x):  # note: jit-abstracted!
+      x = jnp.sin(x)
+      x = stash_grads(grads_ref, x)
+      x = jnp.sin(x)
+      x = stash_grads(grads_ref, x)  # ignored, order-preserved
+      return x
+
+    if jit:
+      primal = jax.jit(primal)
+
+    @jax.custom_vjp
+    def stash_grads(grads_ref, x):
+      return x
+    def stash_grads_fwd(grads_ref, x):
+      return x, grads_ref
+    def stash_grads_bwd(grads_ref, g):
+      grads_ref[...] = g
+      return None, g
+    stash_grads.defvjp(stash_grads_fwd, stash_grads_bwd)
+
+    grads_ref = core.new_ref(jnp.float32(0.))
+    jax.grad(primal, 1)(grads_ref, jnp.float32(1.0))
+    self.assertAllClose(grads_ref[...], jnp.cos(jnp.sin(1.)), check_dtypes=False)
+
+  @parameterized.parameters(it.product([False, True], repeat=2))
+  def test_custom_vjp_grad_stats_plumbing_scan(self, jit, remat):
+    def primal(grads_ref, x):  # note: jit-abstracted!
+      def body(x, _):
+        x = jnp.sin(x)
+        x = stash_grads(grads_ref, x)
+        x = jnp.sin(x)
+        return x, ()
+      if remat:
+        body = jax.remat(body)
+      x, () = jax.lax.scan(body, x, None, length=1)
+      return x
+
+    if jit:
+      primal = jax.jit(primal)
+
+    @jax.custom_vjp
+    def stash_grads(grads_ref, x):
+      return x
+    def stash_grads_fwd(grads_ref, x):
+      return x, grads_ref
+    def stash_grads_bwd(grads_ref, g):
+      grads_ref[...] = g
+      return None, g
+    stash_grads.defvjp(stash_grads_fwd, stash_grads_bwd)
+
+    grads_ref = core.new_ref(jnp.float32(0.))
+    jax.grad(primal, argnums=1)(grads_ref, jnp.float32(1.0))
+    self.assertAllClose(grads_ref[...], jnp.cos(jnp.sin(1.)), check_dtypes=False)
+
+  @parameterized.product(jit=[False, True], has_aux=[False, True])
+  def test_custom_vjp_grad_stats_plumbing_basic_vjp3(self, jit, has_aux):
+    def primal(grads_ref, x):  # note: abstracts over jit and has_aux!
+      x0 = x
+      x = jnp.sin(x)
+      x = stash_grads(grads_ref, x)
+      x = jnp.sin(x)
+      x = stash_grads(grads_ref, x)  # ignored, order-preserved
+      return (x, x0) if has_aux else x
+
+    if jit:
+      primal = jax.jit(primal)
+
+    @jax.custom_vjp
+    def stash_grads(grads_ref, x):
+      return x
+    def stash_grads_fwd(grads_ref, x):
+      return x, grads_ref
+    def stash_grads_bwd(grads_ref, g):
+      grads_ref[...] = g
+      return None, g
+    stash_grads.defvjp(stash_grads_fwd, stash_grads_bwd)
+
+    grads_ref = core.new_ref(jnp.float32(0.))
+    x = jnp.float32(1.)
+    _, f_vjp, *maybe_aux = jax.vjp(
+        lambda x: primal(grads_ref, x), x, has_aux=has_aux)
+    _ = f_vjp(jnp.float32(1.))
+    self.assertAllClose(grads_ref[...], jnp.cos(jnp.sin(1.)), check_dtypes=False)
+    if has_aux:
+      aux, = maybe_aux
+      self.assertAllClose(aux, x)
+
+  def test_custom_vjp_grad_stats_plumbing_scan_vjp3(self):
+    def primal(stash_ref, x):  # note: jit-abstracted!
+      def body(x, _):
+        x = jnp.sin(x)
+        x = stash_grads(stash_ref, x)
+        x = jnp.sin(x)
+        return x, ()
+      x, () = jax.lax.scan(body, x, None, length=1)
+      return x
+
+    @jax.custom_vjp
+    def stash_grads(stash_ref, x):
+      return x
+    def stash_grads_fwd(stash_ref, x):
+      return x, stash_ref
+    def stash_grads_bwd(stash_ref, g):
+      stash_ref[...] = g
+      return None, g
+    stash_grads.defvjp(stash_grads_fwd, stash_grads_bwd)
+
+    stash_ref = core.new_ref(jnp.float32(0.))
+    _, f_vjp = jax.vjp(lambda x: primal(stash_ref, x), jnp.float32(1.))
+    grads_val, = f_vjp(jnp.float32(1.))
+    self.assertAllClose(stash_ref[...], jnp.cos(jnp.sin(1.)), check_dtypes=False)
+    self.assertAllClose(grads_val, jnp.cos(jnp.sin(1.)) * jnp.cos(1.),
+                        check_dtypes=False)
+
+    stash_ref = core.new_ref(jnp.float32(0.))
+    grads_ref = core.new_ref(jnp.float32(0.))
+    _, f_vjp = jax.vjp(lambda x: primal(stash_ref, x), jnp.float32(1.))
+    _ = f_vjp.with_refs(grads_ref)(jnp.float32(1.))
+    self.assertAllClose(stash_ref[...], jnp.cos(jnp.sin(1.)), check_dtypes=False)
+    self.assertAllClose(grads_ref[...], jnp.cos(jnp.sin(1.)) * jnp.cos(1.),
+                        check_dtypes=False)
+
+  @parameterized.parameters([False, True], [False, True])
+  def test_freeze_insertion(self, inner_jit, outer_jit):
+    def f(x):
+      x_ref = core.new_ref(x)
+
+      def g():
+        x_ref[...] = x_ref[...] + x_ref[...]
+      if inner_jit:
+        g = jax.jit(g)
+      g()
+
+      return x_ref[...]
+
+    if outer_jit:
+      f = jax.jit(f)
+
+    self.assertAllClose(jax.grad(f)(3.), 2., check_dtypes=False)
+
+  @parameterized.parameters([False, True])
+  def test_grad_jit(self, jit):
+    def f(x):
+      x_ref = core.new_ref(x)
+
+      @jax.jit
+      def g():
+        x_ref[...] = jnp.sin(x_ref[...]) + jnp.sin(x_ref[...])
+      g()
+
+      return core.freeze(x_ref)
+
+    if jit:
+      f = jax.jit(f)
+
+    ans = jax.grad(f)(2.)
+    expected = 2. * jnp.cos(2.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  @parameterized.parameters([False, True])
+  def test_grad_scan(self, jit):
+    def f(x):
+      x_ref = core.new_ref(x)
+
+      def g(_, __):
+        x_ref[...] = jnp.sin(x_ref[...]) + jnp.sin(x_ref[...])
+        return None, None
+      jax.lax.scan(g, None, None, length=1)
+
+      return core.freeze(x_ref)
+
+    if jit:
+      f = jax.jit(f)
+
+    ans = jax.grad(f)(2.)
+    expected = 2. * jnp.cos(2.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_grad_scan_extensive(self):
+    def f(xs):
+      xs_ref = core.new_ref(xs)
+
+      def g(c, x_ref):
+        return c + x_ref[...], None
+      out, _ = jax.lax.scan(g, 0., xs_ref)
+
+      return out
+
+    ans = jax.grad(f)(jnp.arange(3.))
+    expected = jnp.ones(3)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  @parameterized.parameters([False, True])
+  def test_grad_jit_readonly(self, jit):
+    def f(x):
+      x_ref = core.new_ref(jnp.zeros_like(x))
+      x_ref[...] = x
+      return x_ref[...]
+
+    if jit:
+      f = jax.jit(f)
+
+    jtu.check_grads(f, (1.5,), 2, ['fwd', 'rev'])
+
+  def test_grad_jit_readonly_1(self):
+    @jax.jit
+    def f(x):
+      x_ref = core.new_ref(x)
+
+      def inner():
+        return jnp.sin(x_ref[...])
+
+      return inner()
+
+    jtu.check_grads(f, (1.5,), 2, ['fwd', 'rev'])
+
+  def test_grad_jit_readonly_2(self):
+    def f(x):
+      x_ref = core.new_ref(x)
+
+      @jax.jit
+      def inner():
+        return jnp.sin(x_ref[...])
+
+      return inner()
+
+    jtu.check_grads(f, (1.5,), 2, ['fwd', 'rev'])
+
+  @jtu.sample_product(
+      seed=range(6),
+      num_consts=range(2, 6),
+      num_args=[0, 3],
+  )
+  @jtu.run_on_devices("cpu")
+  def test_jit_vjp_systematic_readonly(self, seed, num_consts, num_args):
+    num_mut_consts = num_consts // 2
+    num_pure_consts = num_consts - num_mut_consts
+
+    rng = np.random.RandomState(seed)
+    pure_consts = [rng.normal() for _ in range(num_pure_consts)]
+    mut_const_vals = [rng.normal() for _ in range(num_mut_consts)]
+
+    args = [rng.normal() for _ in range(num_args)]
+
+    mutable_bools = rng.permutation([True] * num_mut_consts +
+                                    [False] * num_pure_consts)
+
+    def f(mut_const_vals, pure_consts, args):
+      consts = pure_consts[:], map(core.new_ref, mut_const_vals)
+
+      @jax.jit
+      def inner(args):
+        tot = 0.
+        for is_mut in mutable_bools:
+          const = consts[int(is_mut)].pop()
+          if is_mut: const = const[...]
+          tot += jnp.sin(const)
+        for x in args:
+          tot += jnp.sin(x)
+        return tot
+
+      return inner(args)
+
+    jtu.check_grads(f, (mut_const_vals, pure_consts, args), 2, ['rev'])
+
+  @jtu.sample_product(
+      seed=range(6),
+      num_consts=range(2, 6),
+      num_carry=[0, 3],
+      num_ext_in=[0, 3],
+      num_iters=[1, 3],
+  )
+  @jtu.run_on_devices("cpu")
+  def test_scan_vjp_systematic_readonly(
+      self, seed, num_consts, num_carry, num_ext_in, num_iters):
+    num_mut_consts = num_consts // 2
+    num_pure_consts = num_consts - num_mut_consts
+
+    rng = np.random.RandomState(seed)
+    pure_consts = [rng.normal() for _ in range(num_pure_consts)]
+    mut_const_vals = [rng.normal() for _ in range(num_mut_consts)]
+
+    init_carry = [rng.normal() for _ in range(num_carry)]
+    xs = [rng.normal(size=num_iters) for _ in range(num_ext_in)]
+
+    mutable_bools = rng.permutation([True] * num_mut_consts +
+                                    [False] * num_pure_consts)
+
+    def f(mut_const_vals, pure_consts, c, xs):
+      consts = pure_consts[:], map(core.new_ref, mut_const_vals)
+
+      def body(c, x):
+        tot = 0.
+        for is_mut in mutable_bools:
+          const = consts[int(is_mut)].pop()
+          if is_mut: const = const[...]
+          tot += jnp.sin(const)
+        new_c = [jnp.sin(carry) + tot for carry in c]
+        y = sum(map(jnp.sin, x)) * 1.0
+        return new_c, y
+
+      return jax.lax.scan(body, init_carry, xs, length=num_iters)
+
+    jtu.check_grads(f, (mut_const_vals, pure_consts, init_carry, xs),
+                    2, ['fwd', 'rev'], rtol=1.5e-2)
+
+  @parameterized.parameters([False, True])
+  def test_remat_basic_internal(self, jit):
+    @jax.remat
+    def f(y, x):
+      x_ref = jax.new_ref(x)
+      out = y * x_ref[...]
+      x_ref[...] += 1
+      return out
+
+    if jit:
+      f = jax.jit(f)
+
+    g = jax.grad(f)(2., 1.)
+    self.assertAllClose(g, 1.)
+
+  @parameterized.parameters([False, True])
+  def test_remat_basic_arg(self, jit):
+    @jax.remat
+    def f(y, x_ref):
+      out = y * y
+      x_ref[...] += out
+      return out
+
+    if jit:
+      f = jax.jit(f)
+
+    x_ref = core.new_ref(1., kind='no_grad_no_remat')
+    g = jax.grad(f)(2., x_ref)
+    self.assertAllClose(x_ref[...], 5.)
+    self.assertAllClose(g, 4.)
+
+  @parameterized.parameters([False, True])
+  def test_remat_basic_closed_over(self, jit):
+    @jax.remat
+    def f(y):
+      out = y * x_ref[...]
+      x_ref[...] += 1
+      return out
+
+    if jit:
+      f = jax.jit(f)
+
+    x_ref = core.new_ref(1., kind='no_grad_no_remat')
+    g = jax.grad(f)(2.)
+    self.assertAllClose(x_ref[...], 2.)
+    self.assertAllClose(g, 1.)
+
+  def test_remat_basic_closed_over_nested(self):
+    @jax.remat
+    @partial(jax.remat, policy=lambda *_, **__: False)
+    @jax.remat
+    def f(y):
+      jax.debug.callback(lambda _: lst.append('hi'), y)
+      out = y * x_ref[...]
+      x_ref[...] += 1
+      return jnp.sin(out)
+
+    lst = []
+    x_ref = core.new_ref(1., kind='no_grad_no_remat')
+    g = jax.grad(f)(2.)
+    self.assertAllClose(x_ref[...], 2.)
+    self.assertAllClose(g, jnp.cos(2.))
+    self.assertLen(lst, 4)
+
+  def test_optimization_barrier_with_refs(self):
+    x_ref = core.new_ref(jnp.float32(1.))
+    y, x_ref2 = jax.lax.optimization_barrier((jnp.float32(2.), x_ref))
+    self.assertIs(x_ref2, x_ref)
+    self.assertAllClose(y, 2., check_dtypes=False)
+
+    def f(x_ref, y):
+      y, _ = jax.lax.optimization_barrier((y, x_ref))
+      x_ref[...] += y
+      return x_ref[...]
+
+    self.assertAllClose(jax.jit(f)(x_ref, jnp.float32(2.)), 3.,
+                        check_dtypes=False)
+    self.assertAllClose(x_ref[...], 3., check_dtypes=False)
+
+    # discharge threads the ref's value in and out of the barrier
+    jaxpr = jax.jit(f).trace(core.new_ref(jnp.float32(0.)),
+                             jnp.float32(2.)).jaxpr
+    discharged = state_discharge.discharge_state(jaxpr)
+    eqn, = (e for e in discharged.eqns if e.primitive.name ==
+            'optimization_barrier')
+    self.assertLen(eqn.invars, 2)
+    self.assertLen(eqn.outvars, 2)
+
+  def test_remat_grad_stats_plumbing_basic(self):
+    # The custom_vjp's output must be used, else it all gets DCE'd away
+    # without exercising the ref-residual plumbing.
+    @jax.remat
+    def f(x_ref, y):
+      y = jnp.sin(y)
+      y = stash_grads(x_ref, y)
+      return jnp.sin(y)
+
+    @jax.custom_vjp
+    def stash_grads(grads_ref, x):
+      return x
+    def stash_grads_fwd(grads_ref, x):
+      return x, grads_ref
+    def stash_grads_bwd(grads_ref, g):
+      grads_ref[...] = g
+      return None, g
+    stash_grads.defvjp(stash_grads_fwd, stash_grads_bwd)
+
+    x_ref = core.new_ref(jnp.float32(0.))
+    g = jax.grad(f, 1)(x_ref, jnp.float32(1.))
+    self.assertAllClose(x_ref[...], jnp.cos(jnp.sin(1.)), check_dtypes=False)
+    self.assertAllClose(g, jnp.cos(jnp.sin(1.)) * jnp.cos(1.),
+                        check_dtypes=False)
+
+  @jtu.run_on_devices("cpu")  # tolerances, lol
+  def test_vjp3_ref_grads_for_val_primals(self):
+    NUM_LAYERS = 3
+    NUM_MUBATCHES = 5
+    MUBATCH_SIZE = 7
+
+    def mubatch_loss(Ws, xs):
+      # Inner loop: scan over layers
+      act, _ = jax.lax.scan(lambda xs, W: (jnp.dot(xs, W), None), xs, Ws)
+      return jnp.mean(act)
+
+    def process_batch(Ws, xs_batch):
+      grad_acc = jax.new_ref(jnp.zeros_like(Ws))               # CHANGED
+
+      def process_mubatch(_, xs):
+        loss, f_vjp = jax.vjp(lambda Ws: mubatch_loss(Ws, xs), Ws)  # CHANGED
+        f_vjp.with_refs(grad_acc)(jnp.ones_like(loss))           # CHANGED
+        return (), loss
+
+      assert xs_batch.shape[0] == NUM_MUBATCHES * MUBATCH_SIZE
+      xs_mubatches = xs_batch.reshape(NUM_MUBATCHES, MUBATCH_SIZE, *xs_batch.shape[1:])
+
+      # Outer loop: scan over microbatches
+      (), _losses = jax.lax.scan(process_mubatch, (), xs_mubatches)
+      return jax.ref.freeze(grad_acc)
+
+    Ws = jnp.ones((NUM_LAYERS, 4, 4))
+    xs_batch = jnp.ones((NUM_MUBATCHES * MUBATCH_SIZE, 4))
+    g = process_batch(Ws, xs_batch)
+    self.assertAllClose(g, 20. * jnp.ones_like(Ws), atol=1e-3, rtol=1e-3)
+
+  @parameterized.parameters([False, True])
+  def test_custom_vjp_internal_ref(self, jit):
+    @jax.custom_vjp
+    def f(x):
+      x_ref = jax.new_ref(jnp.zeros_like(x))
+      x_ref[...] = x
+      return x_ref[...]
+    def f_fwd(x):
+      return x, None
+    def f_bwd(_, g):
+      return g,
+    f.defvjp(f_fwd, f_bwd)
+
+    if jit:
+      f = jax.jit(f)
+
+    x = jax.jit(f)(3.)  # no ad, doesn't crash
+    self.assertAllClose(x, 3., check_dtypes=False)
+
+    g = jax.grad(f)(3.)
+    self.assertAllClose(g, 1., check_dtypes=False)
+
+  @parameterized.parameters([False, True])
+  def test_custom_vjp_differentiated_ref(self, jit):
+    @jax.custom_vjp
+    def f(x_ref):
+      return x_ref[...]
+    def f_fwd(x_ref):
+      return f(x_ref), None
+    def f_bwd(_, g):
+      return g,
+    f.defvjp(f_fwd, f_bwd)
+
+    if jit:
+      f = jax.jit(f)
+
+    y = f(jax.new_ref(3.14))
+    self.assertAllClose(y, 3.14, check_dtypes=False)
+
+    # this exercises the fallback path, not a fancy transpose
+    _, f_vjp = jax.vjp(lambda x: f(jax.new_ref(x)), 3.14)
+    g, = f_vjp(1.)
+    self.assertAllClose(g, 1., check_dtypes=False)
+
+  def test_custom_vmap_discharge_internal_ref(self):
+    @jax.custom_batching.custom_vmap
+    def f(x):
+      ref = jax.new_ref(jnp.zeros_like(x))
+      ref[...] = x * 2.
+      return jax.ref.freeze(ref)
+
+    @f.def_vmap
+    def _(axis_size, in_batched, x):
+      return x * 2., True
+
+    jaxpr = jax.make_jaxpr(f)(jnp.arange(3.))
+    discharged_jaxpr = state_discharge.discharge_state(jaxpr)
+    res = core.eval_jaxpr(discharged_jaxpr, jaxpr.consts, jnp.arange(3.))
+    self.assertAllClose(res[0], jnp.arange(3.) * 2., check_dtypes=False)
+
+    vmapped_res = jax.vmap(f)(jnp.arange(3.))
+    self.assertAllClose(vmapped_res, jnp.arange(3.) * 2., check_dtypes=False)
+
+  def test_custom_vmap_discharge_ref_across_boundary(self):
+    @jax.custom_batching.custom_vmap
+    def f(x):
+      ref = jax.new_ref(jnp.zeros(3))
+      ref[...] = x * 3.
+      return jax.ref.freeze(ref)
+
+    @f.def_vmap
+    def _(axis_size, in_batched, x):
+      return x * 3., True
+
+    # The constant-derived ref is hoisted to a custom_vmap_p const, so discharge
+    # sees an AbstractRef input.
+    jaxpr = jax.make_jaxpr(f)(jnp.arange(3.))
+    discharged_jaxpr = state_discharge.discharge_state(jaxpr)
+    res = core.eval_jaxpr(discharged_jaxpr, jaxpr.consts, jnp.arange(3.))
+    self.assertAllClose(res[0], jnp.arange(3.) * 3., check_dtypes=False)
+
+  def test_get_transpose_uninstantiated_grad_ref(self):
+    # from https://github.com/jax-ml/jax/pull/31412#discussion_r2308151559
+    f = lambda x: jax.new_ref(x)[0]
+    jax.grad(f)(jnp.array([3.]))  # don't crash
+
+  def test_vmap_create_ref_from_unbatched_value(self):
+    @jax.jit
+    def internally_pure(x):
+      ref = jax.new_ref(1.)
+      ref[...] += x
+      return ref[...]
+
+    ans = jax.vmap(internally_pure)(jnp.arange(4.))
+    self.assertAllClose(ans, jnp.array([1., 2., 3., 4.]))
+
+  def test_isinstance(self):
+    ref = jax.new_ref(1.)
+    self.assertIsInstance(ref, jax.Ref)
+
+    @jax.jit
+    def f(x_ref):
+      self.assertIsInstance(x_ref, jax.Ref)
+    f(ref)
+
+    self.assertNotIsInstance(ref, jax.Array)
+
+    arr = jnp.ones(3)
+    self.assertNotIsInstance(arr, jax.Ref)
+
+  def test_scan_vjp3_reverse(self):
+    # https://github.com/jax-ml/jax/issues/32411
+    def f(xs):
+      ys = jnp.arange(5.)
+
+      def body(_, xy):
+        x, y = xy
+        return (), x * y
+      (), z = jax.lax.scan(body, (), (xs, ys))
+      return z.sum()
+
+    grad_accum = jax.new_ref(jnp.zeros(5))
+    _, f_vjp = jax.vjp(f, jnp.ones(5))
+    _, = f_vjp.with_refs(grad_accum)(1.)
+    self.assertAllClose(grad_accum[...], jnp.arange(5.))
+
+  @parameterized.parameters([False, True])
+  def test_scan_vjp3_mixed_accum_kinds_xs(self, use_dontwant):
+    # https://github.com/jax-ml/jax/issues/32468
+    # A scan's tangent inputs can be a mix of grad-value, grad-ref, and
+    # dont-want accumulators; the transpose must not rely on their order.
+    def f(Ws, Vs, x):
+      def body(c, wv):
+        W, V = wv
+        return jnp.tanh(jnp.tanh(c @ W) @ V), None
+      c, _ = jax.lax.scan(body, x, (Ws, Vs))
+      return c.sum()
+
+    Ws = jnp.ones((3, 4, 5)) * 0.1
+    Vs = jnp.ones((3, 5, 4)) * 0.2
+    x = jnp.ones(4)
+    ws_bar, vs_bar, x_bar = jax.grad(f, argnums=(0, 1, 2))(Ws, Vs, x)
+
+    # grad ref for the second xs input only
+    _, f_vjp = jax.vjp(f, Ws, Vs, x)
+    vs_ref = jax.new_ref(jnp.zeros_like(Vs))
+    first = jax.ad.DontWant() if use_dontwant else jax.ad.GradValue()
+    ws_bar_, _, x_bar_ = f_vjp.with_refs(first, vs_ref, jax.ad.GradValue())(1.)
+    if not use_dontwant:
+      self.assertAllClose(ws_bar_, ws_bar)
+    self.assertAllClose(vs_ref[...], vs_bar)
+    self.assertAllClose(x_bar_, x_bar)
+
+  @parameterized.parameters([False, True])
+  def test_scan_vjp3_mixed_accum_kinds_consts(self, use_dontwant):
+    # https://github.com/jax-ml/jax/issues/32468
+    # Like test_scan_vjp3_mixed_accum_kinds_xs, but with the scan closing over
+    # the parameters so they become scan consts.
+    def f(W, V, x):
+      def body(c, _):
+        return jnp.tanh(jnp.tanh(c @ W) @ V), None
+      c, _ = jax.lax.scan(body, x, None, length=3)
+      return c.sum()
+
+    W = jnp.ones((4, 5)) * 0.1
+    V = jnp.ones((5, 4)) * 0.2
+    x = jnp.ones(4)
+    w_bar, v_bar, x_bar = jax.grad(f, argnums=(0, 1, 2))(W, V, x)
+
+    # grad ref for the second const input only
+    _, f_vjp = jax.vjp(f, W, V, x)
+    v_ref = jax.new_ref(jnp.zeros_like(V))
+    first = jax.ad.DontWant() if use_dontwant else jax.ad.GradValue()
+    w_bar_, _, x_bar_ = f_vjp.with_refs(first, v_ref, jax.ad.GradValue())(1.)
+    if not use_dontwant:
+      self.assertAllClose(w_bar_, w_bar)
+    self.assertAllClose(v_ref[...], v_bar)
+    self.assertAllClose(x_bar_, x_bar)
+
+  @jtu.sample_product(
+      seed=range(20),
+      num_params=[1, 2, 3, 4],
+      reverse=[False, True],
+  )
+  @jtu.run_on_devices("cpu")
+  def test_scan_vjp3_systematic_accum_kinds(self, seed, num_params, reverse):
+    # https://github.com/jax-ml/jax/issues/32468
+    # The vjp-with-refs of a scan must handle any mix of gradient accumulator
+    # kinds (GradValue, grad ref, DontWant) among the scan's tangent consts,
+    # carries, and xs, in any order, interleaved with residuals, zero-tangent
+    # int inputs, and differentiable consts captured from outside computations.
+    n, length = 3, 3
+    rng = np.random.RandomState(seed)
+    # bias roles toward const/xs: those groups are order-sensitive in the
+    # transpose, while carries are positional
+    roles = [rng.choice(['const', 'carry', 'xs'], p=[0.4, 0.2, 0.4])
+             for _ in range(num_params)]
+    kinds = [rng.choice(['val', 'ref', 'dont']) for _ in range(num_params)]
+    if num_params >= 2 and rng.rand() < 0.75:
+      # usually force a ref/non-ref mix, the order-sensitive combination
+      i, j = rng.choice(num_params, 2, replace=False)
+      kinds[i], kinds[j] = 'ref', rng.choice(['val', 'dont'])
+    use_perm = rng.permutation(num_params)  # scrambles body capture order
+    # capture the derived (ValAccum-tangent) const before or after the params
+    table_first = bool(rng.rand() < 0.5)
+    use_ys = bool(rng.rand() < 0.75)
+    body_const = jnp.array(rng.randn(n), 'float32')
+    # xs-role params are passed to the scan directly, so their top-level
+    # accumulators (e.g. RefAccums) appear directly in the scan's xs slots;
+    # likewise const-role params are closed over directly.
+    params = [jnp.array(rng.uniform(0.5, 1.5,
+                                    (length, n) if r == 'xs' else n), 'float32')
+              for r in roles]
+    xs_idx = {j: k for k, j in enumerate(
+        j for j, r in enumerate(roles) if r == 'xs')}
+    int_xs = jnp.arange(length, dtype='int32')  # zero-tangent xs
+
+    def f(*params):
+      carry_ps = [p for p, r in zip(params, roles) if r == 'carry']
+      init = jnp.tanh(sum(carry_ps) + body_const) if carry_ps else 0. * body_const
+      # a differentiable const captured from an outside computation, with a
+      # nonzero tangent no matter the roles (it depends on every param)
+      seed_vec = init + sum(jnp.sum(p) for p in params) / 10.
+      table = jnp.stack([jnp.cos(seed_vec) * (k + 1.) for k in range(length)])
+      xs_ps = tuple(p for p, r in zip(params, roles) if r == 'xs')
+
+      def body(carry, x):
+        c, i = carry
+        xps, idx = x
+        terms = [table[i]] if table_first else []
+        for j in use_perm:
+          p, r = params[j], roles[j]
+          if r == 'const':
+            terms.append(jnp.sin(p) * jnp.sum(jnp.cos(c)) + p * c)
+          elif r == 'xs':
+            xp = xps[xs_idx[j]]
+            terms.append(jnp.sin(xp) * jnp.sum(c) + xp * jnp.cos(c))
+        if not table_first:
+          terms.append(table[i])
+        new_c = jnp.tanh(c + sum(terms) + idx.astype(c.dtype))
+        return (new_c, i + 1), jnp.sum(new_c * new_c)
+
+      (c_final, _), ys = jax.lax.scan(body, (init, jnp.int32(0)),
+                                      (xs_ps, int_xs), reverse=reverse)
+      return jnp.sum(c_final) + (jnp.sum(ys) if use_ys else 0.)
+
+    expected = jax.grad(f, argnums=tuple(range(num_params)))(*params)
+
+    def run(*params):
+      out, f_vjp = jax.vjp(f, *params)
+      accums = [jax.new_ref(jnp.zeros_like(p)) if k == 'ref' else
+                jax.ad.DontWant() if k == 'dont' else jax.ad.GradValue()
+                for k, p in zip(kinds, params)]
+      cts = f_vjp.with_refs(*accums)(jnp.ones_like(out))
+      return [jax.freeze(a) if k == 'ref' else ct
+              for k, a, ct in zip(kinds, accums, cts)]
+
+    for runner in [run, jax.jit(run)]:
+      results = runner(*params)
+      for kind, result, expect in zip(kinds, results, expected):
+        if kind != 'dont':
+          self.assertAllClose(result, expect, rtol=1e-3, atol=1e-5,
+                              check_dtypes=False)
+
+  def test_vmap_with_vjp3(self):
+    # https://github.com/jax-ml/jax/issues/32479
+    def grad_via_ref(f):
+      def wrapper(*args):
+        grad_accum = jax.tree.map(lambda x: jax.new_ref(jnp.zeros_like(x)), args)
+        out, f_vjp = jax.vjp(f, *args)
+        f_vjp.with_refs(*grad_accum)(jnp.ones_like(out))
+        return jax.tree.map(lambda x: jax.freeze(x), grad_accum)
+      return wrapper
+
+    def issue_vmap1():
+      def f(x):
+        return x + 1
+      x = jnp.ones((4,))
+      # g = grad_via_ref(jax.vmap(f))  # good
+      g = jax.vmap(grad_via_ref(f))    # bad
+      g(x)  # crash
+
+    def issue_vmap1_minimized():
+      def f(x):
+        x.addupdate(1.0)  # bad (assumes non-empty list of indexers)
+      jax.vmap(f)(jax.new_ref(jnp.zeros((4,))))  # crash
+
+    def issue_vmap2():
+      def f(x):
+        x[...] = 1.0  # bad (mismatched shapes)
+      jax.vmap(f)(jax.new_ref(jnp.zeros((4,))))  # crash
+
+    # don't crash
+    issue_vmap1()
+    issue_vmap1_minimized()
+    issue_vmap2()
+
+  def test_slicing_with_vjp3(self):
+    @jax.jit
+    def f(x, i):
+      return x[i] ** 2
+
+    x = jnp.arange(10.)
+
+    grad_accum = jax.new_ref(jnp.zeros(10))
+    not_needed = object()
+
+    @jax.make_jaxpr
+    def run():
+      _, f_vjp = jax.vjp(f, x, 5)
+      f_vjp = f_vjp.with_refs(grad_accum, not_needed)
+      f_vjp(1.)
+
+    jaxpr = run()
+    self.assertIn('+=', str(jaxpr))
+    self.assertNotIn('0.0', str(jaxpr))
+
+  def test_static_slicing_with_vjp3(self):
+    # like test_slicing_with_vjp3, but not jitted, so that the static index
+    # hits slice_p rather than dynamic_slice_p
+    def f(x, i):
+      return x[i]
+
+    x = jnp.arange(10.)
+
+    grad_accum = jax.new_ref(jnp.zeros(10))
+    _, f_vjp = jax.vjp(f, x, 3)
+    f_vjp.with_refs(grad_accum, jax.ad.GradValue())(1.)
+    self.assertAllClose(grad_accum[...], jnp.zeros(10).at[3].set(1.),
+                        check_dtypes=False)
+
+    @jax.make_jaxpr
+    def run():
+      _, f_vjp = jax.vjp(f, x, 3)
+      f_vjp.with_refs(grad_accum, jax.ad.GradValue())(1.)
+
+    jaxpr = run()
+    self.assertIn('+=', str(jaxpr))
+    self.assertNotIn('0.0', str(jaxpr))
+
+    # strided slices take the sparse in-place path too
+    grad_accum = jax.new_ref(jnp.zeros(10))
+    _, f_vjp = jax.vjp(lambda x: x[::2], x)
+    f_vjp.with_refs(grad_accum)(jnp.arange(5.))
+    self.assertAllClose(grad_accum[...],
+                        jnp.zeros(10).at[::2].set(jnp.arange(5.)),
+                        check_dtypes=False)
+
+  @absltest.skip("Not yet implemented")
+  def test_none_index(self):
+    ref = jax.new_ref(jnp.array([1, 2, 3]))
+    y = ref[None]
+    self.assertEqual(y.shape, (1, 3))
+
+  def test_what_if_you_lower_fun_something_with_internal_effects(self):
+    bjp_p = core.Primitive('bjp')
+
+    @bjp_p.def_abstract_eval
+    def _(aval):
+      return aval
+
+    def lowering(x):
+      x_ref = jax.new_ref(x)
+      x_ref[...] += 1
+      x_ref[...] += -1
+      return jax.freeze(x_ref)
+
+    mlir.register_lowering(bjp_p, mlir.lower_fun(lowering, multiple_results=False))
+
+    @jax.jit
+    def f(x):
+      return bjp_p.bind(x)
+
+    f(3.)  # don't crash
+
+  def test_remat_while_loop_residuals(self):
+    @jax.custom_vjp
+    def ra2a(x):
+      return jax.freeze(jax.new_ref(x))
+
+    def ra2a_fwd(x):
+      o = ra2a(x)
+      return o, ()
+
+    def ra2a_bwd(res, g):
+      return (ra2a(g),)
+
+    ra2a.defvjp(ra2a_fwd, ra2a_bwd)
+
+    @jax.jit
+    @jax.remat
+    def f(x):
+
+      def g(x):
+        def body(carry):
+          i, x = carry
+          x = ra2a(x)
+          return i + 1, x
+        return jax.lax.while_loop(lambda x: x[0] < 5, body, (0, x))[1]
+      return g(x)
+
+    jax.linearize(f, 5.)  # don't crash
+
+  def test_empty_ref_basic(self):
+    @jax.jit
+    def f():
+      ref = jax.empty_ref(jax.ShapeDtypeStruct((), 'float32'))
+      ref[...] = 1.
+      return ref[...]
+
+    y = f()
+    self.assertAllClose(y, jnp.ones((), 'float32'))
+
+  def test_empty_ref_jvp(self):
+    @jax.jit
+    def f(x):
+      ref = jax.empty_ref(jax.ShapeDtypeStruct((), 'float32'))
+      ref[...] = 2. * x
+      return ref[...]
+
+    y, y_dot = jax.jvp(f, (3.,), (1.,))
+    self.assertAllClose(y, 6., check_dtypes=False)
+    self.assertAllClose(y_dot, 2., check_dtypes=False)
+
+  def test_empty_ref_grad(self):
+    @jax.jit
+    def f(x):
+      ref = jax.empty_ref(jax.ShapeDtypeStruct((), 'float32'))
+      ref[...] = 2. * x
+      return ref[...]
+
+    y_bar = jax.grad(f)(3.)
+    self.assertAllClose(y_bar, 2., check_dtypes=False)
+
+  def test_free_ref_basic(self):
+    @jax.jit
+    def f(x):
+      ref = jax.empty_ref(jax.ShapeDtypeStruct((), 'float32'))
+      ref[...] = 2. * x
+      result = ref[...]
+      jax.free_ref(ref)
+      return result
+    self.assertArraysEqual(f(3.), 6., check_dtypes=False)
+
+  def test_double_free_ref_raises(self):
+    @jax.jit
+    def f():
+      ref = jax.empty_ref(jax.ShapeDtypeStruct((), 'float32'))
+      jax.free_ref(ref)
+      jax.free_ref(ref)  # double free, should raise
+
+    with self.assertRaises(Exception):
+      f()
+
+  def test_deref_after_free_ref_raises(self):
+    @jax.jit
+    def f(x):
+      ref = jax.new_ref(x)
+      jax.free_ref(ref)
+      return ref[...]  # deref after free, should raise
+    with self.assertRaises(Exception):
+      f(1.)
+
+  def test_free_ref_jvp(self):
+    @jax.jit
+    def f(x):
+      ref = jax.empty_ref(jax.ShapeDtypeStruct((), 'float32'))
+      ref[...] = 2. * x
+      result = ref[...]
+      jax.free_ref(ref)
+      return result
+
+    y, y_dot = jax.jvp(f, (3.,), (1.,))
+    self.assertArraysEqual(y, 6., check_dtypes=False)
+    self.assertArraysEqual(y_dot, 2., check_dtypes=False)
+
+  def test_free_ref_grad(self):
+    @jax.jit
+    def f(x):
+      ref = jax.empty_ref(jax.ShapeDtypeStruct((), 'float32'))
+      ref[...] = 2. * x
+      result = ref[...]
+      jax.free_ref(ref)
+      return result
+
+    y_bar = jax.grad(f)(3.)
+    self.assertArraysEqual(y_bar, 2., check_dtypes=False)
+
+  @jtu.sample_product([
+    dict(shape=(3, 4), indexer=np.index_exp[1]),
+    dict(shape=(3, 4), indexer=np.index_exp[1:4]),
+    dict(shape=(2, 3, 4), indexer=np.index_exp[..., 0]),
+    dict(shape=(2, 3, 4), indexer=np.index_exp[:, 1]),
+    dict(shape=(3, 4), indexer=np.index_exp[np.arange(2), np.arange(2)]),
+    dict(shape=(3, 4), indexer=np.index_exp[np.arange(2), ..., np.arange(2)]),
+  ])
+  def test_indexing_patterns(self, shape, indexer):
+    x = self.rng().uniform(size=shape)
+    x_ref = jax.new_ref(x)
+    self.assertArraysAllClose(x[indexer], x_ref[indexer])
+
+  def test_can_dce_internal_ref_effect(self):
+
+    @jax.jit
+    def f(x, y):
+      @jax.jit
+      def g(y):
+        y_ref = jax.new_ref(y)
+        y_ref[...] += 1
+        return jax.freeze(y_ref)
+      _ = g(y)
+      return x
+    stable_hlo = f.lower(1, 2).as_text()
+    self.assertNotIn("add", stable_hlo)
+
+  def test_grad_of_constant_ref_set(self):
+    # https://github.com/jax-ml/jax/issues/33987
+    @jax.jit
+    def f(x):
+      ref = jax.new_ref(x)
+      ref[...] = 2.0
+      return jax.freeze(ref)
+    self.assertArraysEqual(jax.grad(f)(1.0), 0.0, check_dtypes=False)
+
+    def g(x):
+      ref = jax.new_ref(x)
+      y = ref[...]
+      ref[...] = 2.0
+      return y * jax.freeze(ref)
+    self.assertArraysEqual(jax.grad(g)(3.0), 2.0, check_dtypes=False)
+
+  def test_grad_of_constant_ref_set_indexed(self):
+    def f(x):
+      ref = jax.new_ref(x)
+      ref[0] = 2.0
+      return jax.freeze(ref).sum()
+    self.assertArraysEqual(jax.grad(f)(jnp.arange(3.)),
+                           jnp.array([0., 1., 1.]))
+
+  def test_grad_get_transformed_ref(self):
+    @jax.jit
+    def f(x):
+      ref = jax.new_ref(jnp.ones(5))
+      ref.at[1:4][...] += x
+      return ref[...].sum()
+
+    x = jnp.array([1.0, 2.0, 3.0])
+    jax.grad(f)(x)  # don't crash
+
+  def test_with_refs_basic(self):
+    def f(x_ref):
+      return x_ref[...] ** 2
+
+    x_ref = jax.new_ref(2.)
+    _, f_vjp = jax.vjp(f, x_ref)
+    x_grad_ref = jax.new_ref(0.)
+    f_vjp = f_vjp.with_refs(x_grad_ref)
+    f_vjp(1.0)
+    self.assertAllClose(x_grad_ref[...], 4., check_dtypes=False)
+
+  @parameterized.parameters([False, True])
+  def test_gather_with_vjp3(self, jit):
+    # reverse-mode of advanced indexing accumulates in-place into a bound
+    # gradient ref, without materializing dense one-hot cotangents
+    def f(x, i):
+      return x[i]
+    if jit:
+      f = jax.jit(f)
+
+    x = jnp.arange(10.)
+    idx = jnp.array([3, 5, 3])  # note the duplicate index
+    ct = jnp.arange(1., 4.)
+
+    grad_accum = jax.new_ref(jnp.zeros(10))
+    _, f_vjp = jax.vjp(f, x, idx)
+    f_vjp.with_refs(grad_accum, jax.ad.GradValue())(ct)
+    self.assertAllClose(grad_accum[...], jnp.zeros(10).at[idx].add(ct),
+                        check_dtypes=False)
+
+    @jax.make_jaxpr
+    def run():
+      _, f_vjp = jax.vjp(f, x, idx)
+      f_vjp.with_refs(grad_accum, jax.ad.GradValue())(ct)
+
+    jaxpr_str = str(run())
+    self.assertIn('+=', jaxpr_str)
+    self.assertNotIn('scatter-add', jaxpr_str)
+
+  def test_gather_with_vjp3_multidim(self):
+    def f(x, i):
+      return x[i, i]
+
+    x = jnp.arange(84.).reshape(7, 4, 3)
+    idx = jnp.array([3, 1, 3])
+
+    _, f_vjp = jax.vjp(f, x, idx)
+    expected, _ = f_vjp(jnp.ones((3, 3)))
+
+    grad_accum = jax.new_ref(jnp.zeros_like(x))
+    _, f_vjp = jax.vjp(f, x, idx)
+    f_vjp.with_refs(grad_accum, jax.ad.GradValue())(jnp.ones((3, 3)))
+    self.assertAllClose(grad_accum[...], expected, check_dtypes=False)
+
+  def test_gather_with_vjp3_general_fallback(self):
+    # gathers that don't look like NumPy-style indexing (e.g. clip mode)
+    # accumulate via scatter-add on the ref's value, matching the dense result
+    def f(x, i):
+      return x.at[i].get(mode='clip')
+
+    x = jnp.arange(10.)
+    idx = jnp.array([3, 100])  # out-of-bounds index clamps under clip mode
+
+    _, f_vjp = jax.vjp(f, x, idx)
+    expected, _ = f_vjp(jnp.ones(2))
+
+    grad_accum = jax.new_ref(jnp.zeros(10))
+    _, f_vjp = jax.vjp(f, x, idx)
+    f_vjp.with_refs(grad_accum, jax.ad.GradValue())(jnp.ones(2))
+    self.assertAllClose(grad_accum[...], expected, check_dtypes=False)
+
+
+@jtu.with_config(jax_mutable_array_checks=True)
+class MutableArrayErrorsTest(jtu.JaxTestCase):
+  def test_return_from_jit(self):
+    with self.assertRaisesRegex(
+        ValueError,
+        r"traced for jit returned a mutable array reference.*\n\n"
+        r".*was created on line"):
+      jax.jit(core.new_ref)(jnp.arange(3))
+
+  def test_return_from_jit_arg(self):
+    with self.assertRaisesRegex(
+        ValueError,
+        r"traced for jit returned a mutable array reference.*\n\n"
+        r".*was passed in as the argument x_ref"):
+      jax.jit(lambda x_ref: x_ref)(core.new_ref(jnp.arange(3)))
+
+  @unittest.skip("regressed")  # TODO(mattjj): fix
+  def test_return_from_jit_pytree(self):
+    with self.assertRaisesRegex(
+        ValueError,
+        r"tree path result\['hi'\]"):
+      jax.jit(lambda x_ref: {'hi': x_ref})(core.new_ref(jnp.arange(3)))
+
+  @unittest.skip("regressed")  # TODO(mattjj): fix
+  def test_return_from_jit_closure(self):
+    with self.assertRaisesRegex(
+        ValueError,
+        r"tree path result\['hi'\]"):
+      x_ref = core.new_ref(jnp.arange(3))
+      jax.jit(lambda: {'hi': x_ref})()
+
+  def test_argument_aliases_jit(self):
+    x_ref = core.new_ref(0.)
+    with self.assertRaisesRegex(
+        ValueError, "appeared at both x_ref and y_ref"):
+      jax.jit(lambda x_ref, y_ref: x_ref[...] + y_ref[...])(x_ref, x_ref)
+
+  def test_closure_and_argument_aliases_jit(self):
+    x_ref = core.new_ref(0.)
+    with self.assertRaisesRegex(
+        ValueError, "closed over and passed as the argument y_ref"):
+      jax.jit(lambda y_ref: x_ref[...] + y_ref[...])(x_ref)
+
+  def test_return_from_scan(self):
+    with self.assertRaisesRegex(
+        ValueError, "traced for scan returned a mutable array reference of type"):
+      jax.lax.scan(lambda c, x: (core.new_ref(c), x), 0, jnp.arange(3))
+
+  def test_argument_aliases_scan(self):
+    x_ref = core.new_ref(0.)
+    with self.assertRaisesRegex(
+        ValueError, r"appeared at both c\[0\] and c\[1\]"):
+      jax.lax.scan(lambda c, _: (None, None), (x_ref, x_ref), None, length=1)
+
+  def test_closure_and_argument_aliases_scan(self):
+    x_ref = core.new_ref(0.)
+    with self.assertRaisesRegex(
+        ValueError, r"closed over and passed as the argument y_ref"):
+      jax.lax.scan(lambda y_ref, _: (x_ref[...] + y_ref[...], None), x_ref,
+                   None, length=1)
+
+  def test_return_from_cond(self):
+    with self.assertRaisesRegex(
+        ValueError, "traced for cond returned a mutable array reference of type"):
+      jax.lax.cond(True, lambda: core.new_ref(1.0), lambda: core.new_ref(2.0))
+
+  def test_argument_aliases_cond(self):
+    x_ref = core.new_ref(0.)
+    with self.assertRaisesRegex( ValueError, r"for cond.*at both x1 and x2"):
+      jax.lax.cond(True, lambda x1, x2: ..., lambda x1, x2: ..., x_ref, x_ref)
+
+  def test_closure_and_argument_aliases_cond(self):
+    x_ref = core.new_ref(0.)
+    with self.assertRaisesRegex(
+        ValueError, r"closed over and passed as the argument y_ref"):
+      jax.lax.cond(True,
+                   lambda y_ref: x_ref[...] + y_ref[...],
+                   lambda y_ref: x_ref[...] + y_ref[...],
+                   x_ref)
+
+  @parameterized.parameters([False, True])
+  def test_return_from_custom_vjp_primal(self, jit):
+    @jax.custom_vjp
+    def f(ref):
+      return ref
+    f.defvjp(lambda ref: ..., lambda *_: ...)
+    if jit:
+      f = jax.jit(f)
+    x_ref = core.new_ref(0.)
+    with self.assertRaisesRegex(ValueError, "returned a mutable array"):
+      f(x_ref)
+
+  @parameterized.parameters([False, True])
+  def test_return_from_custom_vjp_primal_nondiff_argnum(self, jit):
+    @partial(jax.custom_vjp, nondiff_argnums=(0,))
+    def f(_, ref):
+      return ref
+    f.defvjp(lambda _, ref: ..., lambda *_: ...)
+    if jit:
+      f = jax.jit(f, static_argnums=0)
+    x_ref = core.new_ref(0.)
+    with self.assertRaisesRegex(ValueError, "returned a mutable array"):
+      f('hi', x_ref)
+
+  @parameterized.parameters([False, True])
+  def test_return_from_custom_vjp_fwd(self, jit):
+    @jax.custom_vjp
+    def f(x, ref):
+      return x
+    f.defvjp(lambda x, ref: (x, ref), lambda ref, g: g)
+    if jit:
+      f = jax.jit(f)
+    x_ref = core.new_ref(0.)
+
+    jax.vjp(f, 3., x_ref)  # returning input ref, okay
+
+    @jax.custom_vjp
+    def g(x, ref):
+      return x
+    def g_fwd(x, _):
+      y_ref = core.new_ref(0)
+      return x, y_ref
+    g.defvjp(g_fwd, lambda ref, g: g)
+    if jit:
+      g = jax.jit(g)
+    x_ref = core.new_ref(0.)
+
+    with self.assertRaisesRegex(
+        ValueError, "custom_vjp fwd function"):
+      jax.vjp(g, 3., x_ref)
+
+  @parameterized.parameters([False, True])
+  def test_argument_aliases_custom_vjp_primal(self, jit):
+    @jax.custom_vjp
+    def f(x_ref, y_ref):
+      ...
+    f.defvjp(lambda x_ref, y_ref: (None, None), lambda _, g: (None, None))
+    if jit:
+      f = jax.jit(f)
+    x_ref = core.new_ref(0.)
+    with self.assertRaisesRegex(ValueError, "x_ref and y_ref"):
+      f(x_ref, x_ref)
+
+  @parameterized.parameters([False, True])
+  def test_argument_aliases_custom_vjp_fwd(self, jit):
+    @jax.custom_vjp
+    def f(x_ref, y_ref):
+      ...
+    f.defvjp(lambda x_ref, y_ref: (None, None), lambda _, g: (None, None))
+    if jit:
+      f = jax.jit(f)
+    x_ref = core.new_ref(0.)
+    with self.assertRaisesRegex(ValueError, "x_ref and y_ref"):
+      jax.vjp(f, x_ref, x_ref)
+
+  # TODO(mattjj): add test test_closure_and_argument_aliases_custom_vjp
+
+  @parameterized.parameters([False, True])
+  def test_cond_both_branches_close_over_same_mutable_array(self, jit):
+    # see also test_cond_with_ref_reuse in state_test.py
+    x_ref = core.new_ref(0.)
+    def f(pred):
+      def true_fun():
+        x_ref[()] = 1.
+      def false_fun():
+        x_ref[()] = 2.
+      jax.lax.cond(pred, true_fun, false_fun)
+    if jit:
+      f = jax.jit(f)
+    f(True)
+    self.assertAllClose(x_ref[...], 1.)
+    f(False)
+    self.assertAllClose(x_ref[...], 2.)
+
+  def test_vmap_closed_over_ref_write(self):
+    x_ref = core.new_ref(jnp.zeros((), 'int32'))
+
+    def f(val):
+      x_ref[...] += val
+
+    vals = jnp.arange(3, dtype='int32')
+    with self.assertRaisesRegex(Exception, "unbatched array reference"):
+      jax.vmap(f)(vals)
+
+  def test_vmap_aliased_arguments(self):
+    def f(ref_1, ref_2):
+      pass
+
+    x_ref = core.new_ref(jnp.zeros((3, 3)))
+    with self.assertRaisesRegex(
+        ValueError,
+        "only one reference to a mutable array may be passed as an argument"):
+      jax.vmap(f)(x_ref, x_ref)
+
+  def test_jvp_closed_over_ref_error(self):
+    ref = core.new_ref(0.)
+    def f(x):
+      ref[...] = x
+      return x
+    with self.assertRaisesRegex(
+        Exception, "Move the array reference"):
+      jax.jvp(f, [1.], [1.])
+
+  def test_return_empty_ref_message(self):
+    with self.assertRaisesRegex( ValueError, "was created on line"):
+      jax.jit(lambda: jax.empty_ref(jax.typeof(3.)))()
+
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

@@ -18,9 +18,10 @@ import operator
 
 import numpy as np
 import jax
-from jax import core
 import jax.numpy as jnp
-from jax._src import prng
+from jax._src import config
+from jax._src import core
+from jax._src.random import prng
 from jax._src import random
 from jax._src import test_util as jtu
 from jax.errors import KeyReuseError
@@ -49,7 +50,6 @@ primitives_with_static_signatures = {
   jax.lax.broadcast_in_dim_p: (lambda key: key[None], key),
   jax.lax.copy_p: (jnp.array, key),
   jax.lax.convert_element_type_p: (lambda key: jnp.array(key, dtype=key.dtype), key),
-  jax.lax.device_put_p: (jax.device_put, key),
   jax.lax.reshape_p: (lambda key: key.reshape((1,)), key),
   jax.lax.squeeze_p: (jnp.squeeze, key1D),
   jax.lax.dynamic_slice_p: (partial(jax.lax.dynamic_slice, slice_sizes=(1,)), key1D, (0,)),
@@ -141,7 +141,7 @@ class KeyReuseUnitTestWithForwarding(jtu.JaxTestCase):
   def test_unwrap(self):
     def f(key):
       assert_unconsumed(key)
-      key_data = jax.random.key_data(key)
+      jax.random.key_data(key)
       assert_unconsumed(key)
     self.check_key_reuse(f, jax.random.key(0))
 
@@ -178,13 +178,26 @@ class KeyReuseUnitTestWithForwarding(jtu.JaxTestCase):
   def test_device_put(self):
     def f(key):
       assert_unconsumed(key)
-      key2 = jax.device_put(key)
-      assert_unconsumed(key)
-      assert_unconsumed(key2)
+      key_d = jax.device_put(key)
+      assert_unconsumed(key_d)
       consume(key)
-      assert_consumed(key)
-      assert_consumed(key2)
+      assert_consumed(key_d)
     self.check_key_reuse(f, jax.random.key(0))
+
+  def test_device_put_multiple(self):
+    def f(key1, key2):
+      assert_unconsumed(key1)
+      assert_unconsumed(key2)
+      key1_d, key2_d = jax.device_put((key1, key2))
+
+      assert_unconsumed(key1_d)
+      consume(key1)
+      assert_consumed(key1_d)
+
+      assert_unconsumed(key2_d)
+      consume(key2)
+      assert_consumed(key2_d)
+    self.check_key_reuse(f, jax.random.key(0), jax.random.key(1))
 
   def test_squeeze(self):
     def f(key):
@@ -245,8 +258,9 @@ class KeyReuseUnitTestWithForwarding(jtu.JaxTestCase):
   def test_jit_can_consume_input(self):
     def f(key):
       assert_unconsumed(key)
-      jax.jit(jax.random.bits)(key)
+      ans = jax.jit(jax.random.bits)(key)
       assert_consumed(key)
+      return ans
     self.check_key_reuse(f, jax.random.key(0))
 
   def test_jit_can_return_consumed_output(self):
@@ -294,28 +308,31 @@ class KeyReuseUnitTestWithForwarding(jtu.JaxTestCase):
       assert_unconsumed(key)
       assert_unconsumed(key1)
       assert_unconsumed(key2)
-      _ = jax.random.bits(key1)
+      other = jax.random.bits(key1)
       assert_consumed(key)
       assert_consumed(key1)
       assert_consumed(key2)
+      return (key1, key2, other)
     self.check_key_reuse(f, jax.random.key(0))
 
   def test_cond_both_consumed(self):
     @jax.jit
     def f(flag, key):
       assert_unconsumed(key)
-      _ = jax.lax.cond(
+      ans = jax.lax.cond(
         flag, jax.random.uniform, jax.random.normal, key)
       assert_consumed(key)
+      return ans
     self.check_key_reuse(f, True, jax.random.key(0))
 
   def test_cond_one_consumed(self):
     @jax.jit
     def f(flag, key):
       assert_unconsumed(key)
-      _ = jax.lax.cond(
+      ans = jax.lax.cond(
         flag, jax.random.uniform, lambda k: 1.0, key)
       assert_consumed(key)
+      return ans
     self.check_key_reuse(f, True, jax.random.key(0))
 
   def test_cond_neither_consumed(self):
@@ -343,7 +360,7 @@ class KeyReuseUnitTestWithForwarding(jtu.JaxTestCase):
     func, *args = primitives_with_static_signatures[primitive]
     signature = _core.key_reuse_signatures[primitive]
     jaxpr = jax.make_jaxpr(func)(*args)
-    self.assertEqual(signature, _core.jaxpr_type_signature(jaxpr.jaxpr))
+    self.assertEqual(signature, _core.jaxpr_type_signature(jaxpr))
 
   @parameterized.parameters(*primitives_with_static_signatures)
   def test_function_type_signature(self, primitive):
@@ -357,7 +374,7 @@ class KeyReuseIntegrationTest(jtu.JaxTestCase):
   random_bits_error = "In random_bits, argument [0-9]+ is already consumed.*"
   random_split_error = "In random_split, argument [0-9]+ is already consumed.*"
   generic_error = ".*argument [0-9]+ is already consumed.*"
-  pjit_error = "In pjit, argument 0 is already consumed."
+  pjit_error = "In jit, argument 0 is already consumed."
 
   def check_key_reuse(self, f, *args):
     return _core.check_key_reuse(f, *args)
@@ -379,17 +396,17 @@ class KeyReuseIntegrationTest(jtu.JaxTestCase):
 
     def f_bad():
       key = jax.random.key(0)
-      _ = jax.random.split(key)
-      return jax.random.uniform(key)
+      other = jax.random.split(key)
+      return (jax.random.uniform(key), other)
 
     with self.assertRaisesRegex(KeyReuseError, self.pjit_error):
       self.check_key_reuse(f_bad)
 
     def f_bad_2():
       key = jax.random.key(0)
-      _ = jax.random.split(key)
-      key1, _ = jax.random.split(key)
-      return jax.random.uniform(key1)
+      other1 = jax.random.split(key)
+      key1, other2 = jax.random.split(key)
+      return (jax.random.uniform(key1), other1, other2)
 
     with self.assertRaisesRegex(KeyReuseError, self.random_split_error):
       self.check_key_reuse(f_bad_2)
@@ -585,6 +602,11 @@ class KeyReuseIntegrationTest(jtu.JaxTestCase):
 
   @jax.numpy_dtype_promotion('standard')
   def test_remat(self):
+    # TODO(mattjj,vanderplas): teach key reuse checking to see through
+    # remat3's RematTraced applications (and to skip rematted functions)
+    if config.remat3.value:
+      self.skipTest("key reuse checking doesn't support remat3")
+
     @jax.checkpoint
     def f_bad(x, key):
       return x * jax.random.bits(key) + jax.random.bits(key)
@@ -600,7 +622,7 @@ class KeyReuseIntegrationTest(jtu.JaxTestCase):
       self.check_key_reuse(f_bad, x, key)
 
     with self.assertRaisesRegex(KeyReuseError, self.random_bits_error):
-      self.check_key_reuse(jax.grad(f_bad), x, key)
+      self.check_key_reuse(jax.value_and_grad(f_bad), x, key)
 
     self.check_key_reuse(f_good, x, key)
     self.check_key_reuse(jax.grad(f_good), x, key)
@@ -613,11 +635,17 @@ class KeyReuseEagerTest(jtu.JaxTestCase):
   traced_bits_msg = "In random_bits, argument 0 is already consumed."
 
   def test_clone_eager(self):
-    key = jax.random.key(0)
-    key2 = jax.random.clone(key)
-    self.assertIsNot(key, key2)
+    def run():
+      key = jax.random.key(0)
+      key2 = jax.random.clone(key)
+      self.assertIsNot(key, key2)
+      _ = jax.random.uniform(key)
+      return key, key2
 
-    _ = jax.random.uniform(key)
+    # First run without the config, to make sure the jit cache behaves correctly.
+    with jax._src.config.debug_key_reuse(False):
+      run()
+    key, key2 = run()
     self.assertTrue(key._consumed)
     self.assertFalse(key2._consumed)
 
@@ -650,6 +678,16 @@ class KeyReuseEagerTest(jtu.JaxTestCase):
       return jax.random.bits(key) + jax.random.bits(key)
     with self.assertRaisesRegex(KeyReuseError, self.traced_bits_msg):
       f()
+
+  def test_vmap_zero_sized_axis(self):
+    # Regression test for https://github.com/jax-ml/jax/issues/37859: vmap over
+    # a zero-sized key axis must not raise a spurious KeyReuseError.
+    def f(key):
+      a, b = jax.random.split(key)
+      return jax.random.bits(a) + jax.random.bits(b)
+    keys = jax.random.split(jax.random.key(0), 0)
+    self.assertEqual(keys.shape, (0,))
+    jax.vmap(f)(keys)  # does not raise
 
 
 class KeyReuseImplementationTest(jtu.JaxTestCase):

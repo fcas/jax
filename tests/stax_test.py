@@ -12,24 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Stax library."""
-
 from absl.testing import absltest
 
 import numpy as np
 
 import jax
+from jax._src import dtypes
 from jax._src import test_util as jtu
 from jax import random
 from jax.example_libraries import stax
-from jax import dtypes
 
 jax.config.parse_flags_with_absl()
 
 
 def random_inputs(rng, input_shape):
   if type(input_shape) is tuple:
-    return rng.randn(*input_shape).astype(dtypes.canonicalize_dtype(float))
+    return rng.randn(*input_shape).astype(dtypes.default_float_dtype())
   elif type(input_shape) is list:
     return [random_inputs(rng, shape) for shape in input_shape]
   else:
@@ -42,7 +40,7 @@ def _CheckShapeAgreement(test_case, init_fun, apply_fun, input_shape):
   result_shape, params = init_fun(init_key, input_shape)
   inputs = random_inputs(test_case.rng(), input_shape)
   if params:
-    inputs = inputs.astype(np.dtype(params[0]))
+    inputs = inputs.astype(dtypes.dtype(jax.tree.leaves(params)[0]))
   result = apply_fun(params, inputs, rng=rng_key)
   test_case.assertEqual(result.shape, result_shape)
 
@@ -216,7 +214,7 @@ class StaxTest(jtu.JaxTestCase):
 
   def testBatchNormShapeNCHW(self):
     key = random.PRNGKey(0)
-    # Regression test for https://github.com/google/jax/issues/461
+    # Regression test for https://github.com/jax-ml/jax/issues/461
     init_fun, apply_fun = stax.BatchNorm(axis=(0, 2, 3))
     input_shape = (4, 5, 6, 7)
 

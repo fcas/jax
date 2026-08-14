@@ -1,0 +1,70 @@
+/* Copyright 2024 The JAX Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#ifndef JAXLIB_MOSAIC_DIALECT_GPU_INTEGRATIONS_C_GPU_DIALECT_H_
+#define JAXLIB_MOSAIC_DIALECT_GPU_INTEGRATIONS_C_GPU_DIALECT_H_
+
+#include <stddef.h>
+
+#include "mlir-c/IR.h"
+#include "mlir-c/Support.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(MosaicGPU, mosaic_gpu);
+
+MLIR_CAPI_EXPORTED void mlirDialectRegistryInsertMosaicGpuInlinerExtensions(
+    MlirDialectRegistry registry);
+
+//===----------------------------------------------------------------------===//
+// BarrierType
+//===----------------------------------------------------------------------===//
+
+MLIR_CAPI_EXPORTED bool mlirMosaicGpuIsABarrierType(MlirType type);
+MLIR_CAPI_EXPORTED MlirType
+mlirMosaicGpuBarrierTypeGet(MlirContext ctx, bool orders_tensor_core);
+MLIR_CAPI_EXPORTED bool mlirMosaicGpuBarrierTypeGetOrdersTensorCore(
+    MlirType type);
+MLIR_CAPI_EXPORTED MlirTypeID mlirMosaicGpuBarrierTypeGetTypeID();
+
+//===----------------------------------------------------------------------===//
+// B6x16P32Type
+//===----------------------------------------------------------------------===//
+
+MLIR_CAPI_EXPORTED bool mlirMosaicGpuIsAB6x16P32Type(MlirType type);
+MLIR_CAPI_EXPORTED MlirType
+mlirMosaicGpuB6x16P32TypeGet(MlirContext ctx, MlirType element_type);
+MLIR_CAPI_EXPORTED MlirType
+mlirMosaicGpuB6x16P32TypeGetElementType(MlirType type);
+MLIR_CAPI_EXPORTED MlirTypeID mlirMosaicGpuB6x16P32TypeGetTypeID(void);
+
+//===----------------------------------------------------------------------===//
+// P2B6Type
+//===----------------------------------------------------------------------===//
+
+MLIR_CAPI_EXPORTED bool mlirMosaicGpuIsAP2B6Type(MlirType type);
+MLIR_CAPI_EXPORTED MlirType
+mlirMosaicGpuP2B6TypeGet(MlirContext ctx, MlirType element_type);
+MLIR_CAPI_EXPORTED MlirType
+mlirMosaicGpuP2B6TypeGetElementType(MlirType type);
+MLIR_CAPI_EXPORTED MlirTypeID mlirMosaicGpuP2B6TypeGetTypeID(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // JAXLIB_MOSAIC_DIALECT_GPU_INTEGRATIONS_C_GPU_DIALECT_H_

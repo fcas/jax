@@ -14,8 +14,10 @@
 
 import hashlib
 import os
+import re
 import sys
 import unittest
+from typing import cast as type_cast
 
 import numpy as np
 
@@ -23,12 +25,18 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax import lax
+from jax.experimental import pallas as pl
 from jax._src import cache_key
 from jax._src import compiler
 from jax._src import config
 from jax._src import test_util as jtu
 from jax._src import xla_bridge
 from jax._src.lib import xla_client
+from jax._src.lib.mlir import ir
+from jax._src.mesh import Mesh
+from jax._src.partition_spec import PartitionSpec as P
+from jax._src.sharding_impls import NamedSharding
+from jax._src.custom_partitioning import custom_partitioning
 
 
 config.parse_flags_with_absl()
@@ -61,6 +69,7 @@ class CacheKeyTest(jtu.JaxTestCase):
     debug_options.xla_dump_hlo_as_long_text = True
     debug_options.xla_dump_disable_metadata = True
     debug_options.xla_dump_hlo_pipeline_re = "xyzzy"
+    debug_options.xla_gpu_experimental_autotune_cache_mode = 2
     hash2 = self.get_hashed_value(
         cache_key._hash_serialized_compile_options, compile_options
     )
@@ -75,9 +84,9 @@ class CacheKeyTest(jtu.JaxTestCase):
     self.assertEqual(dev_hash1, dev_hash2)
 
     acc_hash1 = self.get_hashed_value(
-        cache_key._hash_accelerator_config, devices, xla_bridge.get_backend())
+        cache_key._hash_accelerator_config, devices)
     acc_hash2 = self.get_hashed_value(
-        cache_key._hash_accelerator_config, devices, xla_bridge.get_backend())
+        cache_key._hash_accelerator_config, devices)
     self.assertEqual(acc_hash1, acc_hash2)
 
   def test_hash_platform(self):
@@ -127,6 +136,7 @@ class CacheKeyTest(jtu.JaxTestCase):
         cache_key.get(computation, devices, compile_options_filled, backend),
     )
 
+  @jtu.thread_unsafe_test()
   def test_custom_hook(self):
     computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
     devices = np.array([[jax.local_devices()[0]]])
@@ -155,6 +165,72 @@ class CacheKeyTest(jtu.JaxTestCase):
         cache_key.get(computation2, devices, compile_options, backend),
     )
 
+  # TODO(phawkins): this test flakes if test concurrency is enabled.
+  @jtu.thread_unsafe_test()
+  @jtu.ignore_warning(category=DeprecationWarning,
+                      message='`with mesh:` context manager')
+  def test_custom_partitioning_ptr_removal(self):
+    def _partition(mesh, arg_shapes, result_shape):
+      arg_shardings = jax.tree.map(lambda x: x.sharding, arg_shapes)
+      result_shardings = NamedSharding(mesh, arg_shapes[0].sharding.spec)
+      return mesh, jax.numpy.add, result_shardings, arg_shardings
+
+    def _infer_sharding_from_operands(mesh, arg_shapes, result_shape):
+      return NamedSharding(mesh, arg_shapes[0].sharding.spec)
+
+    @custom_partitioning
+    def _cp_add(x, y):
+      return jax.numpy.add(x, y)
+
+    _cp_add.def_partition(
+      infer_sharding_from_operands=_infer_sharding_from_operands,
+      partition=_partition,
+      sharding_rule='..., ... -> ...')
+
+    devices = np.asarray(jax.devices())
+    with Mesh(devices, ('x',)) as m:
+      computation = jax.jit(
+        _cp_add,
+        in_shardings=(NamedSharding(m, P('x')),
+                      NamedSharding(m, P('x'))),
+                      out_shardings=NamedSharding(m, P('x'))
+      ).lower(
+        jax.ShapeDtypeStruct([1024], dtype=jax.numpy.float32),
+        jax.ShapeDtypeStruct([1024], dtype=jax.numpy.float32),
+      ).compiler_ir()
+      pattern = (
+          r'stablehlo\.custom_call @CustomSPMDPartitioning\('
+          r'(.*?)\) \{'
+          r'(.*?backend_config\s*=\s*"([^"]*)".*?)'
+          r'\}'
+      )
+      with computation.context:
+        updated_module = cache_key._remove_custom_partitioning_callbacks(
+            type_cast(ir.Module, computation.operation.clone()),
+        )
+        bcs = [
+            match[2]
+            for match in re.findall(pattern, str(updated_module), re.DOTALL)
+        ]
+        for bc in bcs:
+          self.assertEqual(bc, "REMOVED")
+
+      compile_options = compiler.get_compile_options(
+          num_replicas=1, num_partitions=1
+      )
+      backend = xla_bridge.get_backend()
+      hash_without_callback_ptrs = cache_key.get(
+          computation,
+          devices,
+          compile_options,
+          backend,
+          ignore_custom_partitioning=True,
+      )
+      expected_hash = cache_key.get(
+          updated_module, devices, compile_options, backend
+      )
+      self.assertEqual(expected_hash, hash_without_callback_ptrs)
+
   def test_different_device_assignment(self):
     computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
     devices = np.array([[jax.local_devices()[0]]])
@@ -173,6 +249,7 @@ class CacheKeyTest(jtu.JaxTestCase):
       self.assertNotEqual(hash_1, hash_2)
 
   @parameterized.parameters([False, True])
+  @jtu.thread_unsafe_test()  # env vars are not thread-safe
   def test_identical_computations_different_metadata(self, include_metadata):
     f = lambda x, y: lax.mul(lax.add(x, y), 2)
     g = lambda x, y: lax.mul(lax.add(x, y), 2)
@@ -189,6 +266,38 @@ class CacheKeyTest(jtu.JaxTestCase):
       key2 = cache_key.get(computation2, devices, compile_options, backend)
     self.assertEqual(include_metadata, key1 != key2)
 
+  @parameterized.parameters([False, True])
+  def test_identical_pallas_kernels_different_metadata(self, include_metadata):
+    if not jtu.test_device_matches(["tpu"]):
+      self.skipTest("Pallas TPU lowering requires TPU backend")
+
+    # Same kernel body at different source lines; same __name__ to avoid kernel_name diff
+    def make_caller_a():
+      def kernel(x_ref, o_ref):
+        o_ref[...] = x_ref[...] + 1.0
+      return jax.jit(lambda x: pl.pallas_call(
+          kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype))(x))
+
+    def make_caller_b():
+      def kernel(x_ref, o_ref):
+        o_ref[...] = x_ref[...] + 1.0
+      return jax.jit(lambda x: pl.pallas_call(
+          kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype))(x))
+
+    x = np.ones((128,), dtype=np.float32)
+    computation1 = make_caller_a().lower(x).compiler_ir()
+    computation2 = make_caller_b().lower(x).compiler_ir()
+    devices = np.array([[jax.local_devices()[0]]])
+    compile_options = compiler.get_compile_options(
+        num_replicas=1, num_partitions=1
+    )
+    backend = xla_bridge.get_backend()
+    with config.compilation_cache_include_metadata_in_key(include_metadata):
+      key1 = cache_key.get(computation1, devices, compile_options, backend)
+      key2 = cache_key.get(computation2, devices, compile_options, backend)
+    self.assertEqual(include_metadata, key1 != key2)
+
+  @jtu.thread_unsafe_test()  # env vars are not thread-safe
   def test_xla_flags(self):
     if jtu.is_device_tpu(version=4):
       raise unittest.SkipTest("TODO(b/240151176)")
@@ -235,6 +344,7 @@ class CacheKeyTest(jtu.JaxTestCase):
         del os.environ["XLA_FLAGS"]
       sys.argv = orig_argv
 
+  @jtu.thread_unsafe_test()  # env vars are not thread-safe
   def test_libtpu_init_args(self):
     if jtu.is_device_tpu(version=4):
       raise unittest.SkipTest("TODO(b/240151176)")

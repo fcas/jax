@@ -30,12 +30,12 @@ import os
 from absl import app
 from absl import flags
 
-from jax.experimental.jax2tf.examples import mnist_lib  # type: ignore
-from jax.experimental.jax2tf.examples import saved_model_lib  # type: ignore
+from jax.experimental.jax2tf.examples import mnist_lib
+from jax.experimental.jax2tf.examples import saved_model_lib
 
 import numpy as np
-import tensorflow as tf  # type: ignore
-import tensorflow_datasets as tfds  # type: ignore
+import tensorflow as tf
+import tensorflow_datasets as tfds  # pyrefly: ignore[missing-import]
 
 _MODEL = flags.DEFINE_enum(
     "model", "mnist_flax", ["mnist_flax", "mnist_pure_jax"],
@@ -84,9 +84,9 @@ _TEST_SAVEDMODEL = flags.DEFINE_boolean(
 def train_and_save():
   logging.info("Loading the MNIST TensorFlow dataset")
   train_ds = mnist_lib.load_mnist(
-      tfds.Split.TRAIN, batch_size=mnist_lib.train_batch_size)
+      tfds.Split("train"), batch_size=mnist_lib.train_batch_size)
   test_ds = mnist_lib.load_mnist(
-      tfds.Split.TEST, batch_size=mnist_lib.test_batch_size)
+      tfds.Split("test"), batch_size=mnist_lib.test_batch_size)
 
   if SHOW_IMAGES.value:
     mnist_lib.plot_images(train_ds, 1, 5, "Training images", inference_fn=None)
@@ -202,6 +202,8 @@ def tf_accelerator_and_tolerances():
     tolerances = dict(atol=1e-6, rtol=1e-4)
   elif tf_accelerator.device_type == "CPU":
     tolerances = dict(atol=1e-5, rtol=1e-5)
+  else:
+    raise RuntimeError(f"Unrecognized {tf_accelerator.device_type=}")
   logging.info("Using tolerances %s", tolerances)
   return tf_accelerator, tolerances
 

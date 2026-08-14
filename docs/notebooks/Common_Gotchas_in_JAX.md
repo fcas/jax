@@ -5,9 +5,9 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.16.1
+    jupytext_version: 1.16.4
 kernelspec:
-  display_name: Python 3
+  display_name: jax-dev
   language: python
   name: python3
 ---
@@ -16,11 +16,11 @@ kernelspec:
 
 # 🔪 JAX - The Sharp Bits 🔪
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/google/jax/blob/main/docs/notebooks/Common_Gotchas_in_JAX.ipynb) [![Open in Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/google/jax/blob/main/docs/notebooks/Common_Gotchas_in_JAX.ipynb)
+<!--* freshness: { reviewed: '2024-06-03' } *-->
+
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jax-ml/jax/blob/main/docs/notebooks/Common_Gotchas_in_JAX.ipynb) [![Open in Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/jax-ml/jax/blob/main/docs/notebooks/Common_Gotchas_in_JAX.ipynb)
 
 +++ {"id": "4k5PVzEo2uJO"}
-
-*levskaya@ mattjj@*
 
 When walking about the countryside of Italy, the people will not hesitate to tell you that __JAX__ has [_"una anima di pura programmazione funzionale"_](https://www.sscardapane.it/iaml-backup/jax-intro/).
 
@@ -31,7 +31,7 @@ JAX works great for many numerical and scientific programs, but __only if they a
 :id: GoK_PCxPeYcy
 
 import numpy as np
-from jax import grad, jit
+from jax import jit
 from jax import lax
 from jax import random
 import jax
@@ -121,14 +121,13 @@ print(jit(pure_uses_internal_state)(5.))
 
 +++ {"id": "cDpQ5u63Ba_H"}
 
-It is not recommended to use iterators in any JAX function you want to `jit` or in any control-flow primitive. The reason is that an iterator is a python object which introduces state to retrieve the next element. Therefore, it is incompatible with JAX functional programming model. In the code below, there are some examples of incorrect attempts to use iterators with JAX. Most of them return an error, but some give unexpected results.
+It is not recommended to use iterators in any JAX function you want to `jit` or in any control-flow primitive. The reason is that an iterator is a python object which introduces state to retrieve the next element. Therefore, it is incompatible with JAX's functional programming model. In the code below, there are some examples of incorrect attempts to use iterators with JAX. Most of them return an error, but some give unexpected results.
 
 ```{code-cell} ipython3
 :id: w99WXa6bBa_H
 :outputId: 52d885fd-0239-4a08-f5ce-0c38cc008903
 
 import jax.numpy as jnp
-import jax.lax as lax
 from jax import make_jaxpr
 
 # lax.fori_loop
@@ -156,7 +155,7 @@ iter_operand = iter(range(10))
 
 +++ {"id": "oBdKtkVW8Lha"}
 
-## 🔪 In-Place Updates
+## 🔪 In-place updates
 
 +++ {"id": "JffAqnEW4JEb"}
 
@@ -178,7 +177,7 @@ print(numpy_array)
 
 +++ {"id": "go3L4x3w4-9p"}
 
-If we try to update a JAX device array in-place, however, we get an __error__!  (☉_☉)
+If we try to do in-place indexed updating on a `jax.Array`, however, we get an __error__!  (☉_☉)
 
 ```{code-cell} ipython3
 :id: iOscaa_GecEK
@@ -198,11 +197,32 @@ jax_array = jnp.zeros((3,3), dtype=jnp.float32)
 jax_array[1, :] = 1.0
 ```
 
+And if we try to do `__iadd__`-style in-place updating, we get __different behavior than NumPy__!  (☉_☉)  (☉_☉)
+
+```{code-cell} ipython3
+jax_array = jnp.array([10, 20])
+jax_array_new = jax_array
+jax_array_new += 10
+print(jax_array_new)  # `jax_array_new` is rebound to a new value [20, 30], but...
+print(jax_array)      # the original value is unmodified as [10, 20] !
+
+numpy_array = np.array([10, 20])
+numpy_array_new = numpy_array
+numpy_array_new += 10
+print(numpy_array_new)  # `numpy_array_new is numpy_array`, and it was updated
+print(numpy_array)      # in-place, so both are [20, 30] !
+```
+
+That's because NumPy defines `__iadd__` to perform in-place mutation. In
+contrast, `jax.Array` doesn't define an `__iadd__`, so Python treats
+`jax_array_new += 10` as syntactic sugar for `jax_array_new = jax_array_new +
+10`, rebinding the variable without mutating any arrays.
+
 +++ {"id": "7mo76sS25Wco"}
 
 Allowing mutation of variables in-place makes program analysis and transformation difficult. JAX requires that programs are pure functions.
 
-Instead, JAX offers a _functional_ array update using the [`.at` property on JAX arrays](https://jax.readthedocs.io/en/latest/_autosummary/jax.numpy.ndarray.at.html#jax.numpy.ndarray.at).
+Instead, JAX offers a _functional_ array update using the [`.at` property on JAX arrays](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.ndarray.at.html#jax.numpy.ndarray.at).
 
 +++ {"id": "hfloZ1QXCS_J"}
 
@@ -220,6 +240,7 @@ For example, the update above can be written as:
 :id: PBGI-HIeCP_s
 :outputId: de13f19a-2066-4df1-d503-764c34585529
 
+jax_array = jnp.zeros((3,3), dtype=jnp.float32)
 updated_array = jax_array.at[1, :].set(1.0)
 print("updated array:\n", updated_array)
 ```
@@ -262,11 +283,194 @@ print(new_jax_array)
 
 +++ {"id": "sTjJ3WuaDyqU"}
 
-For more details on indexed array updates, see the [documentation for the `.at` property](https://jax.readthedocs.io/en/latest/_autosummary/jax.numpy.ndarray.at.html#jax.numpy.ndarray.at).
+For more details on indexed array updates, see the [documentation for the `.at` property](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.ndarray.at.html#jax.numpy.ndarray.at).
+
++++
+
+(jax-jit-class-methods)=
+## 🔪 Using `jax.jit` with class methods
+
+Most examples of [`jax.jit`](https://docs.jax.dev/en/latest/_autosummary/jax.jit.html) concern decorating stand-alone Python functions, but decorating a method within a class introduces some complication. For example, consider the following simple class, where we've used a standard `jax.jit` annotation on a method:
+
+```{code-cell} ipython3
+import jax.numpy as jnp
+from jax import jit
+
+class CustomClass:
+  def __init__(self, x: jnp.ndarray, mul: bool):
+    self.x = x
+    self.mul = mul
+
+  @jit  # <---- How to do this correctly?
+  def calc(self, y):
+    if self.mul:
+      return self.x * y
+    return y
+```
+
+However, this approach will result in an error when you attempt to call this method:
+
+```{code-cell} ipython3
+:tags: [raises-exception]
+
+c = CustomClass(2, True)
+c.calc(3)
+```
+
+The problem is that the first argument to the function is `self`, which has type `CustomClass`, and JAX does not know how to handle this type. There are three basic strategies we might use in this case, and we'll discuss them below.
+
++++
+
+### Strategy 1: JIT-compiled helper function
+
+The most straightforward approach is to create a helper function external to the class that can be JIT-decorated in the normal way. For example:
+
+```{code-cell} ipython3
+class CustomClass:
+  def __init__(self, x: jnp.ndarray, mul: bool):
+    self.x = x
+    self.mul = mul
+
+  def calc(self, y):
+    return _calc(self.mul, self.x, y)
+
+@jit(static_argnums=0)
+def _calc(mul, x, y):
+  if mul:
+    return x * y
+  return y
+```
+
+The result will work as expected:
+
+```{code-cell} ipython3
+c = CustomClass(2, True)
+print(c.calc(3))
+```
+
+The benefit of such an approach is that it is simple, explicit, and it avoids the need to teach JAX how to handle objects of type `CustomClass`. However, you may wish to keep all the method logic in the same place.
+
++++
+
+### Strategy 2: Marking `self` as static
+
+Another common pattern is to use `static_argnums` to mark the `self` argument as static. But this must be done with care to avoid unexpected results. You may be tempted to simply do this:
+
+```{code-cell} ipython3
+class CustomClass:
+  def __init__(self, x: jnp.ndarray, mul: bool):
+    self.x = x
+    self.mul = mul
+
+  # WARNING: this example is broken, as we'll see below. Don't copy & paste!
+  @jit(static_argnums=0)
+  def calc(self, y):
+    if self.mul:
+      return self.x * y
+    return y
+```
+
+If you call the method, it will no longer raise an error:
+
+```{code-cell} ipython3
+c = CustomClass(2, True)
+print(c.calc(3))
+```
+
+However, there is a catch: if you mutate the object after the first method call, the subsequent method call may return an incorrect result:
+
+```{code-cell} ipython3
+c.mul = False
+print(c.calc(3))  # Should print 3
+```
+
+Why is this? When you mark an object as static, it will effectively be used as a dictionary key in JIT's internal compilation cache, meaning its hash (i.e. `hash(obj)`) equality (i.e. `obj1 == obj2`) and object identity (i.e. `obj1 is obj2`) will be assumed to have consistent behavior. The default `__hash__` for a custom object is its object ID, and so JAX has no way of knowing that a mutated object should trigger a re-compilation.
+
+You can partially address this by defining an appropriate `__hash__` and `__eq__` methods for your object; for example:
+
+```{code-cell} ipython3
+class CustomClass:
+  def __init__(self, x: jnp.ndarray, mul: bool):
+    self.x = x
+    self.mul = mul
+
+  @jit(static_argnums=0)
+  def calc(self, y):
+    if self.mul:
+      return self.x * y
+    return y
+
+  def __hash__(self):
+    return hash((self.x, self.mul))
+
+  def __eq__(self, other):
+    return (isinstance(other, CustomClass) and
+            (self.x, self.mul) == (other.x, other.mul))
+```
+
+(see the [`object.__hash__`](https://docs.python.org/3/reference/datamodel.html#object.__hash__) documentation for more discussion of the requirements
+when overriding `__hash__`).
+
+This should work correctly with JIT and other transforms **so long as you never mutate your object**. Mutations of objects used as hash keys lead to several subtle problems, which is why for example mutable Python containers (e.g. [`dict`](https://docs.python.org/3/library/stdtypes.html#dict), [`list`](https://docs.python.org/3/library/stdtypes.html#list)) don't define `__hash__`, while their immutable counterparts (e.g. [`tuple`](https://docs.python.org/3/library/stdtypes.html#tuple)) do.
+
+If your class relies on in-place mutations (such as setting `self.attr = ...` within its methods), then your object is not really "static" and marking it as such may lead to problems. Fortunately, there's another option for this case.
+
++++
+
+### Strategy 3: Making `CustomClass` a PyTree
+
+The most flexible approach to correctly JIT-compiling a class method is to register the type as a custom PyTree object; see [Custom pytree nodes](https://docs.jax.dev/en/latest/custom_pytrees.html#pytrees-custom-pytree-nodes). This lets you specify exactly which components of the class should be treated as static and which should be
+treated as dynamic. Here's how it might look:
+
+```{code-cell} ipython3
+class CustomClass:
+  def __init__(self, x: jnp.ndarray, mul: bool):
+    self.x = x
+    self.mul = mul
+
+  @jit
+  def calc(self, y):
+    if self.mul:
+      return self.x * y
+    return y
+
+  def _tree_flatten(self):
+    children = (self.x,)  # arrays / dynamic values
+    aux_data = {'mul': self.mul}  # static values
+    return (children, aux_data)
+
+  @classmethod
+  def _tree_unflatten(cls, aux_data, children):
+    return cls(*children, **aux_data)
+
+from jax import tree_util
+tree_util.register_pytree_node(CustomClass,
+                               CustomClass._tree_flatten,
+                               CustomClass._tree_unflatten)
+```
+
+This is certainly more involved, but it solves all the issues associated with the simpler approaches used above:
+
+```{code-cell} ipython3
+c = CustomClass(2, True)
+print(c.calc(3))
+```
+
+```{code-cell} ipython3
+c.mul = False  # mutation is detected
+print(c.calc(3))
+```
+
+```{code-cell} ipython3
+c = CustomClass(jnp.array(2), True)  # non-hashable x is supported
+print(c.calc(3))
+```
+
+So long as your `tree_flatten` and `tree_unflatten` functions correctly handle all relevant attributes in the class, you should be able to use objects of this type directly as arguments to JIT-compiled functions, without any special annotations.
 
 +++ {"id": "oZ_jE2WAypdL"}
 
-## 🔪 Out-of-Bounds Indexing
+## 🔪 Out-of-bounds indexing
 
 +++ {"id": "btRFwEVzypdN"}
 
@@ -293,7 +497,7 @@ jnp.arange(10)[11]
 
 +++ {"id": "NAcXJNAcDi_v"}
 
-If you would like finer-grained control over the behavior for out-of-bound indices, you can use the optional parameters of [`ndarray.at`](https://jax.readthedocs.io/en/latest/_autosummary/jax.numpy.ndarray.at.html); for example:
+If you would like finer-grained control over the behavior for out-of-bound indices, you can use the optional parameters of [`ndarray.at`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.ndarray.at.html); for example:
 
 ```{code-cell} ipython3
 :id: -0-MaFddO-xy
@@ -313,7 +517,7 @@ jnp.arange(10.0).at[11].get(mode='fill', fill_value=jnp.nan)
 
 Note that due to this behavior for index retrieval, functions like `jnp.nanargmin` and `jnp.nanargmax` return -1 for slices consisting of NaNs whereas Numpy would throw an error.
 
-Note also that, as the two behaviors described above are not inverses of each other, reverse-mode automatic differentiation (which turns index updates into index retrievals and vice versa) [will not preserve the semantics of out of bounds indexing](https://github.com/google/jax/issues/5760). Thus it may be a good idea to think of out-of-bounds indexing in JAX as a case of [undefined behavior](https://en.wikipedia.org/wiki/Undefined_behavior).
+Note also that, as the two behaviors described above are not inverses of each other, reverse-mode automatic differentiation (which turns index updates into index retrievals and vice versa) [will not preserve the semantics of out of bounds indexing](https://github.com/jax-ml/jax/issues/5760). Thus it may be a good idea to think of out-of-bounds indexing in JAX as a case of [undefined behavior](https://en.wikipedia.org/wiki/Undefined_behavior).
 
 +++ {"id": "LwB07Kx5sgHu"}
 
@@ -383,487 +587,19 @@ jnp.sum(jnp.array(x))
 
 +++ {"id": "MUycRNh6e50W"}
 
-## 🔪 Random Numbers
+## 🔪 Random numbers
 
-+++ {"id": "O8vvaVt3MRG2"}
-
-> _If all scientific papers whose results are in doubt because of bad
-> `rand()`s were to disappear from library shelves, there would be a
-> gap on each shelf about as big as your fist._ - Numerical Recipes
-
-+++ {"id": "Qikt9pPW9L5K"}
-
-### RNGs and State
-You're used to _stateful_ pseudorandom number generators (PRNGs) from numpy and other libraries, which helpfully hide a lot of details under the hood to give you a ready fountain of pseudorandomness:
-
-```{code-cell} ipython3
-:id: rr9FeP41fynt
-:outputId: df0ceb15-96ec-4a78-e327-c77f7ea3a745
-
-print(np.random.random())
-print(np.random.random())
-print(np.random.random())
-```
-
-+++ {"id": "ORMVVGZJgSVi"}
-
-Underneath the hood, numpy uses the [Mersenne Twister](https://en.wikipedia.org/wiki/Mersenne_Twister) PRNG to power its pseudorandom functions.  The PRNG has a period of $2^{19937}-1$ and at any point can be described by __624 32-bit unsigned ints__ and a __position__ indicating how much of this  "entropy" has been used up.
-
-```{code-cell} ipython3
-:id: 7Pyp2ajzfPO2
-
-np.random.seed(0)
-rng_state = np.random.get_state()
-# print(rng_state)
-# --> ('MT19937', array([0, 1, 1812433255, 1900727105, 1208447044,
-#       2481403966, 4042607538,  337614300, ... 614 more numbers...,
-#       3048484911, 1796872496], dtype=uint32), 624, 0, 0.0)
-```
-
-+++ {"id": "aJIxHVXCiM6m"}
-
-This pseudorandom state vector is automagically updated behind the scenes every time a random number is needed, "consuming" 2 of the uint32s in the Mersenne twister state vector:
-
-```{code-cell} ipython3
-:id: GAHaDCYafpAF
-
-_ = np.random.uniform()
-rng_state = np.random.get_state()
-#print(rng_state)
-# --> ('MT19937', array([2443250962, 1093594115, 1878467924,
-#       ..., 2648828502, 1678096082], dtype=uint32), 2, 0, 0.0)
-
-# Let's exhaust the entropy in this PRNG statevector
-for i in range(311):
-  _ = np.random.uniform()
-rng_state = np.random.get_state()
-#print(rng_state)
-# --> ('MT19937', array([2443250962, 1093594115, 1878467924,
-#       ..., 2648828502, 1678096082], dtype=uint32), 624, 0, 0.0)
-
-# Next call iterates the RNG state for a new batch of fake "entropy".
-_ = np.random.uniform()
-rng_state = np.random.get_state()
-# print(rng_state)
-# --> ('MT19937', array([1499117434, 2949980591, 2242547484,
-#      4162027047, 3277342478], dtype=uint32), 2, 0, 0.0)
-```
-
-+++ {"id": "N_mWnleNogps"}
-
-The problem with magic PRNG state is that it's hard to reason about how it's being used and updated across different threads, processes, and devices, and it's _very easy_ to screw up when the details of entropy production and consumption are hidden from the end user.
-
-The Mersenne Twister PRNG is also known to have a [number](https://cs.stackexchange.com/a/53475) of problems, it has a large 2.5kB state size, which leads to problematic [initialization issues](https://dl.acm.org/citation.cfm?id=1276928).  It [fails](http://www.pcg-random.org/pdf/toms-oneill-pcg-family-v1.02.pdf) modern BigCrush tests, and is generally slow.
-
-+++ {"id": "Uvq7nV-j4vKK"}
-
-### JAX PRNG
-
-+++ {"id": "COjzGBpO4tzL"}
-
-JAX instead implements an _explicit_ PRNG where entropy production and consumption are handled by explicitly passing and iterating PRNG state.  JAX uses a modern [Threefry counter-based PRNG](https://github.com/google/jax/blob/main/docs/jep/263-prng.md) that's __splittable__.  That is, its design allows us to __fork__ the PRNG state into new PRNGs for use with parallel stochastic generation.
-
-The random state is described by a special array element that we call a __key__:
-
-```{code-cell} ipython3
-:id: yPHE7KTWgAWs
-:outputId: ae8af0ee-f19e-474e-81b6-45e894eb2fc3
-
-from jax import random
-key = random.key(0)
-key
-```
-
-+++ {"id": "XjYyWYNfq0hW"}
-
-JAX's random functions produce pseudorandom numbers from the PRNG state, but __do not__ change the state!
-
-Reusing the same state will cause __sadness__ and __monotony__, depriving the end user of __lifegiving chaos__:
-
-```{code-cell} ipython3
-:id: 7zUdQMynoE5e
-:outputId: 23a86b72-dfb9-410a-8e68-22b48dc10805
-
-print(random.normal(key, shape=(1,)))
-print(key)
-# No no no!
-print(random.normal(key, shape=(1,)))
-print(key)
-```
-
-+++ {"id": "hQN9van8rJgd"}
-
-Instead, we __split__ the PRNG to get usable __subkeys__ every time we need a new pseudorandom number:
-
-```{code-cell} ipython3
-:id: ASj0_rSzqgGh
-:outputId: 2f13f249-85d1-47bb-d503-823eca6961aa
-
-print("old key", key)
-key, subkey = random.split(key)
-normal_pseudorandom = random.normal(subkey, shape=(1,))
-print("    \---SPLIT --> new key   ", key)
-print("             \--> new subkey", subkey, "--> normal", normal_pseudorandom)
-```
-
-+++ {"id": "tqtFVE4MthO3"}
-
-We propagate the __key__ and make new __subkeys__ whenever we need a new random number:
-
-```{code-cell} ipython3
-:id: jbC34XLor2Ek
-:outputId: 4059a2e2-0205-40bc-ad55-17709d538871
-
-print("old key", key)
-key, subkey = random.split(key)
-normal_pseudorandom = random.normal(subkey, shape=(1,))
-print("    \---SPLIT --> new key   ", key)
-print("             \--> new subkey", subkey, "--> normal", normal_pseudorandom)
-```
-
-+++ {"id": "0KLYUluz3lN3"}
-
-We can generate more than one __subkey__ at a time:
-
-```{code-cell} ipython3
-:id: lEi08PJ4tfkX
-:outputId: 1f280560-155d-4c04-98e8-c41d72ee5b01
-
-key, *subkeys = random.split(key, 4)
-for subkey in subkeys:
-  print(random.normal(subkey, shape=(1,)))
-```
+JAX's pseudo-random number generation differs from Numpy's in important ways. For a quick how-to, see {ref}`key-concepts-prngs`. For more details, see the {ref}`pseudorandom-numbers` tutorial.
 
 +++ {"id": "rg4CpMZ8c3ri"}
 
-## 🔪 Control Flow
+## 🔪 Control flow
 
-+++ {"id": "izLTvT24dAq0"}
-
-### ✔ python control_flow + autodiff ✔
-
-If you just want to apply `grad` to your python functions, you can use regular python control-flow constructs with no problems, as if you were using [Autograd](https://github.com/hips/autograd) (or Pytorch or TF Eager).
-
-```{code-cell} ipython3
-:id: aAx0T3F8lLtu
-:outputId: 383b7bfa-1634-4d23-8497-49cb9452ca52
-
-def f(x):
-  if x < 3:
-    return 3. * x ** 2
-  else:
-    return -4 * x
-
-print(grad(f)(2.))  # ok!
-print(grad(f)(4.))  # ok!
-```
-
-+++ {"id": "hIfPT7WMmZ2H"}
-
-### python control flow + JIT
-
-Using control flow with `jit` is more complicated, and by default it has more constraints.
-
-This works:
-
-```{code-cell} ipython3
-:id: OZ_BJX0CplNC
-:outputId: 60c902a2-eba1-49d7-c8c8-2f68616d660c
-
-@jit
-def f(x):
-  for i in range(3):
-    x = 2 * x
-  return x
-
-print(f(3))
-```
-
-+++ {"id": "22RzeJ4QqAuX"}
-
-So does this:
-
-```{code-cell} ipython3
-:id: pinVnmRWp6w6
-:outputId: 25e06cf2-474f-4782-af7c-4f5514b64422
-
-@jit
-def g(x):
-  y = 0.
-  for i in range(x.shape[0]):
-    y = y + x[i]
-  return y
-
-print(g(jnp.array([1., 2., 3.])))
-```
-
-+++ {"id": "TStltU2dqf8A"}
-
-But this doesn't, at least by default:
-
-```{code-cell} ipython3
-:id: 9z38AIKclRNM
-:outputId: 38dd2075-92fc-4b81-fee0-b9dff8da1fac
-:tags: [raises-exception]
-
-@jit
-def f(x):
-  if x < 3:
-    return 3. * x ** 2
-  else:
-    return -4 * x
-
-# This will fail!
-f(2)
-```
-
-+++ {"id": "pIbr4TVPqtDN"}
-
-__What gives!?__
-
-When we `jit`-compile a function, we usually want to compile a version of the function that works for many different argument values, so that we can cache and reuse the compiled code. That way we don't have to re-compile on each function evaluation.
-
-For example, if we evaluate an `@jit` function on the array `jnp.array([1., 2., 3.], jnp.float32)`, we might want to compile code that we can reuse to evaluate the function on `jnp.array([4., 5., 6.], jnp.float32)` to save on compile time.
-
-To get a view of your Python code that is valid for many different argument values, JAX traces it on _abstract values_ that represent sets of possible inputs. There are [multiple different levels of abstraction](https://github.com/google/jax/blob/main/jax/_src/abstract_arrays.py), and different transformations use different abstraction levels.
-
-By default, `jit` traces your code on the `ShapedArray` abstraction level, where each abstract value represents the set of all array values with a fixed shape and dtype. For example, if we trace using the abstract value `ShapedArray((3,), jnp.float32)`, we get a view of the function that can be reused for any concrete value in the corresponding set of arrays. That means we can save on compile time.
-
-But there's a tradeoff here: if we trace a Python function on a `ShapedArray((), jnp.float32)` that isn't committed to a specific concrete value, when we hit a line like `if x < 3`, the expression `x < 3` evaluates to an abstract `ShapedArray((), jnp.bool_)` that represents the set `{True, False}`. When Python attempts to coerce that to a concrete `True` or `False`, we get an error: we don't know which branch to take, and can't continue tracing! The tradeoff is that with higher levels of abstraction we gain a more general view of the Python code (and thus save on re-compilations), but we require more constraints on the Python code to complete the trace.
-
-The good news is that you can control this tradeoff yourself. By having `jit` trace on more refined abstract values, you can relax the traceability constraints. For example, using the `static_argnums` argument to `jit`, we can specify to trace on concrete values of some arguments. Here's that example function again:
-
-```{code-cell} ipython3
-:id: -Tzp0H7Bt1Sn
-:outputId: f7f664cb-2cd0-4fd7-c685-4ec6ba1c4b7a
-
-def f(x):
-  if x < 3:
-    return 3. * x ** 2
-  else:
-    return -4 * x
-
-f = jit(f, static_argnums=(0,))
-
-print(f(2.))
-```
-
-+++ {"id": "MHm1hIQAvBVs"}
-
-Here's another example, this time involving a loop:
-
-```{code-cell} ipython3
-:id: iwY86_JKvD6b
-:outputId: 48f9b51f-bd32-466f-eac1-cd23444ce937
-
-def f(x, n):
-  y = 0.
-  for i in range(n):
-    y = y + x[i]
-  return y
-
-f = jit(f, static_argnums=(1,))
-
-f(jnp.array([2., 3., 4.]), 2)
-```
-
-+++ {"id": "nSPTOX8DvOeO"}
-
-In effect, the loop gets statically unrolled.  JAX can also trace at _higher_ levels of abstraction, like `Unshaped`, but that's not currently the default for any transformation
-
-+++ {"id": "wWdg8LTYwCW3"}
-
-️⚠️ **functions with argument-__value__ dependent shapes**
-
-These control-flow issues also come up in a more subtle way: numerical functions we want to __jit__ can't specialize the shapes of internal arrays on argument _values_ (specializing on argument __shapes__ is ok).  As a trivial example, let's make a function whose output happens to depend on the input variable `length`.
-
-```{code-cell} ipython3
-:id: Tqe9uLmUI_Gv
-:outputId: 989be121-dfce-4bb3-c78e-a10829c5f883
-
-def example_fun(length, val):
-  return jnp.ones((length,)) * val
-# un-jit'd works fine
-print(example_fun(5, 4))
-```
-
-```{code-cell} ipython3
-:id: fOlR54XRgHpd
-:outputId: cf31d798-a4ce-4069-8e3e-8f9631ff4b71
-:tags: [raises-exception]
-
-bad_example_jit = jit(example_fun)
-# this will fail:
-bad_example_jit(10, 4)
-```
-
-```{code-cell} ipython3
-:id: kH0lOD4GgFyI
-:outputId: d009fcf5-c9f9-4ce6-fc60-22dc2cf21ade
-
-# static_argnums tells JAX to recompile on changes at these argument positions:
-good_example_jit = jit(example_fun, static_argnums=(0,))
-# first compile
-print(good_example_jit(10, 4))
-# recompiles
-print(good_example_jit(5, 4))
-```
-
-+++ {"id": "MStx_r2oKxpp"}
-
-`static_argnums` can be handy if `length` in our example rarely changes, but it would be disastrous if it changed a lot!
-
-Lastly, if your function has global side-effects, JAX's tracer can cause weird things to happen. A common gotcha is trying to print arrays inside __jit__'d functions:
-
-```{code-cell} ipython3
-:id: m2ABpRd8K094
-:outputId: 4f7ebe17-ade4-4e18-bd8c-4b24087c33c3
-
-@jit
-def f(x):
-  print(x)
-  y = 2 * x
-  print(y)
-  return y
-f(2)
-```
-
-+++ {"id": "uCDcWG4MnVn-"}
-
-### Structured control flow primitives
-
-There are more options for control flow in JAX. Say you want to avoid re-compilations but still want to use control flow that's traceable, and that avoids un-rolling large loops. Then you can use these 4 structured control flow primitives:
-
- - `lax.cond`  _differentiable_
- - `lax.while_loop` __fwd-mode-differentiable__
- - `lax.fori_loop` __fwd-mode-differentiable__ in general; __fwd and rev-mode differentiable__ if endpoints are static.
- - `lax.scan` _differentiable_
-
-+++ {"id": "Sd9xrLMXeK3A"}
-
-#### `cond`
-python equivalent:
-
-```python
-def cond(pred, true_fun, false_fun, operand):
-  if pred:
-    return true_fun(operand)
-  else:
-    return false_fun(operand)
-```
-
-```{code-cell} ipython3
-:id: SGxz9JOWeiyH
-:outputId: 942a8d0e-5ff6-4702-c499-b3941f529ca3
-
-from jax import lax
-
-operand = jnp.array([0.])
-lax.cond(True, lambda x: x+1, lambda x: x-1, operand)
-# --> array([1.], dtype=float32)
-lax.cond(False, lambda x: x+1, lambda x: x-1, operand)
-# --> array([-1.], dtype=float32)
-```
-
-+++ {"id": "lIYdn1woOS1n"}
-
-`jax.lax` provides two other functions that allow branching on dynamic predicates:
-
-- [`lax.select`](https://jax.readthedocs.io/en/latest/_autosummary/jax.lax.select.html) is
-  like a batched version of `lax.cond`, with the choices expressed as pre-computed arrays
-  rather than as functions.
-- [`lax.switch`](https://jax.readthedocs.io/en/latest/_autosummary/jax.lax.switch.html) is
-  like `lax.cond`, but allows switching between any number of callable choices.
-
-In addition, `jax.numpy` provides several numpy-style interfaces to these functions:
-
-- [`jnp.where`](https://jax.readthedocs.io/en/latest/_autosummary/jax.numpy.where.html) with
-  three arguments is the numpy-style wrapper of `lax.select`.
-- [`jnp.piecewise`](https://jax.readthedocs.io/en/latest/_autosummary/jax.numpy.piecewise.html)
-  is a numpy-style wrapper of `lax.switch`, but switches on a list of boolean conditions rather than a single scalar index.
-- [`jnp.select`](https://jax.readthedocs.io/en/latest/_autosummary/jax.numpy.select.html) has
-  an API similar to `jnp.piecewise`, but the choices are given as pre-computed arrays rather
-  than as functions. It is implemented in terms of multiple calls to `lax.select`.
-
-+++ {"id": "xkOFAw24eOMg"}
-
-#### `while_loop`
-
-python equivalent:
-```
-def while_loop(cond_fun, body_fun, init_val):
-  val = init_val
-  while cond_fun(val):
-    val = body_fun(val)
-  return val
-```
-
-```{code-cell} ipython3
-:id: jM-D39a-c436
-:outputId: 552fe42f-4d32-4e25-c8c2-b951160a3f4e
-
-init_val = 0
-cond_fun = lambda x: x<10
-body_fun = lambda x: x+1
-lax.while_loop(cond_fun, body_fun, init_val)
-# --> array(10, dtype=int32)
-```
-
-+++ {"id": "apo3n3HAeQY_"}
-
-#### `fori_loop`
-python equivalent:
-```
-def fori_loop(start, stop, body_fun, init_val):
-  val = init_val
-  for i in range(start, stop):
-    val = body_fun(i, val)
-  return val
-```
-
-```{code-cell} ipython3
-:id: dt3tUpOmeR8u
-:outputId: 7819ca7c-1433-4d85-b542-f6159b0e8380
-
-init_val = 0
-start = 0
-stop = 10
-body_fun = lambda i,x: x+i
-lax.fori_loop(start, stop, body_fun, init_val)
-# --> array(45, dtype=int32)
-```
-
-+++ {"id": "SipXS5qiqk8e"}
-
-#### Summary
-
-$$
-\begin{array} {r|rr}
-\hline \
-\textrm{construct}
-& \textrm{jit}
-& \textrm{grad} \\
-\hline \
-\textrm{if} & ❌ & ✔ \\
-\textrm{for} & ✔* & ✔\\
-\textrm{while} & ✔* & ✔\\
-\textrm{lax.cond} & ✔ & ✔\\
-\textrm{lax.while_loop} & ✔ & \textrm{fwd}\\
-\textrm{lax.fori_loop} & ✔ & \textrm{fwd}\\
-\textrm{lax.scan} & ✔ & ✔\\
-\hline
-\end{array}
-$$
-
-<center>
-
-$\ast$ = argument-<b>value</b>-independent loop condition - unrolls the loop
-
-</center>
+Moved to {ref}`control-flow`.
 
 +++ {"id": "OxLsZUyRt_kF"}
 
-## 🔪 Dynamic Shapes
+## 🔪 Dynamic shapes
 
 +++ {"id": "1tKXcAMduDR1"}
 
@@ -928,138 +664,9 @@ Similar tricks can be played in other situations where dynamically-shaped arrays
 
 +++ {"id": "DKTMw6tRZyK2"}
 
-## 🔪 NaNs
+## 🔪 Debugging NaNs and Infs
 
-+++ {"id": "ncS0NI4jZrwy"}
-
-### Debugging NaNs
-
-If you want to trace where NaNs are occurring in your functions or gradients, you can turn on the NaN-checker by:
-
-* setting the `JAX_DEBUG_NANS=True` environment variable;
-
-* adding `jax.config.update("jax_debug_nans", True)` near the top of your main file;
-
-* adding `jax.config.parse_flags_with_absl()` to your main file, then set the option using a command-line flag like `--jax_debug_nans=True`;
-
-This will cause computations to error-out immediately on production of a NaN. Switching this option on adds a nan check to every floating point type value produced by XLA. That means values are pulled back to the host and checked as ndarrays for every primitive operation not under an `@jit`. For code under an `@jit`, the output of every `@jit` function is checked and if a nan is present it will re-run the function in de-optimized op-by-op mode, effectively removing one level of `@jit` at a time.
-
-There could be tricky situations that arise, like nans that only occur under a `@jit` but don't get produced in de-optimized mode. In that case you'll see a warning message print out but your code will continue to execute.
-
-If the nans are being produced in the backward pass of a gradient evaluation, when an exception is raised several frames up in the stack trace you will be in the backward_pass function, which is essentially a simple jaxpr interpreter that walks the sequence of primitive operations in reverse. In the example below, we started an ipython repl with the command line `env JAX_DEBUG_NANS=True ipython`, then ran this:
-
-+++ {"id": "p6ZtDHPbBa_W"}
-
-```
-In [1]: import jax.numpy as jnp
-
-In [2]: jnp.divide(0., 0.)
----------------------------------------------------------------------------
-FloatingPointError                        Traceback (most recent call last)
-<ipython-input-2-f2e2c413b437> in <module>()
-----> 1 jnp.divide(0., 0.)
-
-.../jax/jax/numpy/lax_numpy.pyc in divide(x1, x2)
-    343     return floor_divide(x1, x2)
-    344   else:
---> 345     return true_divide(x1, x2)
-    346
-    347
-
-.../jax/jax/numpy/lax_numpy.pyc in true_divide(x1, x2)
-    332   x1, x2 = _promote_shapes(x1, x2)
-    333   return lax.div(lax.convert_element_type(x1, result_dtype),
---> 334                  lax.convert_element_type(x2, result_dtype))
-    335
-    336
-
-.../jax/jax/lax.pyc in div(x, y)
-    244 def div(x, y):
-    245   r"""Elementwise division: :math:`x \over y`."""
---> 246   return div_p.bind(x, y)
-    247
-    248 def rem(x, y):
-
-... stack trace ...
-
-.../jax/jax/interpreters/xla.pyc in handle_result(device_buffer)
-    103         py_val = device_buffer.to_py()
-    104         if np.any(np.isnan(py_val)):
---> 105           raise FloatingPointError("invalid value")
-    106         else:
-    107           return Array(device_buffer, *result_shape)
-
-FloatingPointError: invalid value
-```
-
-+++ {"id": "_NCnVt_GBa_W"}
-
-The nan generated was caught. By running `%debug`, we can get a post-mortem debugger. This also works with functions under `@jit`, as the example below shows.
-
-+++ {"id": "pf8RF6eiBa_W"}
-
-```
-In [4]: from jax import jit
-
-In [5]: @jit
-   ...: def f(x, y):
-   ...:     a = x * y
-   ...:     b = (x + y) / (x - y)
-   ...:     c = a + 2
-   ...:     return a + b * c
-   ...:
-
-In [6]: x = jnp.array([2., 0.])
-
-In [7]: y = jnp.array([3., 0.])
-
-In [8]: f(x, y)
-Invalid value encountered in the output of a jit function. Calling the de-optimized version.
----------------------------------------------------------------------------
-FloatingPointError                        Traceback (most recent call last)
-<ipython-input-8-811b7ddb3300> in <module>()
-----> 1 f(x, y)
-
- ... stack trace ...
-
-<ipython-input-5-619b39acbaac> in f(x, y)
-      2 def f(x, y):
-      3     a = x * y
-----> 4     b = (x + y) / (x - y)
-      5     c = a + 2
-      6     return a + b * c
-
-.../jax/jax/numpy/lax_numpy.pyc in divide(x1, x2)
-    343     return floor_divide(x1, x2)
-    344   else:
---> 345     return true_divide(x1, x2)
-    346
-    347
-
-.../jax/jax/numpy/lax_numpy.pyc in true_divide(x1, x2)
-    332   x1, x2 = _promote_shapes(x1, x2)
-    333   return lax.div(lax.convert_element_type(x1, result_dtype),
---> 334                  lax.convert_element_type(x2, result_dtype))
-    335
-    336
-
-.../jax/jax/lax.pyc in div(x, y)
-    244 def div(x, y):
-    245   r"""Elementwise division: :math:`x \over y`."""
---> 246   return div_p.bind(x, y)
-    247
-    248 def rem(x, y):
-
- ... stack trace ...
-```
-
-+++ {"id": "6ur2yArDBa_W"}
-
-When this code sees a nan in the output of an `@jit` function, it calls into the de-optimized code, so we still get a clear stack trace. And we can run a post-mortem debugger with `%debug` to inspect all the values to figure out the error.
-
-⚠️ You shouldn't have the NaN-checker on if you're not debugging, as it can introduce lots of device-host round-trips and performance regressions!
-
-⚠️ The NaN-checker doesn't work with `pmap`. To debug nans in `pmap` code, one thing to try is replacing `pmap` with `vmap`.
+Use the `jax_debug_nans` and `jax_debug_infs` flags to find the source of NaN/Inf values in functions and gradients. See {ref}`debugging-flags`.
 
 +++ {"id": "YTktlwTTMgFl"}
 
@@ -1109,14 +716,14 @@ There are a few ways to do this:
 
 Note that #2-#4 work for _any_ of JAX's configuration options.
 
-We can then confirm that `x64` mode is enabled:
+We can then confirm that `x64` mode is enabled, for example:
 
-```{code-cell} ipython3
-:id: HqGbBa9Rr-2g
-:outputId: 5aa72952-08cc-4569-9b51-a10311ae9e81
-
+```python
+import jax
 import jax.numpy as jnp
 from jax import random
+
+jax.config.update("jax_enable_x64", True)
 x = random.uniform(random.key(0), (1000,), dtype=jnp.float64)
 x.dtype # --> dtype('float64')
 ```
@@ -1128,13 +735,13 @@ x.dtype # --> dtype('float64')
 
 +++ {"id": "WAHjmL0E2XwO"}
 
-## 🔪 Miscellaneous Divergences from NumPy
+## 🔪 Miscellaneous divergences from NumPy
 
 While `jax.numpy` makes every attempt to replicate the behavior of numpy's API, there do exist corner cases where the behaviors differ.
 Many such cases are discussed in detail in the sections above; here we list several other known places where the APIs diverge.
 
-- For binary operations, JAX's type promotion rules differ somewhat from those used by NumPy. See [Type Promotion Semantics](https://jax.readthedocs.io/en/latest/type_promotion.html) for more details.
-- When performing unsafe type casts (i.e. casts in which the target dtype cannot represent the input value), JAX's behavior may be backend dependent, and in general may diverge from NumPy's behavior. Numpy allows control over the result in these scenarios via the `casting` argument (see [`np.ndarray.astype`](https://numpy.org/devdocs/reference/generated/numpy.ndarray.astype.html)); JAX does not provide any such configuration, instead directly inheriting the behavior of [XLA:ConvertElementType](https://www.tensorflow.org/xla/operation_semantics#convertelementtype).
+- For binary operations, JAX's type promotion rules differ somewhat from those used by NumPy. See [Type Promotion Semantics](https://docs.jax.dev/en/latest/type_promotion.html) for more details.
+- When performing unsafe type casts (i.e. casts in which the target dtype cannot represent the input value), JAX's behavior may be backend dependent, and in general may diverge from NumPy's behavior. Numpy allows control over the result in these scenarios via the `casting` argument (see [`np.ndarray.astype`](https://numpy.org/devdocs/reference/generated/numpy.ndarray.astype.html)); JAX does not provide any such configuration, instead directly inheriting the behavior of [XLA:ConvertElementType](https://www.openxla.org/xla/operation_semantics#convertelementtype).
 
   Here is an example of an unsafe cast with differing results between NumPy and JAX:
   ```python
@@ -1143,9 +750,27 @@ Many such cases are discussed in detail in the sections above; here we list seve
 
   >>> jnp.arange(254.0, 258.0).astype('uint8')
   Array([254, 255, 255, 255], dtype=uint8)
+
   ```
   This sort of mismatch would typically arise when casting extreme values from floating to integer types or vice versa.
+- When operating on [subnormal](https://en.wikipedia.org/wiki/Subnormal_number)
+  floating point numbers, JAX operations use flush-to-zero semantics on some
+  backends. For example:
+  ```python
+  >>> import jax.numpy as jnp
+  >>> subnormal = jnp.float32(1E-45)
+  >>> subnormal  # subnormals are representable
+  Array(1.e-45, dtype=float32)
+  >>> subnormal + 0  # but are flushed to zero within operations
+  Array(0., dtype=float32)
 
+  ```
+  The detailed operation semantics for subnormal values will generally
+  vary depending on the backend.
+
+## 🔪 Sharp bits covered in tutorials
+- {ref}`control-flow` discusses how to work with the constraints that `jit` imposes on the use of Python control flow and logical operators.
+- {ref}`stateful-computations` gives some advice on how to properly handle state in a JAX program, given that JAX transformations can be applied only to pure functions.
 
 ## Fin.
 

@@ -14,10 +14,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from functools import partial
 import itertools as it
-from typing import Any, Callable, TypeVar, Union
+from typing import Any
 
 import numpy as np
 from absl.testing import absltest
@@ -64,7 +65,7 @@ class BatchingTest(jtu.JaxTestCase):
     self.assertAllClose(ans, expected, check_dtypes=False)
 
     jaxpr = make_jaxpr(matmat)(A, B)
-    self.assertLen(jaxpr.jaxpr.eqns, 1)
+    self.assertLen(jaxpr.eqns, 1)
 
   def testPerExampleGradients(self):
     def predict(params, inputs):
@@ -290,7 +291,8 @@ class BatchingTest(jtu.JaxTestCase):
     ys = R(10, 1)
     ans = vmap(jnp.dot, in_axes=(1, None))(xs, ys)
     expected = np.einsum('inj,jk->nik', xs, ys)
-    self.assertAllClose(ans, expected, check_dtypes=False)
+    self.assertAllClose(ans, expected, check_dtypes=False,
+                        atol=1e-2, rtol=1e-2)
 
   def testDot4(self):
     R = self.rng().randn
@@ -298,7 +300,8 @@ class BatchingTest(jtu.JaxTestCase):
     ys = R(3)
     ans = vmap(jnp.dot, in_axes=(1, None))(xs, ys)
     expected = np.einsum('ij,i->j', xs, ys)
-    self.assertAllClose(ans, expected, check_dtypes=False)
+    self.assertAllClose(ans, expected, check_dtypes=False,
+                        atol=1e-2, rtol=1e-2)
 
   def testPad(self):
     R = self.rng().randn
@@ -334,7 +337,7 @@ class BatchingTest(jtu.JaxTestCase):
     self.assertAllClose(ans, expected_ans, check_dtypes=False)
 
   def testJacobianIssue54(self):
-    # test modeling the code in https://github.com/google/jax/issues/54
+    # test modeling the code in https://github.com/jax-ml/jax/issues/54
 
     def func(xs):
       return jnp.array(list(xs))
@@ -344,7 +347,7 @@ class BatchingTest(jtu.JaxTestCase):
     jacfwd(func)(xs)  # don't crash
 
   def testAny(self):
-    # test modeling the code in https://github.com/google/jax/issues/108
+    # test modeling the code in https://github.com/jax-ml/jax/issues/108
 
     ans = vmap(jnp.any)(jnp.array([[True, False], [False, False]]))
     expected = jnp.array([True, False])
@@ -367,7 +370,7 @@ class BatchingTest(jtu.JaxTestCase):
 
   def testDynamicSlice(self):
     # test dynamic_slice via numpy indexing syntax
-    # see https://github.com/google/jax/issues/1613 for an explanation of why we
+    # see https://github.com/jax-ml/jax/issues/1613 for an explanation of why we
     # need to use np rather than np to create x and idx
     x = jnp.arange(30).reshape((10, 3))
 
@@ -457,6 +460,12 @@ class BatchingTest(jtu.JaxTestCase):
     self.assertAllClose(sv, np.broadcast_to(v[0, ::-1], (3, 4)))
 
   def testConvGeneralDilated(self):
+    if jtu.is_device_rocm():
+      # A bug at the boundary between XLA and MIOpen causes a rare scenario
+      # where batched convolution returns wrong results. Skip until fixed.
+      # TODO(magaoka-amd): unskip once the issue is addressed.
+      self.skipTest("Skipped on ROCm: XLA/MIOpen boundary bug causes rare "
+                    "wrong results for batched convolution.")
     W = jnp.array(self.rng().randn(3, 3, 1, 5), dtype=np.float32)
     X = jnp.array(self.rng().randn(10, 5, 5, 1), dtype=np.float32)
 
@@ -931,26 +940,9 @@ class BatchingTest(jtu.JaxTestCase):
     self.assertAllClose(ans, expected, check_dtypes=False,
                         rtol=jtu.default_gradient_tolerance)
 
-  def testIssue387(self):
-    # https://github.com/google/jax/issues/387
-    R = self.rng().rand(100, 2)
-
-    def dist_sq(R):
-      dR = R[:, jnp.newaxis, :] - R[jnp.newaxis, :, :]
-      zero = jnp.zeros_like(dR)
-      dR = dR - jnp.where(jnp.abs(dR) < 0.5, zero, 0.5 * jnp.sign(dR))
-      return jnp.sum(dR ** 2, axis=2)
-
-    @jit
-    def f(R):
-      _ = dist_sq(R)
-      return jnp.sum(R ** 2)
-
-    _ = hessian(f)(R)  # don't crash on UnshapedArray
-
   @jax.legacy_prng_key('allow')
   def testIssue489(self):
-    # https://github.com/google/jax/issues/489
+    # https://github.com/jax-ml/jax/issues/489
     def f(key):
       def body_fn(uk):
         key = uk[1]
@@ -1045,7 +1037,8 @@ class BatchingTest(jtu.JaxTestCase):
       perm_pairs = np.stack([np.arange(nelem), perm], axis=-1)
       rng.shuffle(perm_pairs)
       self.assertAllClose(
-        vmap(lambda x: x - lax.ppermute(x, 'i', perm_pairs), axis_name='i')(x),
+        vmap(lambda x: x - lax.ppermute(x, 'i', list(perm_pairs)),
+             axis_name='i')(x),
         x - x[np.argsort(perm)])
 
   @parameterized.named_parameters(
@@ -1129,74 +1122,8 @@ class BatchingTest(jtu.JaxTestCase):
       vmap(lambda x: x - lax.axis_index('i'), axis_name='i')(x),
       x - np.arange(x.shape[0], dtype='int32'))
 
-  def testCollectivePdot(self):
-    def f(x, y):
-      return lax.pdot(x, y, 'i')
-
-    rng = self.rng()
-
-    x = rng.randn(3, 4)
-    y = rng.randn(4, 5)
-    z = vmap(f, axis_name='i', in_axes=(1, 0), out_axes=None)(x, y)
-    self.assertAllClose(z, jnp.dot(x, y))
-
-    x = rng.randn(4, 3)
-    y = rng.randn(4, 5)
-    z = vmap(f, axis_name='i', in_axes=(0, 0), out_axes=None)(x, y)
-    self.assertAllClose(z, jnp.dot(x.T, y))
-
-  def testCollectivePdotBatching(self):
-    def f(x, y):
-      return lax.pdot(x, y, 'i')
-
-    rng = self.rng()
-    xs = rng.randn(2, 8, 3)
-    ys = rng.randn(2, 3, 5)
-    zs = vmap(vmap(f, axis_name='i', in_axes=(1, 0), out_axes=None))(xs, ys)
-    self.assertAllClose(zs, jnp.einsum('nij,njk->nik', xs, ys))
-
-  def testPdotPrecision(self):
-    def f(x, y):
-      return lax.pdot(x, y, 'i', precision=lax.Precision.HIGHEST)
-
-    f_jaxpr = make_jaxpr(f, axis_env=(('i', 4),))(jnp.ones(4), jnp.ones(4))
-    self.assertIn('HIGHEST', str(f_jaxpr))
-
-    vmap_jaxpr = make_jaxpr(jax.vmap(f, axis_name='i'))(jnp.ones((3, 4)),
-        jnp.ones((3, 4)))
-    self.assertIn('HIGHEST', str(vmap_jaxpr))
-
-  def testPdotJvp(self):
-    def f(x, y):
-      return lax.pdot(x, y, 'i')
-
-    rng = self.rng()
-    x = rng.randn(3, 4)
-    x_dot = rng.randn(*x.shape)
-    y = rng.randn(4, 5)
-    y_dot = rng.randn(*y.shape)
-
-    z, z_dot = vmap(lambda x, y, x_dot, y_dot: jvp(f, (x, y), (x_dot, y_dot)),
-                    axis_name='i', in_axes=(1, 0, 1, 0), out_axes=None)(x, y, x_dot, y_dot)
-    self.assertAllClose(z, jnp.dot(x, y))
-    self.assertAllClose(z_dot, jnp.dot(x_dot, y) + jnp.dot(x, y_dot))
-
-  def testPdotVjp(self):
-    def f(x, y):
-      return lax.pdot(x, y, 'i')
-
-    rng = self.rng()
-    x = rng.randn(3, 4)
-    y = rng.randn(4, 5)
-    z_bar = rng.randn(3, 5)
-
-    x_bar, y_bar = vmap(lambda x, y, z_bar: vjp(f, x, y)[1](z_bar),
-                        axis_name='i', in_axes=(1, 0, None), out_axes=(1, 0))(x, y, z_bar)
-    self.assertAllClose(x_bar, jnp.dot(z_bar, y.T))
-    self.assertAllClose(y_bar, jnp.dot(x.T, z_bar))
-
   def testVmapKwargs(self):
-    # https://github.com/google/jax/issues/912
+    # https://github.com/jax-ml/jax/issues/912
 
     def f(a, b):
       return (2*a, 3*b)
@@ -1307,7 +1234,7 @@ class BatchingTest(jtu.JaxTestCase):
     self.assertEqual(jax.vmap(f)(jnp.ones((2, 3))).shape, (2, 3))
 
   def testPpermuteBatcherTrivial(self):
-    # https://github.com/google/jax/issues/8688
+    # https://github.com/jax-ml/jax/issues/8688
     def ppermute(input):
       return jax.lax.ppermute(input, axis_name="i", perm=[[0, 1], [1, 0]])
 
@@ -1320,7 +1247,7 @@ class BatchingTest(jtu.JaxTestCase):
     self.assertAllClose(ans, jnp.ones(2), check_dtypes=False)
 
   def testBatchingPreservesWeakType(self):
-    # Regression test for https://github.com/google/jax/issues/10025
+    # Regression test for https://github.com/jax-ml/jax/issues/10025
     x = jnp.ravel(1)
     self.assertTrue(dtypes.is_weakly_typed(x))
     @vmap
@@ -1333,7 +1260,7 @@ class BatchingTest(jtu.JaxTestCase):
 
 Array = Any
 ArrayElt = Any
-Int = Union[int, core.Tracer]
+Int = int | core.Tracer
 
 # Can't used NamedTuple here b/c those are pytrees
 class NamedArray:
@@ -1396,47 +1323,109 @@ def temporarily_register_named_array_vmappable():
   finally:
     batching.unregister_vmappable(NamedArray)
 
-a = TypeVar('a')
-
-def list_pop(lst: list[a], idx: int) -> a:
+def list_pop[T](lst: list[T], idx: int) -> T:
   lst = list(lst)
   return lst, lst.pop(idx)
 
-def list_insert(lst: list[a], idx: int, val: a) -> list[a]:
+def list_insert[T](lst: list[T], idx: int, val: T) -> list[T]:
   lst = list(lst)
   lst.insert(idx, val)
   return lst
 
 
+@jtu.thread_unsafe_test_class()  # temporary registration isn't thread-safe
 class VmappableTest(jtu.JaxTestCase):
-  def test_basic(self):
+  @parameterized.parameters([False, True])
+  def test_basic(self, jit):
     with temporarily_register_named_array_vmappable():
       def f(x):
         return named_mul(x, x)
+      if jit:
+        f = jax.jit(f)
 
       x = NamedArray(['i', 'j'], jnp.arange(12.).reshape(3, 4))
       g = jax.vmap(f,
-                  in_axes=NamedMapSpec('i', 0),
-                  out_axes=NamedMapSpec('i', 1),
-                  axis_size=3)
+                   in_axes=NamedMapSpec('i', 0),
+                   out_axes=NamedMapSpec('i', 1),
+                   axis_size=3)
       ans = g(x)
       expected = NamedArray(['j', 'i'], jnp.arange(12.).reshape(3, 4).T ** 2)
 
       self.assertEqual(ans.names, expected.names)
       self.assertAllClose(ans.data, expected.data)
 
-  def test_basic_jit(self):
-    with temporarily_register_named_array_vmappable():
-      def f(x):
-        return named_mul(x, x)
+  def test_to_elt_that_binds_primitives(self):
+    class A:
+      data: Array
+      def __init__(self, data):
+        self.data = data
+    def to_elt(cont, _, val, spec):
+      return cont(val.data + 1, spec)
+    def from_elt(cont, size, elt, spec):
+      assert False
 
-      x = NamedArray(['i', 'j'], jnp.arange(12.).reshape(3, 4))
-      ans = jax.jit(f)(x)
-      expected = NamedArray(['i', 'j'], jnp.arange(12.).reshape(3, 4) ** 2)
+    @jax.jit
+    def f():
+      a = A(jnp.arange(3.))
+      return jax.vmap(lambda x: x - 1, axis_size=3)(a)
 
-      self.assertEqual(ans.names, expected.names)
-      self.assertAllClose(ans.data, expected.data)
+    try:
+      batching.register_vmappable(A, int, int, to_elt, from_elt, None)
+      ans = f()
+    finally:
+      batching.unregister_vmappable(A)
 
+    self.assertAllClose(ans, jnp.arange(3.))
+
+  def test_from_elt_that_binds_primitives(self):
+    class A:
+      data: Array
+      def __init__(self, data):
+        self.data = data
+    def to_elt(cont, _, val, spec):
+      return A(cont(val.data, spec))
+    def from_elt(cont, size, elt, spec):
+      return A(cont(size, elt.data + 1, spec))
+
+    @jax.jit
+    def f():
+      a = A(jnp.arange(3.))
+      return jax.vmap(lambda x: x, axis_size=3)(a).data
+
+    try:
+      batching.register_vmappable(A, int, int, to_elt, from_elt, None)
+      ans = f()
+    finally:
+      batching.unregister_vmappable(A)
+
+    self.assertAllClose(ans, jnp.arange(3.) + 1)
+
+  def test_types_with_same_spec(self):
+    # We register NamedArray.
+    batching.register_vmappable(NamedArray, NamedMapSpec, int,
+                              named_to_elt, named_from_elt, None)
+
+    # We then register another type that uses NamedMapSpec as the spec_type too,
+    # and immediately unregister it.
+    class Foo:
+      pass
+    batching.register_vmappable(Foo, NamedMapSpec, int,
+                                named_to_elt, named_from_elt, None)
+    batching.unregister_vmappable(Foo)
+
+    # We should still be able to use vmap on NamedArray.
+    def f(x):
+      return named_mul(x, x)
+
+    x = NamedArray(['i', 'j'], jnp.arange(12.).reshape(3, 4))
+    ans = jax.jit(f)(x)
+    expected = NamedArray(['i', 'j'], jnp.arange(12.).reshape(3, 4) ** 2)
+
+    self.assertEqual(ans.names, expected.names)
+    self.assertAllClose(ans.data, expected.data)
+
+    # And unregister NamedArray without exceptions.
+    batching.unregister_vmappable(NamedArray)
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

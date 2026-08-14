@@ -12,16 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import cast
-
 import numpy as np
 
-from jax import lax
-import jax.numpy as jnp
+from jax._src import lax
+from jax._src import numpy as jnp
 from jax._src.lax.lax import _const as _lax_const
 from jax._src.numpy.util import promote_args_inexact
+from jax._src.scipy import special
 from jax._src.typing import Array, ArrayLike
-from jax.scipy import special
 
 
 def logpdf(x: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
@@ -157,8 +155,7 @@ def logcdf(x: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
     - :func:`jax.scipy.stats.norm.ppf`
   """
   x, loc, scale = promote_args_inexact("norm.logcdf", x, loc, scale)
-  # Cast required because custom_jvp return type is broken.
-  return cast(Array, special.log_ndtr(lax.div(lax.sub(x, loc), scale)))
+  return special.log_ndtr(lax.div(lax.sub(x, loc), scale))
 
 
 def ppf(q: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
@@ -175,7 +172,7 @@ def ppf(q: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
     scale: arraylike, distribution scale parameter
 
   Returns:
-    array of ppdf values.
+    array of ppf values.
 
   See Also:
     - :func:`jax.scipy.stats.norm.cdf`
@@ -268,7 +265,7 @@ def isf(q: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
   :func:`jax.scipy.stats.norm.sf`.
 
   Args:
-    x: arraylike, value at which to evaluate the ISF
+    q: arraylike, value at which to evaluate the ISF
     loc: arraylike, distribution offset parameter
     scale: arraylike, distribution scale parameter
 

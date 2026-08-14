@@ -26,12 +26,11 @@ currently saved file with the saved one.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import contextlib
 import dataclasses
 import os
 import re
-from typing import Callable, Optional
 import zlib
 
 from absl import app
@@ -40,8 +39,8 @@ from absl import logging
 import numpy.random as npr
 
 import jax # Must import before TF
-from jax.experimental import jax2tf  # Defines needed flags
-from jax._src import test_util  # Defines needed flags
+from jax.experimental import jax2tf  # Defines needed flags  # noqa: F401
+from jax._src import test_util  # Defines needed flags  # noqa: F401
 
 jax.config.parse_flags_with_absl()
 
@@ -149,7 +148,7 @@ def write_and_check_harness(harness: primitive_harness.Harness,
         from jax.experimental.jax2tf.jax2tf import cross_platform_lowering
         lowered = cross_platform_lowering(func_jax, args,
                                           platforms=[for_platform])
-      hlo = lowered.compiler_ir(dialect="stablehlo")  # type: ignore
+      hlo = lowered.compiler_ir(dialect="stablehlo")
       with open(output_file, "w") as f:
         f.write(str(hlo))
 

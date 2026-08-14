@@ -9,7 +9,7 @@ are typically defined as transformations on :mod:`jax.lax` primitives.
 
 Many of the primitives are thin wrappers around equivalent XLA operations,
 described by the `XLA operation semantics
-<https://www.tensorflow.org/xla/operation_semantics>`_ documentation. In a few
+<https://www.openxla.org/xla/operation_semantics>`_ documentation. In a few
 cases JAX diverges from XLA, usually to ensure that the set of operations is
 closed under the operation of JVP and transpose rules.
 
@@ -49,6 +49,7 @@ Operators
     population_count
     broadcast
     broadcast_in_dim
+    broadcast_like
     broadcast_shapes
     broadcast_to_rank
     broadcasted_iota
@@ -58,6 +59,7 @@ Operators
     clz
     collapse
     complex
+    composite
     concatenate
     conj
     conv
@@ -85,11 +87,13 @@ Operators
     dynamic_update_index_in_dim
     dynamic_update_slice
     dynamic_update_slice_in_dim
+    empty
     eq
     erf
     erfc
     erf_inv
     exp
+    exp2
     expand_dims
     expm1
     fft
@@ -100,6 +104,7 @@ Operators
     ge
     gt
     igamma
+    igamma_grad_a
     igammac
     imag
     index_in_dim
@@ -116,19 +121,32 @@ Operators
     max
     min
     mul
+    mulhi
     ne
     neg
     nextafter
+    optimization_barrier
     pad
+    platform_dependent
     polygamma
     population_count
     pow
     random_gamma_grad
+    ragged_all_to_all
+    ragged_dot
+    ragged_dot_general
     real
     reciprocal
     reduce
+    reduce_and
+    reduce_max
+    reduce_min
+    reduce_or
     reduce_precision
+    reduce_prod
+    reduce_sum
     reduce_window
+    reduce_xor
     rem
     reshape
     rev
@@ -136,12 +154,14 @@ Operators
     rng_uniform
     round
     rsqrt
+    scaled_dot
     scatter
     scatter_add
     scatter_apply
     scatter_max
     scatter_min
     scatter_mul
+    scatter_sub
     shift_left
     shift_right_arithmetic
     shift_right_logical
@@ -152,15 +172,19 @@ Operators
     slice_in_dim
     sort
     sort_key_val
+    split
     sqrt
     square
     squeeze
+    stack
+    stage
     sub
     tan
     tanh
+    tile
     top_k
     transpose
-    zeros_like_array
+    unstack
     zeta
 
 .. _lax-control-flow:
@@ -201,7 +225,6 @@ Parallel operators
 
     all_gather
     all_to_all
-    pdot
     psum
     psum_scatter
     pmax
@@ -211,6 +234,10 @@ Parallel operators
     pshuffle
     pswapaxes
     axis_index
+    axis_size
+    psend
+    precv
+    pbroadcast
 
 Sharding-related operators
 --------------------------
@@ -228,29 +255,60 @@ Linear algebra operators (jax.lax.linalg)
   :toctree: _autosummary
 
     cholesky
+    cholesky_update
     eig
     eigh
     hessenberg
-    lu
     householder_product
+    lu
+    lu_pivots_to_permutation
+    ormqr
     qdwh
     qr
     schur
     svd
+    SvdAlgorithm
+    symmetric_product
     triangular_solve
     tridiagonal
     tridiagonal_solve
+
+.. autoclass:: EigImplementation
+   :members:
+   :undoc-members:
+.. autoclass:: EighImplementation
+   :members:
+   :undoc-members:
+
 
 Argument classes
 ----------------
 
 .. currentmodule:: jax.lax
 
+.. autoclass:: AccuracyMode
+   :members:
+   :undoc-members:
 .. autoclass:: ConvDimensionNumbers
 .. autoclass:: ConvGeneralDilatedDimensionNumbers
+.. autoclass:: DotAlgorithm
+.. autoclass:: DotAlgorithmPreset
+   :members:
+   :undoc-members:
+   :member-order: bysource
+.. autoclass:: DotDimensionNumbers
+.. autoclass:: FftType
+  :members:
 .. autoclass:: GatherDimensionNumbers
 .. autoclass:: GatherScatterMode
 .. autoclass:: Precision
 .. autoclass:: PrecisionLike
+.. autoclass:: RaggedDotDimensionNumbers
+.. autoclass:: RandomAlgorithm
+  :members:
+  :member-order: bysource
 .. autoclass:: RoundingMethod
+  :members:
+  :member-order: bysource
 .. autoclass:: ScatterDimensionNumbers
+.. autoclass:: Tolerance

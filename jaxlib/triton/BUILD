@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("//jaxlib:jax.bzl", "if_windows", "pytype_strict_library")
 load("@llvm-project//mlir:tblgen.bzl", "gentbl_filegroup")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("//jaxlib:jax.bzl", "if_windows", "pytype_strict_library")
 
 licenses(["notice"])
 
 package(
     default_applicable_licenses = [],
-    default_visibility = ["//:__subpackages__"],
+    default_visibility = ["//jax:internal"],
 )
 
 pytype_strict_library(
@@ -29,13 +30,16 @@ pytype_strict_library(
         "dialect.py",
         ":_triton_gen",
     ],
+    type_checking = "pyrefly",
     visibility = ["//visibility:public"],
     deps = [
         "//jaxlib/mlir:core",
         "//jaxlib/mlir:ir",
     ] + if_windows(
         [],
-        ["//jaxlib/mlir/_mlir_libs:_triton_ext"],
+        [
+            "//jaxlib/mlir/_mlir_libs:_triton_ext",
+        ],
     ),
 )
 
@@ -54,10 +58,10 @@ genrule(
     for src in $(SRCS); do
       base=$$(basename $$src)
       out=$(RULEDIR)/$${base//_raw/}
-      echo '# pytype: skip-file' > $${out} && \
+      echo '# pyrefly: ignore-errors' > $${out} && \
           cat $${src} |
-          sed -e 's/^from \\.\\./from jaxlib.mlir\\./g' |
-          sed -e 's/^from \\./from jaxlib.mlir\\.dialects\\./g' >> $${out}
+          sed -e 's/^from \\.\\./from jaxlib\\.mlir\\./g' |
+          sed -e 's/^from \\./from jaxlib\\.mlir\\.dialects\\./g' >> $${out}
     done
     """,
 )
@@ -116,7 +120,7 @@ cc_library(
     hdrs = ["triton_dialect_capi.h"],
     deps = [
         "@llvm-project//llvm:Support",
-        "@llvm-project//mlir:CAPIIR",
+        "@llvm-project//mlir:CAPIIRObjects",
         "@llvm-project//mlir:IR",
         "@triton//:TritonDialects",
     ],

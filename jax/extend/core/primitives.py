@@ -13,7 +13,12 @@
 # limitations under the License.
 
 # Note: import <name> as <name> is required for names to be exported.
-# See PEP 484 & https://github.com/google/jax/issues/7570
+# See PEP 484 & https://github.com/jax-ml/jax/issues/7570
+
+from jax._src.ad_checkpoint import (
+  name_p as name_p,
+  remat_p as remat_p,
+)
 
 from jax._src.ad_util import stop_gradient_p as stop_gradient_p
 
@@ -22,11 +27,15 @@ from jax._src.core import (
   closed_call_p as closed_call_p
 )
 
+from jax._src.lax.eval_jaxpr import (
+  create_call_primitive as create_call_primitive,
+  eval_jaxpr_transpose as eval_jaxpr_transpose,
+  register_call_primitive_rules as register_call_primitive_rules,
+)
+
 from jax._src.custom_derivatives import (
   custom_jvp_call_p as custom_jvp_call_p,
-  custom_jvp_call_jaxpr_p as custom_jvp_call_jaxpr_p,
   custom_vjp_call_p as custom_vjp_call_p,
-  custom_vjp_call_jaxpr_p as custom_vjp_call_jaxpr_p,
 )
 
 from jax._src.dispatch import device_put_p as device_put_p
@@ -34,10 +43,7 @@ from jax._src.dispatch import device_put_p as device_put_p
 from jax._src.interpreters.ad import (
   add_jaxvals_p as add_jaxvals_p,
   custom_lin_p as custom_lin_p,
-  zeros_like_p as zeros_like_p,
 )
-
-from jax._src.interpreters.pxla import xla_pmap_p as xla_pmap_p
 
 from jax._src.lax.lax import (
   abs_p as abs_p,
@@ -78,7 +84,6 @@ from jax._src.lax.lax import (
   ge_p as ge_p,
   gt_p as gt_p,
   imag_p as imag_p,
-  infeed_p as infeed_p,
   integer_pow_p as integer_pow_p,
   iota_p as iota_p,
   is_finite_p as is_finite_p,
@@ -97,7 +102,6 @@ from jax._src.lax.lax import (
   nextafter_p as nextafter_p,
   not_p as not_p,
   or_p as or_p,
-  outfeed_p as outfeed_p,
   pad_p as pad_p,
   population_count_p as population_count_p,
   pow_p as pow_p,
@@ -127,6 +131,7 @@ from jax._src.lax.lax import (
   sinh_p as sinh_p,
   sort_p as sort_p,
   sqrt_p as sqrt_p,
+  square_p as square_p,
   squeeze_p as squeeze_p,
   sub_p as sub_p,
   tan_p as tan_p,
@@ -134,6 +139,7 @@ from jax._src.lax.lax import (
   top_k_p as top_k_p,
   transpose_p as transpose_p,
   xor_p as xor_p,
+  empty2_p as empty2_p,
 )
 
 from jax._src.lax.special import (
@@ -148,7 +154,6 @@ from jax._src.lax.special import (
   igamma_p as igamma_p,
   lgamma_p as lgamma_p,
   polygamma_p as polygamma_p,
-  random_gamma_grad_p as random_gamma_grad_p,
   regularized_incomplete_beta_p as regularized_incomplete_beta_p,
   zeta_p as zeta_p,
 )
@@ -203,6 +208,7 @@ from jax._src.lax.parallel import (
   pmin_p as pmin_p,
   ppermute_p as ppermute_p,
   psum_p as psum_p,
+  ragged_all_to_all_p as ragged_all_to_all_p,
 )
 
 from jax._src.lax.ann import (
@@ -224,6 +230,24 @@ from jax._src.lax.linalg import (
   schur_p as schur_p,
 )
 
-from jax._src.pjit import sharding_constraint_p as sharding_constraint_p
-from jax._src.prng import threefry2x32_p as threefry2x32_p
-from jax._src.random import random_gamma_p as random_gamma_p
+from jax._src.pjit import (
+    jit_p as jit_p,
+    sharding_constraint_p as sharding_constraint_p,
+)
+
+from jax._src.random.prng import (
+  random_bits_p as random_bits_p,
+  random_fold_in_p as random_fold_in_p,
+  random_seed_p as random_seed_p,
+  random_split_p as random_split_p,
+)
+from jax._src.random.threefry2x32 import (
+  threefry2x32_p as threefry2x32_p,
+)
+
+from jax._src.random.core import random_gamma_p as random_gamma_p
+
+from jax._src.state.primitives import (
+  get_p as get_p,
+  swap_p as swap_p,
+)

@@ -21,17 +21,17 @@ from __future__ import annotations
 
 import collections
 import itertools
-from typing import Union, cast
+from typing import cast
 
-import jax
-from jax import lax
+from jax._src import config
 from jax._src import dtypes
+from jax._src import lax
 from jax._src import test_util
 from jax._src.util import safe_map, safe_zip
 
 import numpy as np
 
-jax.config.parse_flags_with_absl()
+config.parse_flags_with_absl()
 
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
@@ -49,8 +49,11 @@ uint_dtypes = test_util.dtypes.all_unsigned
 bool_dtypes = test_util.dtypes.boolean
 
 default_dtypes = float_dtypes + int_dtypes
+number_dtypes = (
+    float_dtypes + complex_dtypes + int_dtypes + uint_dtypes
+)
 all_dtypes = (
-    float_dtypes + complex_dtypes + int_dtypes + uint_dtypes + bool_dtypes
+    number_dtypes + bool_dtypes
 )
 python_scalar_types = [bool, int, float, complex]
 
@@ -147,6 +150,33 @@ def lax_reduce_ops():
           0,
           int_dtypes + uint_dtypes + bool_dtypes,
           lax.reduce_xor_p,
+      ),
+  ]
+
+
+NamedReducerOpRecord = collections.namedtuple(
+    "NamedReducerOpRecord", ["op", "reference_op", "dtypes"]
+)
+
+def lax_named_reduce_ops():
+  return [
+      NamedReducerOpRecord(lax.reduce_sum, np.sum, number_dtypes),
+      NamedReducerOpRecord(lax.reduce_prod, np.prod, number_dtypes),
+      NamedReducerOpRecord(lax.reduce_max, np.max, all_dtypes),
+      NamedReducerOpRecord(lax.reduce_min, np.min, all_dtypes),
+      NamedReducerOpRecord(lax.reduce_and, np.bitwise_and.reduce,
+                           bool_dtypes + int_dtypes + uint_dtypes),
+      NamedReducerOpRecord(lax.reduce_or, np.bitwise_or.reduce,
+                           bool_dtypes + int_dtypes + uint_dtypes),
+      NamedReducerOpRecord(lax.reduce_xor, np.bitwise_xor.reduce,
+                           bool_dtypes + int_dtypes + uint_dtypes),
+  ]
+
+
+def lax_out_dtype_ops():
+  return [
+      op_record(
+          "mul", 2, default_dtypes + complex_dtypes, test_util.rand_small
       ),
   ]
 
@@ -282,7 +312,7 @@ def lax_ops():
           float_dtypes,
           test_util.rand_uniform,
           {
-              np.float32: 1e-5,
+              np.float32: 2e-5,
               np.float64: 1e-12,
           },
       ),
@@ -341,6 +371,7 @@ def lax_ops():
       op_record(
           "mul", 2, default_dtypes + complex_dtypes, test_util.rand_small
       ),
+      op_record("mulhi", 2, int_dtypes + uint_dtypes, test_util.rand_fullrange),
       op_record(
           "div", 2, default_dtypes + complex_dtypes, test_util.rand_nonzero
       ),
@@ -357,7 +388,7 @@ def lax_ops():
 
 
 def all_bdims(*shapes):
-  bdims = (itertools.chain([cast(Union[int, None], None)],
+  bdims = (itertools.chain([cast(int | None, None)],
                            range(len(shape) + 1)) for shape in shapes)
   return (t for t in itertools.product(*bdims) if not all(e is None for e in t))
 

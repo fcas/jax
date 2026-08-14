@@ -1,0 +1,97 @@
+# Used for ROCm build and test
+
+common:rocm --define=using_rocm=true --define=using_rocm_hipcc=true
+common:rocm --repo_env=TF_NEED_ROCM=1
+common:rocm --@local_config_rocm//rocm:rocm_path_type=hermetic
+
+# Build with hipcc for ROCm and clang for the host.
+common:rocm --action_env=TF_HIPCC_CLANG="1"
+common:rocm --action_env=TF_ROCM_CLANG="1"
+common:rocm --action_env=HIPCC_COMPILE_FLAGS_APPEND=--offload-compress
+common:rocm --copt=-Wno-gnu-offsetof-extensions
+common:rocm --copt=-Qunused-arguments
+common:rocm --repo_env=TF_ROCM_AMDGPU_TARGETS="gfx900,gfx906,gfx908,gfx90a,gfx942,gfx950,gfx1010,gfx1011,gfx1012,gfx1030,gfx1031,gfx1032,gfx1033,gfx1034,gfx1035,gfx1036,gfx1100,gfx1101,gfx1102,gfx1103,gfx1150,gfx1151,gfx1152,gfx1153,gfx1200,gfx1201"
+# Used for @xla//build_tools/rocm:parallel_gpu_execute
+common:rocm --legacy_external_runfiles=true
+
+common:rocm_clang_local --config=rocm
+common:rocm_clang_local --noincompatible_enable_cc_toolchain_resolution
+common:rocm_clang_local --@rules_ml_toolchain//common:enable_hermetic_cc=False
+common:rocm_clang_local --repo_env USE_HERMETIC_CC_TOOLCHAIN=0
+common:rocm_clang_local --crosstool_top=@local_config_rocm//crosstool:toolchain
+common:rocm_clang_local --action_env=CLANG_COMPILER_PATH="/usr/lib/llvm-18/bin/clang" 
+
+# ROCm with hermetic toolchain from rules_ml_toolchain
+common:rocm_clang_hermetic --config=rocm
+common:rocm_clang_hermetic --@rules_ml_toolchain//common:enable_rocm=True
+common:rocm_clang_hermetic --@rules_ml_toolchain//common:enable_cuda=False
+common:rocm_clang_hermetic --@rules_ml_toolchain//common:enable_sycl=False
+common:rocm_clang_hermetic --@rules_ml_toolchain//common:enable_hermetic_cc=True
+common:rocm_clang_hermetic --strategy=CppLink=local
+
+# ROCm with hermetic clang but local (system) sysroot
+# Use this when ROCm libraries are built against system libstdc++ to avoid ABI mismatches
+common:rocm_clang_hermetic_local_sysroot --config=rocm_clang_hermetic
+common:rocm_clang_hermetic_local_sysroot --@rules_ml_toolchain//cc/sysroots:use_local_sysroot=True
+
+build:rocm_release_wheel --config=rocm_clang_hermetic
+build:rocm_release_wheel --@local_config_rocm//rocm:rocm_path_type=link_only
+
+test:rocm --test_timeout=920,2400,7200,9600
+test:rocm --flaky_test_attempts=3
+test:rocm --test_verbose_timeout_warnings
+test:rocm --run_under=@xla//build_tools/rocm:parallel_gpu_execute
+
+# Configs for ROCm RBE tests
+build:single_gpu --repo_env=TF_ROCM_RBE_POOL="linux_x64_gpu"
+build:single_gpu --repo_env=TF_ROCM_RBE_SINGLE_GPU_POOL="linux_x64_gpu"
+build:single_gpu --repo_env=TF_ROCM_RBE_MULTI_GPU_POOL="linux_x64_gpu"
+
+build:multi_gpu --repo_env=TF_ROCM_RBE_POOL="linux_x64_multigpu"
+build:multi_gpu --repo_env=TF_ROCM_RBE_SINGLE_GPU_POOL="linux_x64_multigpu"
+build:multi_gpu --repo_env=TF_ROCM_RBE_MULTI_GPU_POOL="linux_x64_multigpu"
+
+build:rocm_rbe --tls_client_certificate="/data/ci-cert.crt"
+build:rocm_rbe --tls_client_key="/data/ci-cert.key"
+
+build:rocm_rbe --test_sharding_strategy=disabled
+build:rocm_rbe --bes_backend="grpcs://wardite.cluster.engflow.com"
+build:rocm_rbe --bes_results_url="https://wardite.cluster.engflow.com/invocation/"
+build:rocm_rbe --remote_executor="grpcs://wardite.cluster.engflow.com"
+build:rocm_rbe --remote_cache="grpcs://wardite.cluster.engflow.com"
+build:rocm_rbe --host_platform="@local_config_rocm//rocm:linux_x64"
+build:rocm_rbe --extra_execution_platforms="@local_config_rocm//rocm:linux_x64"
+build:rocm_rbe --platforms="@local_config_rocm//rocm:linux_x64"
+build:rocm_rbe --bes_timeout=600s
+build:rocm_rbe --spawn_strategy=local
+build:rocm_rbe --grpc_keepalive_time=30s
+build:rocm_rbe --repo_env=REMOTE_GPU_TESTING=1
+build:rocm_rbe --remote_download_outputs=minimal
+
+test:rocm_rbe --remote_timeout=3600
+test:rocm_rbe --jobs=32
+test:rocm_rbe --strategy=TestRunner=remote,local
+test:rocm_rbe --worker_sandboxing=true
+test:rocm_rbe --repo_env=REMOTE_GPU_TESTING=1
+
+# Dynamic execution config for ROCm RBE - builds locally, tests use hybrid mode
+common:rocm_rbe_dynamic --config=rocm_rbe
+# Keep builds local (inherit from rocm_rbe)
+build:rocm_rbe_dynamic --spawn_strategy=local
+# Enable dynamic execution for tests only
+test:rocm_rbe_dynamic --experimental_spawn_scheduler
+test:rocm_rbe_dynamic --strategy=TestRunner=dynamic
+test:rocm_rbe_dynamic --dynamic_mode=default
+# Configure local and remote strategies for dynamic test execution
+test:rocm_rbe_dynamic --dynamic_local_strategy=worker,standalone,local
+test:rocm_rbe_dynamic --dynamic_remote_strategy=remote
+# Delay before starting local test execution (ms) - adjust to prefer remote or local
+# Lower values = more local execution, higher values = more remote execution
+test:rocm_rbe_dynamic --experimental_local_execution_delay=1000
+# Maximum number of test jobs to run locally in parallel (50% of available CPUs)
+test:rocm_rbe_dynamic --local_resources=cpu=HOST_CPUS*0.5
+
+# Used for rules_python bootstrap 1.8.0+
+build --@rules_python//python/config_settings:bootstrap_impl=script --repo_env=RULES_PYTHON_ENABLE_PIPSTAR=0
+test --@rules_python//python/config_settings:bootstrap_impl=script --repo_env=RULES_PYTHON_ENABLE_PIPSTAR=0
+

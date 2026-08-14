@@ -8,7 +8,7 @@ jax.scipy.cluster
 
 .. autosummary::
    :toctree: _autosummary
-   
+
    vq
 
 jax.scipy.fft
@@ -57,23 +57,38 @@ jax.scipy.linalg
    cho_factor
    cho_solve
    cholesky
+   circulant
+   companion
+   convolution_matrix
    det
+   dft
    eigh
    eigh_tridiagonal
    expm
    expm_frechet
+   fiedler
+   fiedler_companion
    funm
+   hadamard
+   helmert
    hessenberg
+   hankel
    hilbert
    inv
+   invhilbert
+   invpascal
+   leslie
    lu
    lu_factor
    lu_solve
+   pascal
    polar
    qr
+   qr_multiply
    rsf2csf
    schur
    solve
+   solve_sylvester
    solve_triangular
    sqrtm
    svd
@@ -154,43 +169,56 @@ jax.scipy.special
    beta
    betainc
    betaln
+   boxcox
+   boxcox1p
+   comb
+   dawsn
    digamma
    entr
    erf
    erfc
+   erfcx
    erfinv
    exp1
    expi
    expit
    expn
    factorial
+   fresnel
    gamma
    gammainc
    gammaincc
    gammaln
    gammasgn
    hyp1f1
+   hyp2f1
    i0
    i0e
    i1
    i1e
+   kl_div
    log_ndtr
+   log_softmax
    logit
+   loggamma
    logsumexp
    lpmn
    lpmn_values
    multigammaln
    ndtr
    ndtri
+   owens_t
    poch
    polygamma
+   rel_entr
+   sici
+   softmax
    spence
-   sph_harm
+   sph_harm_y
+   wofz
    xlog1py
    xlogy
    zeta
-   kl_div
-   rel_entr
 
 
 jax.scipy.stats
@@ -300,6 +328,11 @@ jax.scipy.stats.expon
 
    logpdf
    pdf
+   logcdf
+   cdf
+   logsf
+   sf
+   ppf
 
 jax.scipy.stats.gamma
 ~~~~~~~~~~~~~~~~~~~~~
@@ -313,6 +346,34 @@ jax.scipy.stats.gamma
    logcdf
    sf
    logsf
+
+jax.scipy.stats.gumbel_l
+~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: jax.scipy.stats.gumbel_l
+.. autosummary::
+  :toctree: _autosummary
+
+   logpdf
+   pdf
+   cdf
+   logcdf
+   sf
+   logsf
+   ppf
+
+jax.scipy.stats.gumbel_r
+~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: jax.scipy.stats.gumbel_r
+.. autosummary::
+  :toctree: _autosummary
+
+   logpdf
+   pdf
+   cdf
+   logcdf
+   sf
+   logsf
+   ppf
 
 jax.scipy.stats.gennorm
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -406,8 +467,13 @@ jax.scipy.stats.pareto
 .. autosummary::
   :toctree: _autosummary
 
+   logcdf
    logpdf
+   logsf
+   cdf
    pdf
+   ppf
+   sf
 
 jax.scipy.stats.poisson
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -418,6 +484,7 @@ jax.scipy.stats.poisson
    logpmf
    pmf
    cdf
+   entropy
 
 jax.scipy.stats.t
 ~~~~~~~~~~~~~~~~~

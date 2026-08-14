@@ -5,19 +5,22 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.16.1
+    jupytext_version: 1.16.4
 kernelspec:
   display_name: Python 3
   language: python
   name: python3
 ---
 
-# Stateful Computations
+(stateful-computations)=
+# Stateful computations
+
+<!--* freshness: { reviewed: '2024-05-03' } *-->
 
 JAX transformations like {func}`~jax.jit`, {func}`~jax.vmap`, {func}`~jax.grad`, require the functions
 they wrap to be pure: that is, functions whose outputs depend *solely* on the inputs, and which have
 no side effects such as updating of global state.
-You can find a discussion of this in [JAX sharp bits: Pure functions](https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions).
+You can find a discussion of this in [JAX sharp bits: Pure functions](https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions).
 
 This constraint can pose some challenges in the context of machine learning, where state may exist in
 many forms. For example:
@@ -142,7 +145,7 @@ This is because, like the strategy we just applied, object-oriented programming 
 
 In our case, the `CounterV2` class is nothing more than a namespace bringing all the functions that use `CounterState` into one location. Exercise for the reader: do you think it makes sense to keep it as a class?
 
-Incidentally, you've already seen an example of this strategy in the JAX pseudo-randomness API, {mod}`jax.random`, shown in the :ref:`pseudorandom-numbers` section.
+Incidentally, you've already seen an example of this strategy in the JAX pseudo-randomness API, {mod}`jax.random`, shown in the {ref}`pseudorandom-numbers` section.
 Unlike Numpy, which manages random state using implicitly updated stateful classes, JAX requires the programmer to work directly with the random generator state -- the PRNG key.
 
 
@@ -192,7 +195,7 @@ def update(params: Params, x: jnp.ndarray, y: jnp.ndarray) -> Params:
   # and then use `updates` instead of `grad` to actually update the params.
   # (And we'd include `new_optimizer_state` in the output, naturally.)
 
-  new_params = jax.tree_map(
+  new_params = jax.tree.map(
       lambda param, g: param - g * LEARNING_RATE, params, grad)
 
   return new_params
@@ -232,4 +235,4 @@ Handling parameters manually seems fine if you're dealing with two parameters, b
 
 2) Are we supposed to pipe all these things around manually?
 
-The details can be tricky to handle, but there are examples of libraries that take care of this for you. See [JAX Neural Network Libraries](https://github.com/google/jax#neural-network-libraries) for some examples.
+The details can be tricky to handle, but there are examples of libraries that take care of this for you. See [JAX Ecosystem Libraries](https://docs.jax.dev/en/latest/#ecosystem) for some examples.

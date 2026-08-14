@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-import sys
 import unittest
 
 from absl.testing import absltest
@@ -27,13 +26,10 @@ config.parse_flags_with_absl()
 class GpuMemoryAllocationTest(absltest.TestCase):
 
   # This test must be run in its own subprocess.
-  @unittest.skipIf(
-      "pytest" in sys.modules,
-      "Test must run in an isolated process",
-  )
+  @jtu.skip_under_pytest("Test must run in an isolated process")
   @unittest.skipIf(
       "XLA_PYTHON_CLIENT_ALLOCATOR" in os.environ,
-      "Test does not work if the python client allocator has been overriden",
+      "Test does not work if the python client allocator has been overridden",
   )
   def test_gpu_memory_allocation(self):
     falsey_values = ("0", "False", "false")
@@ -44,7 +40,7 @@ class GpuMemoryAllocationTest(absltest.TestCase):
     device = jax.devices()[0]
     mem_stats = device.memory_stats()
     self.assertEqual(mem_stats["pool_bytes"], 0)
-    x = jax.lax.add(1, 2)
+    jax.lax.add(1, 2).block_until_ready()
 
     mem_stats = device.memory_stats()
     if preallocate:
